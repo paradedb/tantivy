@@ -196,6 +196,10 @@ pub(crate) struct ScanTrace {
     pub(crate) exact_scores: Vec<f32>,
     /// Clusters whose unseen rows were scored from the whole band.
     pub(crate) whole_band_admissions: usize,
+    /// `(row, layer-0 upper endpoint)` of every row admission compared with a threshold.
+    pub(crate) admission_uppers: Vec<(BlockAddress, f32)>,
+    /// `(row, upper endpoint)` of every row the late filter refined, after its last layer.
+    pub(crate) late_filter_uppers: Vec<(BlockAddress, f32)>,
 }
 
 // --- Quantized state ---
@@ -229,6 +233,8 @@ struct QuantizedState<'a> {
     centroid_reads: usize,
     #[cfg(test)]
     whole_band_admissions: usize,
+    #[cfg(test)]
+    admission_uppers: Vec<(BlockAddress, f32)>,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -272,6 +278,8 @@ impl<'a> QuantizedState<'a> {
             centroid_reads: 0,
             #[cfg(test)]
             whole_band_admissions: 0,
+            #[cfg(test)]
+            admission_uppers: Vec::new(),
             #[cfg(test)]
             plan_override: config.plan_override,
             #[cfg(test)]
@@ -481,6 +489,13 @@ impl<'a> QuantizedState<'a> {
                 .filter(|&(_, &upper)| threshold.admits(UpperEndpoint(upper)))
                 .map(|(&row, _)| row),
         );
+        #[cfg(test)]
+        self.admission_uppers.extend(
+            offsets
+                .iter()
+                .zip(&self.admission_upper)
+                .map(|(&row, &upper)| (BlockAddress::new(whole.cluster as u32, row), upper)),
+        );
         let at = self.candidates.push_selected(
             whole,
             centroid,
@@ -510,6 +525,13 @@ impl<'a> QuantizedState<'a> {
             if threshold.admits(upper) {
                 self.admission_keep.push(index as u32);
             }
+        }
+        #[cfg(test)]
+        for (index, row) in rows.local_rows().enumerate() {
+            let upper = Estimate(self.admission_columns.estimates[index])
+                .upper(self.admission_columns.sigmas[index], kappa);
+            self.admission_uppers
+                .push((BlockAddress::new(rows.cluster as u32, row as u32), upper.0));
         }
     }
 
@@ -1086,6 +1108,11 @@ where
                 for (i, &offset) in offsets.iter().enumerate() {
                     let upper = Estimate(state.admission_columns.estimates[i])
                         .upper(state.admission_columns.sigmas[i], state.candidates.kappa());
+                    #[cfg(test)]
+                    self.report
+                        .trace
+                        .late_filter_uppers
+                        .push((BlockAddress::new(cluster as u32, offset), upper.0));
                     if threshold.is_none_or(|bar| upper.0 >= bar) {
                         let docs = doc_cache.entry(cluster).or_default();
                         if docs.is_empty() {
@@ -1326,6 +1353,7 @@ where
             #[cfg(test)]
             {
                 report.trace.whole_band_admissions = state.whole_band_admissions;
+                report.trace.admission_uppers = state.admission_uppers.clone();
             }
         }
         #[cfg(test)]
