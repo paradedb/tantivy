@@ -287,12 +287,17 @@ impl BooleanQuery {
             if *occur == Occur::Must {
                 if let Some(child_bq) = subquery.downcast_ref::<BooleanQuery>() {
                     let (child_flat, child_min_should) = child_bq.flattened_clauses();
-                    let all_must = !child_flat.is_empty()
+                    let no_must_not = !child_flat.is_empty()
+                        && child_flat.iter().all(|(o, _)| *o != Occur::MustNot);
+                    let all_must = no_must_not
                         && child_flat.iter().all(|(o, _)| *o == Occur::Must)
                         && child_min_should == 0;
-                    let all_should = !child_flat.is_empty()
+                    let all_should = no_must_not
                         && child_flat.iter().all(|(o, _)| *o == Occur::Should)
                         && child_min_should <= 1;
+                    let must_with_single_disjunction = no_must_not
+                        && child_min_should == 1
+                        && child_flat.iter().any(|(o, _)| *o == Occur::Should);
 
                     if all_must {
                         // Flatten nested conjunction: (a AND b) AND c -> a AND b AND c
@@ -300,11 +305,17 @@ impl BooleanQuery {
                             new_clauses.push((child_occur, child_query));
                         }
                         continue;
-                    } else if all_should && !has_outer_should && !flattened_disjunction {
+                    } else if (all_should || must_with_single_disjunction)
+                        && !has_outer_should
+                        && !flattened_disjunction
+                    {
                         // A standalone disjunction (such as `BooleanQuery::union`, which has
-                        // minimum_number_should_match == 0) semantically requires at least 1 match.
-                        // When the parent has no outer Should clauses and no other disjunction has
-                        // been flattened yet, promote its Should clauses with min_should = 1.
+                        // minimum_number_should_match == 0) or a conjunction already carrying a
+                        // single required disjunction (`child_min_should == 1`, e.g. from an inner
+                        // `and_query` before an outer range filter) requires at least 1 `Should`
+                        // match alongside all `Must` clauses. When the parent has no outer
+                        // `Should` clauses and no other disjunction has been flattened yet,
+                        // absorb its clauses with `new_min_should = 1`.
                         for (child_occur, child_query) in child_flat {
                             new_clauses.push((child_occur, child_query));
                         }

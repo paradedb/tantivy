@@ -342,12 +342,27 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         self.num_bytes
     }
 
+    /// Returns the exact number of SSTable blocks spanned by the non-empty ordinal
+    /// range `ord_range` (`0` when `ord_range` is empty or `num_terms() == 0`).
+    pub fn num_blocks_for_ord_range(
+        &self,
+        ord_range: std::ops::Range<TermOrdinal>,
+    ) -> io::Result<u64> {
+        if ord_range.is_empty() || self.num_terms == 0 || ord_range.start >= self.num_terms {
+            return Ok(0);
+        }
+        let end_incl = (ord_range.end - 1).min(self.num_terms - 1);
+        let first_block = self.sstable_index.locate_with_ord(ord_range.start)?;
+        let last_block = self.sstable_index.locate_with_ord(end_incl)?;
+        Ok(last_block.saturating_sub(first_block) + 1)
+    }
+
     /// Decode a DeltaReader up to key, returning the number of terms traversed
     ///
     /// If the key was not found, returns Ok(None).
     /// After calling this function, it is possible to call `DeltaReader::value` to get the
     /// associated value.
-    fn decode_up_to_key<K: AsRef<[u8]>>(
+    pub(crate) fn decode_up_to_key<K: AsRef<[u8]>>(
         &self,
         key: K,
         sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
@@ -500,6 +515,45 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(true)
     }
 
+    /// Locates the SSTable block containing `ord`, returning `(block_addr, end_ordinal)` where
+    /// `block_addr.first_ordinal..end_ordinal` is the ordinal range of that block, or `None` if
+    /// `ord >= self.num_terms()`.
+    pub fn block_addr_and_end_ord(
+        &self,
+        ord: TermOrdinal,
+    ) -> io::Result<Option<(BlockAddr, TermOrdinal)>> {
+        if ord >= self.num_terms {
+            return Ok(None);
+        }
+        let (block_addr, block_id) = self.sstable_index.get_and_locate_with_ord(ord)?;
+        let end_ord = self
+            .sstable_index
+            .get_block(block_id + 1)?
+            .map(|next| next.first_ordinal)
+            .unwrap_or(self.num_terms);
+        Ok(Some((block_addr, end_ord)))
+    }
+
+    /// Decodes every `(ord, key)` entry in `block_addr`, returning the decoded ordinal range
+    /// `block_addr.first_ordinal..end_ord`.
+    pub fn visit_block_addr(
+        &self,
+        block_addr: BlockAddr,
+        mut cb: impl FnMut(TermOrdinal, &[u8]),
+    ) -> io::Result<std::ops::Range<TermOrdinal>> {
+        let first_ordinal = block_addr.first_ordinal;
+        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
+        let mut bytes = Vec::with_capacity(64);
+        let mut cur_ord = first_ordinal;
+        while sstable_delta_reader.advance()? {
+            bytes.truncate(sstable_delta_reader.common_prefix_len());
+            bytes.extend_from_slice(sstable_delta_reader.suffix());
+            cb(cur_ord, &bytes);
+            cur_ord += 1;
+        }
+        Ok(first_ordinal..cur_ord)
+    }
+
     /// Returns the terms for a _sorted_ list of term ordinals.
     ///
     /// Returns true if and only if all terms have been found.
@@ -633,6 +687,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         sorted_keys: crate::batch::SortedTermSlice<'a, K>,
     ) -> crate::batch::BatchedTermInfoIter<'a, K, TSSTable> {
         crate::batch::BatchedTermInfoIter::new(self, sorted_keys)
+    }
+
+    /// Batched exact-key ordinal lookup over a sorted input slice, decoding each
+    /// touched SSTable block at most once and yielding `(input_index, term_ord)`.
+    pub fn batch_term_ord_exact<'a, K: AsRef<[u8]>>(
+        &'a self,
+        sorted_keys: crate::batch::SortedTermSlice<'a, K>,
+    ) -> impl Iterator<Item = io::Result<(usize, TermOrdinal)>> + 'a {
+        let mut iter = crate::batch::BatchedTermInfoIter::new(self, sorted_keys);
+        std::iter::from_fn(move || {
+            iter.next_with_ord()
+                .map(|r| r.map(|(idx, ord, _)| (idx, ord)))
+        })
     }
 
     /// Lookups the value corresponding to the key.
