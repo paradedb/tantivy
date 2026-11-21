@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
-use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
+use crate::docset::{DocSet, DriveCost, ProbeCost, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
-use crate::postings::{FreqReadingOption, SegmentPostings};
+use crate::postings::FreqReadingOption;
 use crate::query::bitmap_combination::{BitmapCombination, BitmapOperation};
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
-use crate::query::phrase_query::PhraseScorer;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scorer::{BasicPruningScorer, BlockMaxScorer};
 use crate::query::synonym_query::SynonymScorer;
@@ -35,11 +34,14 @@ fn intersect_scorers(
         && scorers
             .iter()
             .all(|scorer| scorer.size_hint().saturating_mul(32) >= num_docs)
-        && !scorers.iter().any(|phrase| {
-            phrase.is::<PhraseScorer<SegmentPostings>>()
+        // Avoid materializing full-segment bitmaps for expensive-to-probe non-bitset scorers
+        // (e.g. `PhraseScorer`, `PredicateColumnDocSet`) when a cheaper selective driver can
+        // intersect with them directly.
+        && !scorers.iter().any(|expensive| {
+            !expensive.has_fast_bitset()
+                && expensive.cost().probe.scalar() > ProbeCost::FAST_FIELD.scalar()
                 && scorers.iter().any(|driver| {
-                    !driver.is::<PhraseScorer<SegmentPostings>>()
-                        && driver.cost() < phrase.cost()
+                    driver.cost().drive < expensive.cost().drive
                         && u64::from(driver.size_hint()) * 2 <= u64::from(num_docs)
                 })
         })
@@ -462,10 +464,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         if !deferred_fast_musts.is_empty() {
             let num_docs = reader.num_docs();
             let max_doc = reader.max_doc();
-            let max_driver_cost = (f64::from(max_doc) * 0.8) as u64;
+            let max_driver_cost = DriveCost((f64::from(max_doc) * 0.8) as u64);
 
             let mut candidate_bound: Option<u32> = None;
-            let mut min_driver_cost: Option<u64> = None;
+            let mut min_driver_cost: Option<DriveCost> = None;
 
             if let Some(musts) = per_occur_scorers.get(&Occur::Must) {
                 let mut hints = Vec::with_capacity(musts.len());
@@ -474,7 +476,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         continue;
                     }
                     hints.push(s.size_hint());
-                    let c = s.cost();
+                    let c = s.cost().drive;
                     min_driver_cost = Some(min_driver_cost.map_or(c, |prev| prev.min(c)));
                 }
                 if !hints.is_empty() {
@@ -503,10 +505,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                             .sum::<u64>()
                             .min(u64::from(max_doc))
                             as u32;
-                        let union_cost: u64 = non_empty
+                        let union_cost = non_empty
                             .iter()
-                            .map(|s| s.cost())
-                            .fold(0u64, u64::saturating_add);
+                            .map(|s| s.cost().drive)
+                            .fold(DriveCost::ZERO, DriveCost::saturating_add);
                         candidate_bound =
                             Some(candidate_bound.map_or(union_hint, |prev| prev.min(union_hint)));
                         min_driver_cost =
