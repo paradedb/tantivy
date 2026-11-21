@@ -8,7 +8,9 @@ use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
 };
 use crate::query::disjunction::Disjunction;
+use crate::query::exclude::BatchExcludeScorer;
 use crate::query::explanation::does_not_match;
+use crate::query::intersection::intersect_scorers_unpositioned;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scorer::{BasicPruningScorer, BlockMaxScorer};
 use crate::query::synonym_query::SynonymScorer;
@@ -16,18 +18,26 @@ use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
-    DisjunctionPruning, EmptyScorer, Exclude, ExcludedDocSet, Explanation, Occur,
+    DisjunctionPruning, EmptyScorer, Exclude, ExcludedDocSet, ExclusionSet, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
-fn intersect_scorers(
-    scorers: Vec<Box<dyn Scorer>>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScorerPositioning {
+    Positioned,
+    Unpositioned,
+}
+
+fn intersect_scorers_with_positioning(
+    mut scorers: Vec<Box<dyn Scorer>>,
     num_docs: u32,
     scoring_enabled: bool,
     bitmap_enabled: bool,
+    positioning: ScorerPositioning,
 ) -> Box<dyn Scorer> {
-    if bitmap_enabled
+    if positioning == ScorerPositioning::Positioned
+        && bitmap_enabled
         && !scoring_enabled
         && scorers.len() > 1
         && scorers.iter().any(|scorer| scorer.has_fast_bitset())
@@ -46,14 +56,37 @@ fn intersect_scorers(
                 })
         })
     {
+        for scorer in &mut scorers {
+            if scorer.doc() == 0 {
+                scorer.seek(0);
+            }
+        }
         Box::new(BitmapCombination::new(
             scorers,
             BitmapOperation::Intersection,
             num_docs,
         ))
     } else {
-        intersect_scored_scorers(scorers, num_docs)
+        match positioning {
+            ScorerPositioning::Positioned => intersect_scored_scorers(scorers, num_docs),
+            ScorerPositioning::Unpositioned => intersect_scorers_unpositioned(scorers, num_docs),
+        }
     }
+}
+
+fn intersect_scorers(
+    scorers: Vec<Box<dyn Scorer>>,
+    num_docs: u32,
+    scoring_enabled: bool,
+    bitmap_enabled: bool,
+) -> Box<dyn Scorer> {
+    intersect_scorers_with_positioning(
+        scorers,
+        num_docs,
+        scoring_enabled,
+        bitmap_enabled,
+        ScorerPositioning::Positioned,
+    )
 }
 
 pub(crate) enum SpecializedScorer {
@@ -298,13 +331,14 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
 ///
 /// When AllScorer instances are removed from must_scorers as an optimization,
 /// we must restore the "match all" semantics if the list becomes empty.
-fn effective_must_scorer(
+fn effective_must_scorer_with_positioning(
     must_scorers: Vec<Box<dyn Scorer>>,
     removed_all_scorer_count: usize,
     max_doc: DocId,
     num_docs: u32,
     scoring_enabled: bool,
     bitmap_enabled: bool,
+    positioning: ScorerPositioning,
 ) -> Option<Box<dyn Scorer>> {
     if must_scorers.is_empty() {
         if removed_all_scorer_count > 0 {
@@ -315,13 +349,33 @@ fn effective_must_scorer(
             None
         }
     } else {
-        Some(intersect_scorers(
+        Some(intersect_scorers_with_positioning(
             must_scorers,
             num_docs,
             scoring_enabled,
             bitmap_enabled,
+            positioning,
         ))
     }
+}
+
+fn effective_must_scorer(
+    must_scorers: Vec<Box<dyn Scorer>>,
+    removed_all_scorer_count: usize,
+    max_doc: DocId,
+    num_docs: u32,
+    scoring_enabled: bool,
+    bitmap_enabled: bool,
+) -> Option<Box<dyn Scorer>> {
+    effective_must_scorer_with_positioning(
+        must_scorers,
+        removed_all_scorer_count,
+        max_doc,
+        num_docs,
+        scoring_enabled,
+        bitmap_enabled,
+        ScorerPositioning::Positioned,
+    )
 }
 
 /// Returns a SHOULD scorer with AllScorer union if any were removed.
@@ -440,11 +494,11 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
     ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
         let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
-        let mut deferred_fast_musts: Vec<&dyn Weight> = Vec::new();
+        let mut deferred_fast_clauses: Vec<(Occur, &dyn Weight)> = Vec::new();
 
         for (occur, subweight) in &self.weights {
-            if *occur == Occur::Must && subweight.uses_fast_fields() {
-                deferred_fast_musts.push(subweight.as_ref());
+            if matches!(*occur, Occur::Must | Occur::MustNot) && subweight.uses_fast_fields() {
+                deferred_fast_clauses.push((*occur, subweight.as_ref()));
                 continue;
             }
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
@@ -461,7 +515,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 .push(sub_scorer);
         }
 
-        if !deferred_fast_musts.is_empty() {
+        if !deferred_fast_clauses.is_empty() {
             let num_docs = reader.num_docs();
             let max_doc = reader.max_doc();
             let max_driver_cost = DriveCost((f64::from(max_doc) * 0.8) as u64);
@@ -528,15 +582,14 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 _ => None,
             };
 
-            let must_entry = per_occur_scorers.entry(Occur::Must).or_default();
-            for subweight in deferred_fast_musts {
+            for (occur, subweight) in deferred_fast_clauses {
                 let sub_scorer = match selective_candidate_size {
                     Some(c) => subweight.scorer_for_candidates_unpositioned(reader, boost, c)?,
                     None => subweight.scorer(reader, boost)?,
                 };
                 let is_empty = sub_scorer.is::<EmptyScorer>();
-                must_entry.push(sub_scorer);
-                if is_empty {
+                per_occur_scorers.entry(occur).or_default().push(sub_scorer);
+                if occur == Occur::Must && is_empty {
                     return Ok(per_occur_scorers);
                 }
             }
@@ -675,11 +728,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     && !term_scorers.is_empty()
                     && !other_scorers.is_empty()
                 {
-                    let filter = intersect_scorers(
+                    let filter = intersect_scorers_with_positioning(
                         other_scorers,
                         num_docs,
                         self.scoring_enabled,
                         self.bitmap_enabled && reader.bitmap_postings_enabled,
+                        ScorerPositioning::Unpositioned,
                     );
                     if term_scorers.len() >= 2 {
                         SpecializedScorer::FilteredTermIntersection {
@@ -767,13 +821,20 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             (ShouldScorersCombinationMethod::Required(should_scorer), must_scorers) => {
                 // Required SHOULD: at least `minimum_number_should_match` must match.
                 // Semantics: (MUST constraint) AND (SHOULD constraint)
-                match effective_must_scorer(
+                let must_positioning = match &should_scorer {
+                    SpecializedScorer::TermUnion(_)
+                    | SpecializedScorer::TermIntersection(_)
+                    | SpecializedScorer::BlockMaxUnion(_) => ScorerPositioning::Unpositioned,
+                    _ => ScorerPositioning::Positioned,
+                };
+                match effective_must_scorer_with_positioning(
                     must_scorers,
                     must_special_scorer_counts.num_all_scorers,
                     reader.max_doc(),
                     num_docs,
                     self.scoring_enabled,
                     self.bitmap_enabled && reader.bitmap_postings_enabled,
+                    must_positioning,
                 ) {
                     None => {
                         // No MUST constraint: SHOULD alone determines matching.
@@ -851,17 +912,28 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     ExcludedDocSet::new(*exclude_scorer),
                 )),
                 // We get back the original Box<dyn Scorer>
-                Err(exclude_scorer) => Box::new(Exclude::new(
-                    include_scorer_boxed,
-                    ExcludedDocSet::new(exclude_scorer),
-                )),
+                Err(exclude_scorer) => {
+                    let excl = ExcludedDocSet::new(exclude_scorer);
+                    if excl.probe_cost().prefers_batching() {
+                        Box::new(BatchExcludeScorer::new(include_scorer_boxed, excl))
+                    } else {
+                        Box::new(Exclude::new(include_scorer_boxed, excl))
+                    }
+                }
             }
         } else {
             let exclude_scorers: Vec<_> = exclude_scorers
                 .into_iter()
                 .map(ExcludedDocSet::new)
                 .collect();
-            Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+            if exclude_scorers.probe_cost().prefers_batching() {
+                Box::new(BatchExcludeScorer::new(
+                    include_scorer_boxed,
+                    exclude_scorers,
+                ))
+            } else {
+                Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+            }
         };
         Ok(SpecializedScorer::Other(scorer))
     }

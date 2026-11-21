@@ -1,12 +1,16 @@
 use common::TinySet;
 
+use super::exclude::{BatchSizeRamp, CandidateBuffer};
 use super::size_hint::estimate_intersection;
 use crate::docset::{
-    DocSet, DocSetCost, DriveCost, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED,
+    fill_all_candidates_mask, DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult,
+    BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
 };
 use crate::query::term_query::TermScorer;
 use crate::query::{EmptyScorer, Scorer};
 use crate::{DocId, Score};
+
+const BATCH_FILTER_ORDER_EXPECTED_LEN: u64 = 256;
 
 /// Orders intersection participants so index `0` is the cheapest driver (`cost().drive`,
 /// tie-breaking by `size_hint()`), and followers `[1..]` are ordered by expected probe cost per
@@ -36,30 +40,48 @@ fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_
     });
 }
 
-/// Returns the intersection scorer.
-///
-/// The score associated with the documents is the sum of the
-/// score of the `Scorer`s given in argument.
-///
-/// For better performance, the function uses a
-/// specialized implementation if the two
-/// shortest scorers are `TermScorer`s.
-///
-/// num_docs_segment is the number of documents in the segment. It is used for estimating the
-/// `size_hint` of the intersection.
-pub fn intersect_scorers(
+fn order_batch_filters(filters: &mut [Box<dyn Scorer>], segment_num_docs: u32) {
+    if filters.len() <= 1 {
+        return;
+    }
+    let num_docs = f64::from(segment_num_docs.max(1));
+    filters.sort_by(|a, b| {
+        let rank = |d: &Box<dyn Scorer>| -> (f64, DriveCost) {
+            let cost = d.cost();
+            let selectivity = (f64::from(d.size_hint()) / num_docs).clamp(0.0, 1.0);
+            let elim = (1.0 - selectivity).max(1e-6);
+            let per_doc = cost.probe.for_batch(BATCH_FILTER_ORDER_EXPECTED_LEN) as f64
+                / BATCH_FILTER_ORDER_EXPECTED_LEN as f64;
+            (per_doc / elim, cost.drive)
+        };
+        let (ra, da) = rank(a);
+        let (rb, db) = rank(b);
+        ra.total_cmp(&rb).then_with(|| da.cmp(&db))
+    });
+}
+
+fn intersect_scalar_scorers(
     mut scorers: Vec<Box<dyn Scorer>>,
     segment_num_docs: u32,
+    positioned: bool,
 ) -> Box<dyn Scorer> {
     if scorers.is_empty() {
         return Box::new(EmptyScorer);
     }
     if scorers.len() == 1 {
-        return scorers.pop().unwrap();
+        let mut s = scorers.pop().unwrap();
+        if positioned && s.doc() == 0 {
+            s.seek(0);
+        }
+        return s;
     }
     order_intersection_docsets(&mut scorers, segment_num_docs);
-    let doc = go_to_first_doc(&mut scorers[..]);
-    if doc == TERMINATED {
+    if positioned {
+        let doc = go_to_first_doc(&mut scorers[..]);
+        if doc == TERMINATED {
+            return Box::new(EmptyScorer);
+        }
+    } else if scorers.iter().any(|s| s.doc() == TERMINATED) {
         return Box::new(EmptyScorer);
     }
     // We know that we have at least 2 elements.
@@ -82,6 +104,94 @@ pub fn intersect_scorers(
         others: scorers,
         segment_num_docs,
     })
+}
+
+fn intersect_scorers_impl(
+    mut scorers: Vec<Box<dyn Scorer>>,
+    segment_num_docs: u32,
+    positioned: bool,
+) -> Box<dyn Scorer> {
+    if scorers.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if scorers.len() == 1 {
+        let mut s = scorers.pop().unwrap();
+        if positioned && s.doc() == 0 {
+            s.seek(0);
+        }
+        return s;
+    }
+    let has_batch_follower = scorers
+        .iter()
+        .any(|s| s.cost().probe.prefers_batching() && s.constant_score().is_some());
+    if !has_batch_follower {
+        return intersect_scalar_scorers(scorers, segment_num_docs, positioned);
+    }
+
+    // Select the cheapest-to-drive scorer first so a narrow batchable scorer (e.g. bounded
+    // `PredicateColumnDocSet` or nested `BatchFilteredScorer`) can still drive when cheaper.
+    let driver_idx = scorers
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, s)| (s.cost().drive, s.size_hint()))
+        .map(|(i, _)| i)
+        .unwrap();
+    let driver = scorers.swap_remove(driver_idx);
+
+    let mut scalar_scorers = Vec::with_capacity(scorers.len() + 1);
+    scalar_scorers.push(driver);
+    let mut batch_filters = Vec::new();
+    for scorer in scorers {
+        if scorer.cost().probe.prefers_batching() && scorer.constant_score().is_some() {
+            batch_filters.push(scorer);
+        } else {
+            scalar_scorers.push(scorer);
+        }
+    }
+    if batch_filters.is_empty() {
+        return intersect_scalar_scorers(scalar_scorers, segment_num_docs, positioned);
+    }
+
+    let inner = intersect_scalar_scorers(scalar_scorers, segment_num_docs, positioned);
+    if inner.doc() == TERMINATED || batch_filters.iter().any(|f| f.doc() == TERMINATED) {
+        return Box::new(EmptyScorer);
+    }
+    order_batch_filters(&mut batch_filters, segment_num_docs);
+    let filtered = if positioned {
+        BatchFilteredScorer::new(inner, batch_filters, segment_num_docs)
+    } else {
+        BatchFilteredScorer::new_unpositioned(inner, batch_filters, segment_num_docs)
+    };
+    if filtered.doc() == TERMINATED {
+        Box::new(EmptyScorer)
+    } else {
+        Box::new(filtered)
+    }
+}
+
+/// Returns the intersection scorer.
+///
+/// The score associated with the documents is the sum of the
+/// score of the `Scorer`s given in argument.
+///
+/// For better performance, the function uses a
+/// specialized implementation if the two
+/// shortest scorers are `TermScorer`s, and splits out constant-score
+/// high-setup followers (`ProbeCost::prefers_batching`) into [`BatchFilteredScorer`].
+///
+/// num_docs_segment is the number of documents in the segment. It is used for estimating the
+/// `size_hint` of the intersection.
+pub fn intersect_scorers(scorers: Vec<Box<dyn Scorer>>, segment_num_docs: u32) -> Box<dyn Scorer> {
+    intersect_scorers_impl(scorers, segment_num_docs, true)
+}
+
+/// Unpositioned counterpart to [`intersect_scorers`] for filters that will be probed via
+/// `seek_danger` / `seek_danger_batch` / `is_empty_in_range` rather than immediately driven.
+pub(crate) fn intersect_scorers_unpositioned(
+    scorers: Vec<Box<dyn Scorer>>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    intersect_scorers_impl(scorers, segment_num_docs, false)
 }
 
 /// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
@@ -283,6 +393,28 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         SeekDangerResult::Found
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        let words = docs.len().div_ceil(64);
+        let mut next_bound = self.left.seek_danger_batch(docs, mask);
+        if mask[..words].iter().all(|w| w.is_empty()) {
+            return next_bound;
+        }
+        next_bound = next_bound.max(self.right.seek_danger_batch(docs, mask));
+        if mask[..words].iter().all(|w| w.is_empty()) {
+            return next_bound;
+        }
+        for docset in &mut self.others {
+            next_bound = next_bound.max(docset.seek_danger_batch(docs, mask));
+            if mask[..words].iter().all(|w| w.is_empty()) {
+                break;
+            }
+        }
+        next_bound
+    }
+
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
         if start > end {
             return true;
@@ -452,6 +584,385 @@ where
             sum += other.constant_score()?;
         }
         Some(sum)
+    }
+}
+
+/// Wraps a cheap inner scorer with one or more constant-score followers whose
+/// `ProbeCost::prefers_batching()` is true.
+///
+/// Pulls candidate batches from `inner` (progressively ramping `64 -> 256 -> 1024`),
+/// filters them in place via [`DocSet::seek_danger_batch`], and propagates inter-batch
+/// skip horizons back to `inner.seek()`. Buffering disables per-doc `SeekLowerBound`
+/// leapfrog skipping back into `inner`, so in-memory docsets with zero setup cost stay
+/// on scalar [`Intersection`].
+pub(crate) struct BatchFilteredScorer {
+    inner: Box<dyn Scorer>,
+    batch_filters: Vec<Box<dyn Scorer>>,
+    inner_const_score: Option<Score>,
+    filter_score: Score,
+    segment_num_docs: u32,
+    ramp: BatchSizeRamp,
+    buf: CandidateBuffer,
+    next_inner_seek: DocId,
+    current: (DocId, Score),
+    positioned: bool,
+}
+
+impl BatchFilteredScorer {
+    pub(crate) fn new(
+        inner: Box<dyn Scorer>,
+        batch_filters: Vec<Box<dyn Scorer>>,
+        segment_num_docs: u32,
+    ) -> Self {
+        let mut s = Self::new_unpositioned(inner, batch_filters, segment_num_docs);
+        if s.current.0 != TERMINATED {
+            if s.current.0 == 0 {
+                s.inner.seek(0);
+            }
+            s.refill();
+        }
+        s
+    }
+
+    pub(crate) fn new_unpositioned(
+        inner: Box<dyn Scorer>,
+        batch_filters: Vec<Box<dyn Scorer>>,
+        segment_num_docs: u32,
+    ) -> Self {
+        let inner_const_score = inner.constant_score();
+        let filter_score: Score = batch_filters
+            .iter()
+            .map(|f| {
+                f.constant_score()
+                    .expect("BatchFilteredScorer filters must have constant_score")
+            })
+            .sum();
+        let empty =
+            inner.doc() == TERMINATED || batch_filters.iter().any(|f| f.doc() == TERMINATED);
+        let start_bound = if empty {
+            TERMINATED
+        } else {
+            batch_filters
+                .iter()
+                .map(|f| f.doc())
+                .fold(inner.doc(), DocId::max)
+        };
+        let initial_score = inner_const_score.map_or(0.0, |s| s + filter_score);
+        Self {
+            inner,
+            batch_filters,
+            inner_const_score,
+            filter_score,
+            segment_num_docs,
+            ramp: BatchSizeRamp::Small,
+            buf: CandidateBuffer::default(),
+            next_inner_seek: if empty { TERMINATED } else { start_bound },
+            current: (start_bound, initial_score),
+            positioned: empty,
+        }
+    }
+
+    #[inline]
+    fn score_for_buf_idx(&self, idx: usize) -> Score {
+        match self.inner_const_score {
+            Some(score) => score + self.filter_score,
+            None => self.buf.scores[idx] + self.filter_score,
+        }
+    }
+
+    fn refill(&mut self) {
+        self.positioned = true;
+        self.buf.clear();
+        let has_var_score = self.inner_const_score.is_none();
+        let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+        let mut fill_chunk = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+
+        loop {
+            if self.next_inner_seek >= TERMINATED {
+                self.inner.seek(TERMINATED);
+                self.buf.end = TERMINATED;
+                self.current.0 = TERMINATED;
+                return;
+            }
+            if self.inner.doc() < self.next_inner_seek {
+                self.inner.seek(self.next_inner_seek);
+            }
+            let mut doc = self.inner.doc();
+            if doc == TERMINATED {
+                self.buf.end = TERMINATED;
+                self.current.0 = TERMINATED;
+                return;
+            }
+            let target_len = self.ramp.limit();
+            self.ramp.promote();
+            self.buf.docs.clear();
+            if has_var_score {
+                self.buf.scores.clear();
+                while doc != TERMINATED && self.buf.docs.len() < target_len {
+                    self.buf.docs.push(doc);
+                    self.buf.scores.push(self.inner.score());
+                    doc = self.inner.advance();
+                }
+            } else {
+                while self.buf.docs.len() + COLLECT_BLOCK_BUFFER_LEN <= target_len {
+                    let count = self.inner.fill_buffer(&mut fill_chunk);
+                    if count == 0 {
+                        break;
+                    }
+                    self.buf.docs.extend_from_slice(&fill_chunk[..count]);
+                    if count < fill_chunk.len() {
+                        break;
+                    }
+                }
+            }
+
+            let n = self.buf.docs.len();
+            if n == 0 {
+                self.buf.end = TERMINATED;
+                self.current.0 = TERMINATED;
+                return;
+            }
+            let words = n.div_ceil(64);
+            fill_all_candidates_mask(n, &mut mask);
+            let mut next_bound = self.buf.docs[n - 1].saturating_add(1).min(TERMINATED);
+            for filter in &mut self.batch_filters {
+                let bound = filter.seek_danger_batch(&self.buf.docs, &mut mask[..words]);
+                next_bound = next_bound.max(bound);
+                if mask[..words].iter().all(|w| w.is_empty()) {
+                    break;
+                }
+            }
+            self.next_inner_seek = self.next_inner_seek.max(next_bound);
+
+            let mut write = 0usize;
+            for (word_idx, &word) in mask[..words].iter().enumerate() {
+                let base = word_idx * 64;
+                for bit in word {
+                    let i = base + bit as usize;
+                    self.buf.docs[write] = self.buf.docs[i];
+                    if has_var_score {
+                        self.buf.scores[write] = self.buf.scores[i];
+                    }
+                    write += 1;
+                }
+            }
+            self.buf.docs.truncate(write);
+            if has_var_score {
+                self.buf.scores.truncate(write);
+            }
+            if write > 0 {
+                self.buf.end = self.next_inner_seek.max(self.inner.doc());
+                self.current = (self.buf.docs[0], self.score_for_buf_idx(0));
+                return;
+            }
+        }
+    }
+}
+
+impl DocSet for BatchFilteredScorer {
+    #[inline]
+    fn advance(&mut self) -> DocId {
+        if self.current.0 == TERMINATED {
+            return TERMINATED;
+        }
+        if !self.positioned {
+            self.inner.seek(self.current.0);
+            self.refill();
+            return self.current.0;
+        }
+        self.buf.idx += 1;
+        if self.buf.idx < self.buf.docs.len() {
+            self.current = (
+                self.buf.docs[self.buf.idx],
+                self.score_for_buf_idx(self.buf.idx),
+            );
+            return self.current.0;
+        }
+        self.refill();
+        self.current.0
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if self.positioned && target <= self.current.0 {
+            return self.current.0;
+        }
+        if target >= TERMINATED {
+            self.buf.clear();
+            self.buf.end = TERMINATED;
+            self.next_inner_seek = TERMINATED;
+            self.inner.seek(TERMINATED);
+            self.current.0 = TERMINATED;
+            self.positioned = true;
+            return TERMINATED;
+        }
+        if self.positioned && target < self.buf.end {
+            if let Some(&last_buf) = self.buf.docs.last() {
+                if target <= last_buf {
+                    let rel = self.buf.remaining().partition_point(|&d| d < target);
+                    self.buf.idx += rel;
+                    self.current = (
+                        self.buf.docs[self.buf.idx],
+                        self.score_for_buf_idx(self.buf.idx),
+                    );
+                    return self.current.0;
+                }
+            }
+        }
+        self.next_inner_seek = self.next_inner_seek.max(target);
+        if self.next_inner_seek >= TERMINATED {
+            self.buf.clear();
+            self.buf.end = TERMINATED;
+            self.inner.seek(TERMINATED);
+            self.current.0 = TERMINATED;
+            self.positioned = true;
+            return TERMINATED;
+        }
+        if self.inner.doc() < self.next_inner_seek {
+            self.inner.seek(self.next_inner_seek);
+        }
+        self.refill();
+        self.current.0
+    }
+
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= TERMINATED || self.current.0 == TERMINATED {
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
+        }
+        if let Some((result, score)) = self.buf.seek_danger_within(target) {
+            if result == SeekDangerResult::Found {
+                self.current = (
+                    target,
+                    match self.inner_const_score {
+                        Some(s) => s + self.filter_score,
+                        None => score.unwrap_or(0.0) + self.filter_score,
+                    },
+                );
+            }
+            return result;
+        }
+        self.buf.clear();
+        if let SeekDangerResult::SeekLowerBound(new_target) = self.inner.seek_danger(target) {
+            if new_target == TERMINATED {
+                self.current.0 = TERMINATED;
+            }
+            self.next_inner_seek = self.next_inner_seek.max(new_target);
+            return SeekDangerResult::SeekLowerBound(new_target);
+        }
+        for filter in &mut self.batch_filters {
+            if let SeekDangerResult::SeekLowerBound(new_target) = filter.seek_danger(target) {
+                if new_target == TERMINATED {
+                    self.current.0 = TERMINATED;
+                }
+                self.next_inner_seek = self.next_inner_seek.max(new_target);
+                return SeekDangerResult::SeekLowerBound(new_target);
+            }
+        }
+        let score = match self.inner_const_score {
+            Some(s) => s + self.filter_score,
+            None => self.inner.score() + self.filter_score,
+        };
+        self.current = (target, score);
+        self.positioned = true;
+        self.next_inner_seek = self.next_inner_seek.max(target.saturating_add(1));
+        SeekDangerResult::Found
+    }
+
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        if self.current.0 == TERMINATED {
+            mask[..docs.len().div_ceil(64)].fill(TinySet::EMPTY);
+            return TERMINATED;
+        }
+        let inner = &mut self.inner;
+        let batch_filters = &mut self.batch_filters;
+        let next_inner_seek = &mut self.next_inner_seek;
+        self.buf
+            .seek_danger_batch_with_fallback(docs, mask, |suffix, sub_mask| {
+                let words = suffix.len().div_ceil(64);
+                let mut next_bound = inner.seek_danger_batch(suffix, sub_mask);
+                for filter in batch_filters.iter_mut() {
+                    if sub_mask[..words].iter().all(|w| w.is_empty()) {
+                        break;
+                    }
+                    next_bound = next_bound.max(filter.seek_danger_batch(suffix, sub_mask));
+                }
+                *next_inner_seek = (*next_inner_seek).max(next_bound);
+                next_bound
+            })
+    }
+
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        if self.current.0 == TERMINATED {
+            return true;
+        }
+        if let Some(empty) = self.buf.is_empty_in_range_within(start, end) {
+            return empty;
+        }
+        let effective_start = start.max(self.buf.end);
+        self.inner.is_empty_in_range(effective_start, end)
+            || self
+                .batch_filters
+                .iter_mut()
+                .any(|filter| filter.is_empty_in_range(effective_start, end))
+    }
+
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        estimate_intersection(
+            std::iter::once(self.inner.size_hint())
+                .chain(self.batch_filters.iter().map(DocSet::size_hint)),
+            self.segment_num_docs,
+        )
+    }
+
+    fn cost(&self) -> DocSetCost {
+        let num_docs = f64::from(self.segment_num_docs.max(1));
+        let inner_cost = self.inner.cost();
+        let inner_hint = self.inner.size_hint();
+        let mut remaining_candidates = f64::from(inner_hint);
+        let mut drive = inner_cost.drive.0;
+        let mut probe: ProbeCost = inner_cost.probe;
+        let selectivity_of = |hint: u32| -> f64 {
+            if hint == 0 {
+                1.0
+            } else {
+                (f64::from(hint) / num_docs).clamp(0.0, 1.0)
+            }
+        };
+        let mut pass_prob = selectivity_of(inner_hint);
+
+        for filter in &self.batch_filters {
+            let f_cost = filter.cost();
+            let cands = remaining_candidates.ceil() as u64;
+            let batches = cands.div_ceil(u64::from(BLOCK_WINDOW));
+            let batch_work = batches
+                .saturating_mul(f_cost.probe.setup.0)
+                .saturating_add(cands.saturating_mul(f_cost.probe.per_doc.0));
+            drive = drive.saturating_add(batch_work);
+            probe = probe.saturating_add(f_cost.probe.scale_per_doc(pass_prob));
+            let s = selectivity_of(filter.size_hint());
+            remaining_candidates *= s;
+            pass_prob *= s;
+        }
+        DocSetCost::new(DriveCost(drive), probe)
+    }
+}
+
+impl Scorer for BatchFilteredScorer {
+    #[inline]
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.inner_const_score.map(|s| s + self.filter_score)
     }
 }
 
