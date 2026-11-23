@@ -156,6 +156,13 @@ impl TopK {
             .map(|(&address, &bound)| Candidate { address, bound })
     }
 
+    /// Whether the map holds `address` with a lower endpoint at or above `floor`.
+    fn holds_at_or_above(&self, address: &RowAddress, floor: f32) -> bool {
+        self.by_addr
+            .get(address)
+            .is_some_and(|bound| bound.lower() >= floor)
+    }
+
     /// The worst lower endpoint once `k` candidates are in.
     pub(crate) fn kth_lower(&self) -> Option<f32> {
         let lower = self.full_worst()?.lower;
@@ -340,6 +347,22 @@ impl PruningBound {
             .load()
             .map(|(score, _)| score)
             .filter(|score| score.is_finite())
+    }
+
+    /// Whether the exact `score` of `address` is below the shared threshold, so the row cannot
+    /// enter the top k.
+    ///
+    /// A row held at or above the threshold is one of the k rows the threshold counts, so it is
+    /// never excluded. Its exact score can land below its own lower endpoint, and excluding it
+    /// leaves fewer than k rows.
+    ///
+    /// Only exact scores get this check. A layer boundary or a recheck still drops a held row
+    /// whose refined upper endpoint is below the threshold.
+    pub(crate) fn excludes_exact(&self, address: RowAddress, score: f32) -> bool {
+        let Some(kth) = self.shared_threshold() else {
+            return false;
+        };
+        score < kth && !self.top.holds_at_or_above(&address, kth)
     }
 
     /// Upserts competitive bounds by [`RowAddress`]. When the local top holds `k` values and the
@@ -1194,6 +1217,31 @@ mod tests {
             let mut above = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[9.0, 8.0]);
             assert_eq!(above.shared_threshold(), Some(8.0));
             assert_eq!(slot_score(&slot), Some(8.0));
+        }
+
+        /// A row whose interval sets the k-th lower stays in when its exact score lands one ulp
+        /// below that lower. A row the bound does not hold, and a held row below a threshold
+        /// another segment published, are still excluded.
+        #[test]
+        fn test_exact_score_below_its_own_lower_stays_in() {
+            let slot = Arc::new(AtomicSharedThreshold::default());
+            let mut bound = PruningBound::new(2, slot.clone());
+            let lower = -0.069_337_17_f32;
+            bound.offer([
+                Candidate::interval(addr(0), lower, -0.069_336_99),
+                Candidate::interval(addr(1), 0.5, 0.6),
+            ]);
+            assert_eq!(bound.shared_threshold(), Some(lower));
+
+            let below = lower.next_down();
+            bound.offer([Candidate::exact(addr(0), below)]);
+            assert!(!bound.excludes_exact(addr(0), below));
+            assert!(bound.excludes_exact(addr(7), below));
+            assert!(!bound.excludes_exact(addr(7), lower));
+
+            let _ = exact_bound(slot, 1, &[1.0]);
+            assert_eq!(bound.shared_threshold(), Some(1.0));
+            assert!(bound.excludes_exact(addr(0), below));
         }
 
         /// Threads publishing interleaved, rising thresholds into one slot leave the slot at the
