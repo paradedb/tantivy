@@ -22,6 +22,7 @@ struct VecWriter {
     shared_directory: RamDirectory,
     data: Cursor<Vec<u8>>,
     is_flushed: bool,
+    is_checkpointed: bool,
 }
 
 impl VecWriter {
@@ -31,6 +32,7 @@ impl VecWriter {
             data: Cursor::new(Vec::new()),
             shared_directory,
             is_flushed: true,
+            is_checkpointed: false,
         }
     }
 }
@@ -65,13 +67,32 @@ impl Write for VecWriter {
 
 impl TerminatingWrite for VecWriter {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
-        self.flush()
+        self.flush()?;
+        let mut fs = self.shared_directory.fs.write().unwrap();
+        fs.unfinished.remove(&self.path);
+        Ok(())
+    }
+
+    fn checkpoint(&mut self) -> io::Result<()> {
+        if self.is_checkpointed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{:?} is already checkpointed", self.path),
+            ));
+        }
+        self.is_checkpointed = true;
+        let mut fs = self.shared_directory.fs.write().unwrap();
+        let written = FileSlice::from(self.data.get_ref().clone());
+        fs.unfinished.insert(self.path.clone(), written);
+        Ok(())
     }
 }
 
 #[derive(Default)]
 struct InnerDirectory {
     fs: HashMap<PathBuf, FileSlice>,
+    /// The checkpointed bytes of each file still open for writing.
+    unfinished: HashMap<PathBuf, FileSlice>,
     watch_router: WatchCallbackList,
 }
 
@@ -86,6 +107,31 @@ impl InnerDirectory {
             .get(path)
             .ok_or_else(|| OpenReadError::FileDoesNotExist(PathBuf::from(path)))
             .cloned()
+    }
+
+    fn open_unfinished(&self, path: &Path, len: usize) -> Result<FileSlice, OpenReadError> {
+        let checkpointed = self.unfinished.get(path).ok_or_else(|| {
+            OpenReadError::wrap_io_error(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file is not open with a checkpoint",
+                ),
+                path.to_path_buf(),
+            )
+        })?;
+        if len > checkpointed.len() {
+            return Err(OpenReadError::wrap_io_error(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{len} bytes requested of a file checkpointed at {} bytes",
+                        checkpointed.len()
+                    ),
+                ),
+                path.to_path_buf(),
+            ));
+        }
+        Ok(checkpointed.slice_to(len))
     }
 
     fn delete(&mut self, path: &Path) -> result::Result<(), DeleteError> {
@@ -136,6 +182,7 @@ impl RamDirectory {
     pub fn deep_clone(&self) -> RamDirectory {
         let inner_clone = InnerDirectory {
             fs: self.fs.read().unwrap().fs.clone(),
+            unfinished: Default::default(),
             watch_router: Default::default(),
         };
         RamDirectory {
@@ -174,6 +221,10 @@ impl Directory for RamDirectory {
 
     fn open_read(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
         self.fs.read().unwrap().open_read(path)
+    }
+
+    fn open_unfinished(&self, path: &Path, len: usize) -> result::Result<FileSlice, OpenReadError> {
+        self.fs.read().unwrap().open_unfinished(path, len)
     }
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
@@ -249,6 +300,7 @@ mod tests {
     use std::path::Path;
 
     use super::RamDirectory;
+    use crate::directory::TerminatingWrite;
     use crate::Directory;
 
     #[test]
@@ -266,6 +318,32 @@ mod tests {
         assert!(directory.persist(&directory_copy).is_ok());
         assert_eq!(directory_copy.atomic_read(path_atomic).unwrap(), msg_atomic);
         assert_eq!(directory_copy.atomic_read(path_seq).unwrap(), msg_seq);
+    }
+
+    #[test]
+    fn test_checkpoint_serves_the_written_prefix() {
+        let path = Path::new("unfinished");
+        let directory = RamDirectory::create();
+        let mut wrt = directory.open_write(path).unwrap();
+        assert!(directory.open_unfinished(path, 0).is_err());
+        wrt.write_all(b"written before").unwrap();
+        wrt.checkpoint().unwrap();
+        let prefix = directory.open_unfinished(path, 14).unwrap();
+        assert_eq!(prefix.read_bytes().unwrap().as_slice(), b"written before");
+        let head = directory.open_unfinished(path, 7).unwrap();
+        assert_eq!(head.read_bytes().unwrap().as_slice(), b"written");
+        assert!(directory.open_unfinished(path, 15).is_err());
+        drop((prefix, head));
+
+        wrt.write_all(b" and after").unwrap();
+        wrt.flush().unwrap();
+        assert!(wrt.checkpoint().is_err());
+
+        wrt.terminate().unwrap();
+        assert_eq!(
+            directory.atomic_read(path).unwrap(),
+            b"written before and after"
+        );
     }
 
     #[test]

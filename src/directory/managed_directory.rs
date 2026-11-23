@@ -310,6 +310,11 @@ impl Directory for ManagedDirectory {
         Ok(reader)
     }
 
+    /// The unfinished bytes carry no footer: the footer is appended when the file terminates.
+    fn open_unfinished(&self, path: &Path, len: usize) -> result::Result<FileSlice, OpenReadError> {
+        self.directory.open_unfinished(path, len)
+    }
+
     fn open_write_inner(&self, path: &Path) -> result::Result<InnerWritePtr, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;

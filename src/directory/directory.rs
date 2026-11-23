@@ -133,6 +133,21 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
         Ok(FileSlice::new(file_handle))
     }
 
+    /// The first `len` bytes of `path`, a file this directory is still writing and whose writer was
+    /// checkpointed at `len` bytes or more.
+    ///
+    /// No read overlaps a write. A handle is opened before the first write that follows the
+    /// checkpoint, and it and every slice of it are dropped before the file is written again.
+    fn open_unfinished(&self, path: &Path, _len: usize) -> Result<FileSlice, OpenReadError> {
+        Err(OpenReadError::wrap_io_error(
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory does not support reading unfinished files",
+            ),
+            path.to_path_buf(),
+        ))
+    }
+
     /// Removes a file
     ///
     /// Removing a file will not affect an eventual
