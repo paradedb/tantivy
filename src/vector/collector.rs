@@ -3563,9 +3563,9 @@ mod late_filter_tests {
         }
     }
 
-    /// Checks that `fruit` holds the oracle's top `top_n`, except for rows whose last upper
-    /// endpoint fell below their exact score. Only matching rows' exact scores set the threshold,
-    /// so it never passes the k-th exact score, and a row whose interval holds its score stays in.
+    /// Checks that `fruit` holds the oracle's top `top_n`, except for rows the scan pruned on their
+    /// upper endpoint. Only matching rows' exact scores set the threshold, so it never passes the
+    /// last returned score, and the last upper endpoint of a pruned row is below that score.
     fn assert_oracle_or_interval_misses(
         fixture: &Fixture,
         filter: &dyn Query,
@@ -3590,14 +3590,26 @@ mod late_filter_tests {
             "results out of the oracle's order"
         );
         prop_assert_eq!(fruit.results.len(), top_n.min(ranked.len()));
+        // Drops are rare, so the returned rows keep `last_upper` exercised in every case.
+        for &(_, address) in &fruit.results {
+            prop_assert!(
+                last_upper(fixture, &fruit.stats, address)?.is_some(),
+                "no upper endpoint traced for {:?}",
+                address
+            );
+        }
+        let Some(&(last_score, _)) = fruit.results.last() else {
+            return Ok(());
+        };
         for (score, address) in dropped {
             let upper = last_upper(fixture, &fruit.stats, address)?;
             prop_assert!(
-                upper.is_some_and(|upper| upper < score),
-                "dropped {:?}: upper {:?}, exact {}",
+                upper.is_some_and(|upper| upper < last_score),
+                "dropped {:?}: upper {:?}, exact {}, last returned {}",
                 address,
                 upper,
-                score
+                score,
+                last_score
             );
         }
         Ok(())
@@ -3634,7 +3646,8 @@ mod late_filter_tests {
                 .find(|(row, _)| rows.contains(row))
                 .map(|&(_, upper)| upper)
         };
-        let shortlisted = trace.layer_columns.first().and_then(|columns| {
+        // The late filter traces one layer-0 shortlist for each routing window.
+        let shortlisted = trace.layer_columns.iter().rev().find_map(|columns| {
             columns
                 .iter()
                 .find(|(row, _)| rows.contains(row))
