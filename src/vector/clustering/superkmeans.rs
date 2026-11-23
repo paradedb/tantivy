@@ -169,6 +169,16 @@ impl SuperKMeansClusterer {
         self
     }
 
+    /// Threads in the pool each SuperKMeans model owns, where training and nearest-centroid
+    /// assignment run. `0`, the default, sizes it from `RAYON_NUM_THREADS`, or one thread per
+    /// logical CPU. SOAR and routed assignment run on the caller's Rayon pool instead.
+    pub fn with_n_threads(mut self, n_threads: u32) -> Self {
+        self.config.base.n_threads = n_threads;
+        // A clone shares its assigner, whose pool has the old size.
+        self.assigner = Arc::new(Mutex::new(None));
+        self
+    }
+
     /// Trains on `ratio` of the vectors (`Some(r)` in `(0, 1]`), or derives the sample ratio from
     /// `target_leaf_size` and the memory budget when `None`.
     pub fn with_training_sample_ratio(mut self, ratio: Option<f32>) -> Self {
@@ -430,12 +440,7 @@ impl IvfClusterer for SuperKMeansClusterer {
     ) -> crate::Result<Vec<(u32, Option<u32>)>> {
         let mut pairs = Vec::with_capacity(source.num_rows());
         let IvfCentroids::F32(centroids) = centroids;
-        let soar = SoarAssigner::with_candidates(
-            as_matrix(centroids),
-            lambda,
-            2,
-            SOAR_CANDIDATES,
-        );
+        let soar = SoarAssigner::with_candidates(as_matrix(centroids), lambda, 2, SOAR_CANDIDATES);
         let batch_rows = self.budget_rows(options);
         for_each_batch(source, batch_rows, |IvfTrainingVectors::F32(batch)| {
             let (primary, secondary) = soar.assign(as_matrix(&batch.matrix));
@@ -1449,5 +1454,9 @@ mod tests {
         assert_eq!(ratio, 1.0);
         assert_eq!(clusterer.config.target_leaf_size, 20);
         assert_eq!(clusterer.training_target_leaf_size(ratio), 20);
+
+        // The thread count reaches the models training builds.
+        let clusterer = clusterer.with_n_threads(3);
+        assert_eq!(clusterer.training_config(false, ratio).base.n_threads, 3);
     }
 }
