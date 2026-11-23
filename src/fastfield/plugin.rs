@@ -16,7 +16,9 @@ use crate::directory::{Directory, WritePtr};
 use crate::fastfield::{FastFieldReaders, FastFieldsWriter};
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
-use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+use crate::plugin::{
+    MergePhase, PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin,
+};
 use crate::schema::document::Document;
 use crate::schema::{value_type_to_column_type, Schema};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
@@ -31,6 +33,10 @@ impl SegmentPlugin for FastFieldsPlugin {
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         unimplemented!("FastFieldsPlugin is a built-in; use FastFieldsPluginWriter::new")
+    }
+
+    fn merge_phase(&self) -> MergePhase<'_> {
+        MergePhase::FastFields
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {

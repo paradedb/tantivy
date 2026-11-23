@@ -25,7 +25,7 @@ use crate::indexer::stamper::Stamper;
 use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
 };
-use crate::{FutureResult, Opstamp, TantivyError};
+use crate::{FutureResult, MergePhase, Opstamp, TantivyError};
 
 /// Save the index meta file.
 /// This operation is atomic:
@@ -128,6 +128,7 @@ fn merge(
     target_opstamp: Opstamp,
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
+    progress: &mut dyn FnMut(MergePhase<'_>),
 ) -> crate::Result<Option<SegmentEntry>> {
     let num_docs = segment_entries
         .iter()
@@ -163,7 +164,7 @@ fn merge(
     )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let num_docs = merger.write(&merged_segment)?;
+    let num_docs = merger.write_with_progress(&merged_segment, progress)?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -678,6 +679,7 @@ impl SegmentUpdater {
                     merge_operation.target_opstamp(),
                     cancel,
                     false,
+                    &mut |_| {},
                 ) {
                     Ok(after_merge_segment_entry) => {
                         let res =
@@ -706,6 +708,7 @@ impl SegmentUpdater {
     pub(crate) fn merge_foreground(
         &self,
         merge_operation: MergeOperation,
+        progress: &mut dyn FnMut(MergePhase<'_>),
     ) -> crate::Result<Option<SegmentMeta>> {
         assert!(
             !merge_operation.segment_ids().is_empty(),
@@ -726,6 +729,7 @@ impl SegmentUpdater {
             merge_operation.target_opstamp(),
             cancel,
             merge_operation.ignore_store(),
+            progress,
         ) {
             Ok(after_merge_segment_entry) => {
                 segment_updater.end_merge_foreground(merge_operation, after_merge_segment_entry)

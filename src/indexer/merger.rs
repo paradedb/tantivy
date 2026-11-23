@@ -8,7 +8,7 @@ use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
 use crate::index::{builtin_plugins, Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
-use crate::plugin::{PluginMergeContext, SegmentPlugin};
+use crate::plugin::{MergePhase, PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
 use crate::termdict::TermOrdinal;
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
@@ -525,6 +525,16 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, target_segment: &Segment) -> crate::Result<u32> {
+        self.write_with_progress(target_segment, &mut |_| {})
+    }
+
+    /// Write the merged segment and report each phase synchronously on the calling thread.
+    pub fn write_with_progress(
+        &self,
+        target_segment: &Segment,
+        progress: &mut dyn FnMut(MergePhase<'_>),
+    ) -> crate::Result<u32> {
+        progress(MergePhase::DocIdMapping);
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
@@ -542,6 +552,7 @@ impl IndexMerger {
             .into_iter()
             .chain(self.custom_plugins.iter().cloned())
         {
+            progress(plugin.merge_phase());
             debug!("merge-plugin: {:?}", plugin.extensions());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,

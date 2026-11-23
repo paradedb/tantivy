@@ -23,7 +23,9 @@ use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
-use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+use crate::plugin::{
+    MergePhase, PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin,
+};
 use crate::postings::{
     compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
     InvertedIndexSerializer, PerFieldPostingsWriter, Postings, PostingsMerger, PostingsWriter,
@@ -68,6 +70,10 @@ impl SegmentPlugin for InvertedIndexPlugin {
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         unimplemented!("InvertedIndexPlugin is a built-in; use InvertedIndexPluginWriter::new")
+    }
+
+    fn merge_phase(&self) -> MergePhase<'_> {
+        MergePhase::InvertedIndex
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {

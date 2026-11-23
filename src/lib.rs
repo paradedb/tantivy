@@ -235,7 +235,9 @@ pub use crate::index::{
     InvertedIndexReader, Order, Segment, SegmentMeta, SegmentReader,
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
-pub use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+pub use crate::plugin::{
+    MergePhase, PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin,
+};
 pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.

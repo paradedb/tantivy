@@ -11,7 +11,9 @@ use measure_time::debug_time;
 use crate::directory::Directory;
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::DocIdMapping;
-use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+use crate::plugin::{
+    MergePhase, PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin,
+};
 use crate::schema::document::Document;
 use crate::schema::Schema;
 use crate::space_usage::{ComponentSpaceUsage, STORE};
@@ -27,6 +29,10 @@ impl SegmentPlugin for StorePlugin {
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         unimplemented!("StorePlugin is a built-in; use StorePluginWriter::new")
+    }
+
+    fn merge_phase(&self) -> MergePhase<'_> {
+        MergePhase::Store
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {

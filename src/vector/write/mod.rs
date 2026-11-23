@@ -21,7 +21,9 @@ pub(crate) mod ivf;
 use std::sync::Arc;
 
 use crate::error::DataCorruption;
-use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+use crate::plugin::{
+    MergePhase, PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin,
+};
 use crate::vector::storage::header::{CENTROIDS_EXT, VEC_EXT};
 use crate::vector::write::flat::{merge_flat, FlatVecWriter};
 use crate::vector::write::ivf::merge_ivf;
@@ -46,6 +48,10 @@ impl SegmentPlugin for VectorPlugin {
         // Per-doc indexing only ever produces flatvec — clustering
         // exists exclusively as a merge-time transformation.
         Ok(Box::new(FlatVecWriter::for_schema(&ctx.segment.schema())))
+    }
+
+    fn merge_phase(&self) -> MergePhase<'_> {
+        MergePhase::Vectors
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {

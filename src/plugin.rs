@@ -20,6 +20,24 @@ use crate::schema::Schema;
 use crate::space_usage::ComponentSpaceUsage;
 use crate::{DocId, Segment};
 
+/// A phase of a segment merge, reported before its work begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MergePhase<'a> {
+    /// Build the mapping from source to merged document IDs.
+    DocIdMapping,
+    /// Merge field norms, terms, postings, and positions.
+    InvertedIndex,
+    /// Merge columnar fast fields.
+    FastFields,
+    /// Merge stored documents.
+    Store,
+    /// Merge vector data and build its index.
+    Vectors,
+    /// Merge a custom plugin, identified by its file extensions.
+    Custom(&'a [&'a str]),
+}
+
 /// A pluggable segment component that participates in writing and merging.
 ///
 /// Each plugin manages one or more files within a segment. The plugin is a factory
@@ -46,6 +64,11 @@ pub trait SegmentPlugin: Send + Sync + 'static {
     /// type when it needs to call component-specific APIs (e.g., feeding terms to
     /// the postings writer).
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>>;
+
+    /// Identify this plugin in merge progress callbacks.
+    fn merge_phase(&self) -> MergePhase<'_> {
+        MergePhase::Custom(self.extensions())
+    }
 
     /// Merge data from multiple source segments into a target segment.
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()>;
@@ -154,11 +177,13 @@ mod tests {
     //! full lifecycle: write → read → merge → read.
 
     use std::sync::Arc;
+    use std::thread;
 
     use serde_json::json;
 
     use super::*;
     use crate::index::SegmentComponent;
+    use crate::indexer::NoMergePolicy;
     use crate::schema::document::{ErasedDocument, Value};
     use crate::schema::{Field, FieldType, Schema, STORED, TEXT};
     use crate::{Index, IndexWriter, TantivyDocument};
@@ -277,8 +302,6 @@ mod tests {
 
     #[test]
     fn test_plugin_full_lifecycle() -> crate::Result<()> {
-        use crate::indexer::NoMergePolicy;
-
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
         // A plugin-defined field type. Only the type name is declared here; no plugin is named.
@@ -363,6 +386,41 @@ mod tests {
             MARKER
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_foreground_merge_reports_phases() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT | STORED);
+        let index = Index::builder()
+            .schema(schema.build())
+            .register_plugin(Arc::new(MarkerPlugin))
+            .create_in_ram()?;
+        let mut writer = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for value in ["hello", "world"] {
+            writer.add_document(doc!(text => value))?;
+            writer.commit()?;
+        }
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 2);
+        let mut expected = [
+            MergePhase::DocIdMapping,
+            MergePhase::InvertedIndex,
+            MergePhase::FastFields,
+            MergePhase::Store,
+            MergePhase::Vectors,
+            MergePhase::Custom(&["marker"]),
+        ]
+        .into_iter();
+        let caller = thread::current().id();
+        let merged = writer.merge_foreground_with_progress(&segment_ids, false, &mut |phase| {
+            assert_eq!(thread::current().id(), caller);
+            assert_eq!(Some(phase), expected.next());
+        })?;
+        assert!(expected.next().is_none());
+        assert_eq!(merged.unwrap().num_docs(), 2);
         Ok(())
     }
 

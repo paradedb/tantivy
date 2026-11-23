@@ -22,7 +22,7 @@ use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
 use crate::schema::document::Document;
 use crate::schema::{IndexRecordOption, TantivyDocument, Term};
-use crate::{Directory, DocId, FutureResult, Opstamp};
+use crate::{Directory, DocId, FutureResult, MergePhase, Opstamp};
 
 // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
@@ -578,10 +578,24 @@ impl<D: Document> IndexWriter<D> {
         segment_ids: &[SegmentId],
         ignore_store: bool,
     ) -> crate::Result<Option<SegmentMeta>> {
+        self.merge_foreground_with_progress(segment_ids, ignore_store, &mut |_| {})
+    }
+
+    /// Merge segments and report each phase before it begins, on the calling thread.
+    ///
+    /// The callback may borrow local state and is never sent to a worker thread.
+    /// The merge has the same behavior as [`Self::merge_foreground`].
+    pub fn merge_foreground_with_progress(
+        &mut self,
+        segment_ids: &[SegmentId],
+        ignore_store: bool,
+        progress: &mut dyn FnMut(MergePhase<'_>),
+    ) -> crate::Result<Option<SegmentMeta>> {
         let merge_operation = self
             .segment_updater
             .make_merge_operation(segment_ids, ignore_store);
-        self.segment_updater.merge_foreground(merge_operation)
+        self.segment_updater
+            .merge_foreground(merge_operation, progress)
     }
 
     /// Closes the current document channel send.
