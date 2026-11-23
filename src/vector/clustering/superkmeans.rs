@@ -52,16 +52,20 @@ impl Dataset for SourceDataset<'_> {
             if self.source.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
-            f(Matrix::new(&kept.values, kept.rows, kept.dims));
+            f(as_matrix(kept));
         }
         for start in (self.kept_rows..num_rows).step_by(self.batch_rows) {
             let end = (start + self.batch_rows).min(num_rows);
             let IvfTrainingVectors::F32(batch) = self.source.read_range(start..end)?;
             let batch = checked_matrix(batch.matrix, end - start, self.dim)?;
-            f(Matrix::new(&batch.values, batch.rows, batch.dims));
+            f(as_matrix(&batch));
         }
         Ok(())
     }
+}
+
+fn as_matrix(matrix: &IvfMatrix<f32>) -> Matrix<'_> {
+    Matrix::new(&matrix.values, matrix.rows, matrix.dims)
 }
 
 /// `matrix`, if it holds `rows` vectors of dimension `dim`.
@@ -346,10 +350,11 @@ impl IvfClusterer for SuperKMeansClusterer {
                         return Err(TantivyError::Cancelled);
                     }
                     let rows = meso.offsets[m]..meso.offsets[m + 1];
-                    let fine = kmeans.train_meso_cluster(
+                    let fine = kmeans.train_meso_cluster(&mut Matrix::new(
                         &kept.values[rows.start * dim..rows.end * dim],
                         rows.len(),
-                    );
+                        dim,
+                    ));
                     centroids.extend_from_slice(&fine.centroids);
                 }
             }
@@ -369,10 +374,11 @@ impl IvfClusterer for SuperKMeansClusterer {
                             return Err(TantivyError::Cancelled);
                         }
                         let rows = meso.offsets[m] - group_start..meso.offsets[m + 1] - group_start;
-                        let fine = kmeans.train_meso_cluster(
+                        let fine = kmeans.train_meso_cluster(&mut Matrix::new(
                             &group.values[rows.start * dim..rows.end * dim],
                             rows.len(),
-                        );
+                            dim,
+                        ));
                         centroids.extend_from_slice(&fine.centroids);
                     }
                     start = end;
@@ -406,11 +412,7 @@ impl IvfClusterer for SuperKMeansClusterer {
             source,
             self.budget_rows(options),
             |IvfTrainingVectors::F32(batch)| {
-                assignments.extend(kmeans.assign(
-                    &batch.matrix.values,
-                    centroids.values.as_slice(),
-                    batch.matrix.rows,
-                ));
+                assignments.extend(kmeans.assign(as_matrix(&batch.matrix), as_matrix(centroids)));
             },
         )?;
         Ok(assignments)
@@ -429,14 +431,14 @@ impl IvfClusterer for SuperKMeansClusterer {
         let mut pairs = Vec::with_capacity(source.num_rows());
         let IvfCentroids::F32(centroids) = centroids;
         let soar = SoarAssigner::with_candidates(
-            Matrix::new(&centroids.values, centroids.rows, centroids.dims),
+            as_matrix(centroids),
             lambda,
             2,
             SOAR_CANDIDATES,
         );
         let batch_rows = self.budget_rows(options);
         for_each_batch(source, batch_rows, |IvfTrainingVectors::F32(batch)| {
-            let (primary, secondary) = soar.assign(&batch.matrix.values, batch.matrix.rows);
+            let (primary, secondary) = soar.assign(as_matrix(&batch.matrix));
             pairs.extend(
                 primary
                     .into_iter()
@@ -498,7 +500,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         let assigner = match (candidates, lambda) {
             (Some(candidates), lambda) => BatchAssigner::Routed { candidates, lambda },
             (None, Some(lambda)) => BatchAssigner::Soar(SoarAssigner::with_candidates(
-                Matrix::new(&matrix.values, matrix.rows, matrix.dims),
+                as_matrix(matrix),
                 lambda,
                 2,
                 SOAR_CANDIDATES,
@@ -548,12 +550,12 @@ impl BatchAssigner<'_> {
     ) -> Result<Vec<(u32, Option<u32>)>> {
         match self {
             BatchAssigner::Nearest(kmeans) => Ok(kmeans
-                .assign(&batch.values, centroids.values.as_slice(), batch.rows)
+                .assign(as_matrix(batch), as_matrix(centroids))
                 .into_iter()
                 .map(|cluster| (cluster, None))
                 .collect()),
             BatchAssigner::Soar(soar) => {
-                let (primary, secondary) = soar.assign(&batch.values, batch.rows);
+                let (primary, secondary) = soar.assign(as_matrix(batch));
                 Ok(primary
                     .into_iter()
                     .zip(secondary)
