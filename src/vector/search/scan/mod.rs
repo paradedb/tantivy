@@ -552,10 +552,12 @@ impl<'a> QuantizedState<'a> {
     /// Drops block `b`'s candidates whose upper endpoint fell below the shared slot since the last
     /// boundary, before the block is read; returns the rows dropped.
     fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
+        let segment_ord = self.segment_ord;
         match bound.shared_threshold() {
-            Some(score) => self.candidates.recheck(
+            Some(kth) => self.candidates.recheck(
                 b,
-                Threshold(crate::vector::search::interval::LowerEndpoint(score)),
+                Threshold(crate::vector::search::interval::LowerEndpoint(kth)),
+                |row| bound.counts(segment_ord, row, kth),
             ),
             None => 0,
         }
@@ -597,10 +599,12 @@ impl<'a> QuantizedState<'a> {
         if !self.late_filter {
             bound.offer(self.candidates.live_candidates(self.segment_ord));
         }
-        let threshold = bound
-            .shared_threshold()
-            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
-        self.candidates.band(threshold);
+        let kth = bound.shared_threshold();
+        let segment_ord = self.segment_ord;
+        self.candidates.band(
+            kth.map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
+            |row| kth.is_some_and(|kth| bound.counts(segment_ord, row, kth)),
+        );
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report

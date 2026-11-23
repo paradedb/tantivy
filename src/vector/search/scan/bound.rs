@@ -20,6 +20,7 @@ use rustc_hash::FxHashMap;
 
 use crate::collector::SharedThreshold;
 use crate::vector::write::RowAddress;
+use crate::vector::BlockAddress;
 use crate::{Score, SegmentOrdinal};
 
 // --- Scores ---
@@ -349,20 +350,32 @@ impl PruningBound {
             .filter(|score| score.is_finite())
     }
 
+    /// Whether the local top k holds the row at `block_address` of `segment_ord` at or above
+    /// `kth`, a value of the shared threshold. The row is then one of the k rows the threshold
+    /// counts.
+    ///
+    /// Such a row is never pruned. Its refined upper endpoint or its exact score can land below
+    /// its own lower endpoint, and pruning it leaves fewer than k rows.
+    pub(crate) fn counts(
+        &self,
+        segment_ord: SegmentOrdinal,
+        block_address: BlockAddress,
+        kth: f32,
+    ) -> bool {
+        let address = RowAddress {
+            segment_ord,
+            block_address,
+        };
+        self.top.holds_at_or_above(&address, kth)
+    }
+
     /// Whether the exact `score` of `address` is below the shared threshold, so the row cannot
-    /// enter the top k.
-    ///
-    /// A row held at or above the threshold is one of the k rows the threshold counts, so it is
-    /// never excluded. Its exact score can land below its own lower endpoint, and excluding it
-    /// leaves fewer than k rows.
-    ///
-    /// Only exact scores get this check. A layer boundary or a recheck still drops a held row
-    /// whose refined upper endpoint is below the threshold.
+    /// enter the top k. A row the threshold counts is never excluded.
     pub(crate) fn excludes_exact(&self, address: RowAddress, score: f32) -> bool {
         let Some(kth) = self.shared_threshold() else {
             return false;
         };
-        score < kth && !self.top.holds_at_or_above(&address, kth)
+        score < kth && !self.counts(address.segment_ord, address.block_address, kth)
     }
 
     /// Upserts competitive bounds by [`RowAddress`]. When the local top holds `k` values and the
@@ -851,6 +864,35 @@ mod tests {
             assert_eq!(far.candidates.row_labels(), [0]);
         }
 
+        /// A row the threshold counts stays a candidate when a later layer refines its upper
+        /// endpoint below its own layer-0 lower, at a boundary and at a recheck. A row the bound
+        /// does not hold, and a held row below a threshold another segment published, are still
+        /// dropped.
+        #[test]
+        fn test_refined_upper_below_its_own_lower_stays_in() {
+            // The lower endpoints are 10, 7 and 4. The bound holds rows 0 and 1, and row 1's lower
+            // is the threshold. A later layer then refines row 1 to an upper endpoint of 6.7.
+            let refined = || {
+                let rows = [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 5.0, 0.5)];
+                let mut harness = admitted(2, 2.0, &rows);
+                assert_eq!(harness.slot_threshold(2), Some(7.0));
+                harness.candidates.columns.estimates[1] = 6.5;
+                harness.candidates.columns.sigmas[1] = 0.1;
+                harness
+            };
+
+            let mut boundary = refined();
+            boundary.band(2, 2.0);
+            assert_eq!(boundary.candidates.row_labels(), [0, 1]);
+            assert_eq!(boundary.slot_threshold(2), Some(7.0));
+
+            let mut rechecked = refined();
+            assert_eq!(rechecked.recheck(0, 7.0), 1);
+            assert_eq!(rechecked.candidates.row_labels(), [0, 1]);
+            assert_eq!(rechecked.recheck(0, 8.0), 1);
+            assert_eq!(rechecked.candidates.row_labels(), [0]);
+        }
+
         /// Exact offer for the same address replaces the interval (no double-count) and only
         /// raises that row's lower endpoint.
         #[test]
@@ -1062,7 +1104,7 @@ mod tests {
                     harness.candidates.remove_rows(b, &removed);
                     rows.retain(|row| removed.binary_search(&(row.0 as u32)).is_err());
                 }
-                harness.candidates.band(None);
+                harness.candidates.band(None, |_| false);
                 let expected = harness_of(&kept);
                 assert_eq!(
                     harness.candidates.column_trace(true),

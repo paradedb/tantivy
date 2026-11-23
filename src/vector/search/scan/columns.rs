@@ -242,9 +242,32 @@ impl QuantizedCandidates {
 
     /// Drops, in place, block `b`'s candidates whose upper endpoint is below `threshold`, keeping
     /// row order and the doc ids aligned; the block's range shrinks and the entries past it stay
-    /// dead until the next boundary compacts them. Returns the rows dropped.
-    pub(crate) fn recheck(&mut self, b: usize, threshold: Threshold) -> usize {
-        self.retain(b, |candidates, row| threshold.admits(candidates.upper(row)))
+    /// dead until the next boundary compacts them. A row for which `counted` is true stays,
+    /// because the threshold counts it. Returns the rows dropped.
+    pub(crate) fn recheck(
+        &mut self,
+        b: usize,
+        threshold: Threshold,
+        counted: impl Fn(BlockAddress) -> bool,
+    ) -> usize {
+        let cluster = self.blocks[b].cluster as u32;
+        self.retain(b, |candidates, row| {
+            candidates.stays(cluster, row, threshold, &counted)
+        })
+    }
+
+    /// Whether the candidate at `index`, a row of `cluster`, stays at `threshold`. It stays when
+    /// its upper endpoint reaches the threshold, or when `counted` is true for the row.
+    #[inline]
+    fn stays(
+        &self,
+        cluster: u32,
+        index: usize,
+        threshold: Threshold,
+        counted: &impl Fn(BlockAddress) -> bool,
+    ) -> bool {
+        threshold.admits(self.upper(index))
+            || counted(BlockAddress::new(cluster, self.offsets[index]))
     }
 
     pub(crate) fn remove_rows(&mut self, b: usize, offsets: &[u32]) {
@@ -327,15 +350,21 @@ impl QuantizedCandidates {
 
     /// Keeps, in place, each block's candidates whose upper endpoint reaches `threshold`, a
     /// boundary's; selecting by lower endpoint, not estimate, keeps every true top-k row whose
-    /// interval encloses its score. Blocks keep their row order and a retired block keeps nothing.
+    /// interval encloses its score. A row for which `counted` is true stays too, because the
+    /// threshold counts it. Blocks keep their row order and a retired block keeps nothing.
     /// Blocks are walked in admission order, which is storage order, so writes never pass reads.
-    pub(crate) fn band(&mut self, threshold: Option<Threshold>) {
+    pub(crate) fn band(
+        &mut self,
+        threshold: Option<Threshold>,
+        counted: impl Fn(BlockAddress) -> bool,
+    ) {
         let (mut write, mut docs_write) = (0, 0);
         for b in 0..self.blocks.len() {
             let (at, docs) = (self.blocks[b].at.clone(), self.blocks[b].docs);
+            let cluster = self.blocks[b].cluster as u32;
             let (start, docs_start) = (write, docs_write);
             for read in at.clone() {
-                if threshold.is_none_or(|kth| kth.admits(self.upper(read))) {
+                if threshold.is_none_or(|kth| self.stays(cluster, read, kth, &counted)) {
                     self.offsets[write] = self.offsets[read];
                     self.columns.move_entry(read, write);
                     if let Some(docs) = docs {
@@ -601,10 +630,11 @@ impl BoundaryHarness {
             PruningBound::new(k, Arc::new(AtomicSharedThreshold::default()))
         });
         bound.offer(self.candidates.live_candidates(0));
-        let threshold = bound
-            .shared_threshold()
-            .map(|score| Threshold(LowerEndpoint(score)));
-        self.candidates.band(threshold);
+        let kth = bound.shared_threshold();
+        self.candidates
+            .band(kth.map(|score| Threshold(LowerEndpoint(score))), |row| {
+                kth.is_some_and(|kth| bound.counts(0, row, kth))
+            });
     }
 
     /// The bound's shared-slot pruning threshold.
@@ -631,7 +661,10 @@ impl BoundaryHarness {
     /// Rechecks block `b` against `threshold`; returns the rows dropped.
     pub(crate) fn recheck(&mut self, b: usize, threshold: f32) -> usize {
         self.block_open = false;
+        let bound = self.bound.as_ref();
         self.candidates
-            .recheck(b, Threshold(LowerEndpoint(threshold)))
+            .recheck(b, Threshold(LowerEndpoint(threshold)), |row| {
+                bound.is_some_and(|bound| bound.counts(0, row, threshold))
+            })
     }
 }
