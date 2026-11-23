@@ -26,6 +26,7 @@ use crate::vector::storage::header::{write_vector_header, VectorEntry, HEADER_LE
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
 use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::write::rows::StreamedRows;
 use crate::vector::write::RowAddress;
 use crate::vector::ENTRY_ALIGN;
 use crate::{DocId, TantivyError};
@@ -125,6 +126,11 @@ impl FlatEntryWriter {
             written,
             num_rows: 0,
         })
+    }
+
+    /// Rows appended so far.
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
     }
 
     /// Appends `rows`, a whole number of rows, closing each group it fills.
@@ -321,8 +327,12 @@ impl PluginWriter for FlatVecWriter {
 
 // --- Merge ---
 
-/// Merges source vectors into a flat target segment.
-pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
+/// Merges source vectors into a flat target segment. With `streamed` rows, the target's `.vec`
+/// already holds them as its Data entry and only the IdMap is written.
+pub(crate) fn merge_flat(
+    ctx: &PluginMergeContext,
+    streamed: Option<(CompositeWrite, StreamedRows)>,
+) -> crate::Result<()> {
     let has_vector_field = ctx
         .schema
         .fields()
@@ -332,6 +342,16 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     }
     if ctx.cancel.wants_cancel() {
         return Err(crate::TantivyError::Cancelled);
+    }
+    if let Some((mut composite, rows)) = streamed {
+        let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum::<u32>();
+        IdMap::serialize(
+            &rows.present_docs(),
+            num_target_docs,
+            composite.for_field_with_idx(rows.field, VectorEntry::IdMap.index()),
+        )?;
+        composite.close()?;
+        return Ok(());
     }
     let path = ctx
         .target_segment

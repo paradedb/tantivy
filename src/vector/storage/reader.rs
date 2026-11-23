@@ -526,6 +526,33 @@ impl VectorIndexReader {
         })
     }
 
+    /// A reader over `entry`, one flat entry whose rows `id_map` addresses, in a segment of
+    /// `max_doc` documents.
+    pub(crate) fn flat(
+        entry: FileSlice,
+        options: VectorOptions,
+        max_doc: DocId,
+        id_map: IdMap,
+    ) -> crate::Result<Self> {
+        let rows_slice = Arc::new(Blocks::open(entry, &options, false)?);
+        if matches!(id_map, IdMap::DocLocations(_))
+            || rows_slice.num_rows() != id_map.num_rows() as usize
+        {
+            return Err(DataCorruption::comment_only("flat vector row count mismatch").into());
+        }
+        Ok(Self {
+            max_doc,
+            options,
+            num_vectors: rows_slice.num_rows(),
+            present: true,
+            id_map: DeferredIdMap::ready(id_map),
+            rows_slice,
+            index: None,
+            exact: None,
+            quantization: OnceLock::new(),
+        })
+    }
+
     /// A reader with no rows and no routing index; every accessor behaves as an empty column.
     pub(crate) fn empty(options: VectorOptions) -> Self {
         let mut bytes = Vec::new();
