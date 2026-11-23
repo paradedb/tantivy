@@ -355,6 +355,9 @@ impl PruningBound {
     /// A row held at or above the threshold is one of the k rows the threshold counts, so it is
     /// never excluded. Its exact score can land below its own lower endpoint, and excluding it
     /// leaves fewer than k rows.
+    ///
+    /// Only exact scores get this check. A layer boundary or a recheck still drops a held row
+    /// whose refined upper endpoint is below the threshold.
     pub(crate) fn excludes_exact(&self, address: RowAddress, score: f32) -> bool {
         let Some(kth) = self.shared_threshold() else {
             return false;

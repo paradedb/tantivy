@@ -298,8 +298,8 @@ where
         if let Some(fold) = fold {
             fold.score(score);
         }
-        // Rows that cannot enter the top k skip the tie-break and the doc id lookup: below the
-        // shared floor, or below the result heap's own threshold.
+        // Rows that cannot enter the top k skip the tie-break and the doc id lookup. A row the
+        // shared threshold counts is kept, even when it scores below that threshold.
         if bound.excludes_exact(address, score)
             || self
                 .topn
