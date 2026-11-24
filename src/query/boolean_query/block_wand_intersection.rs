@@ -809,7 +809,7 @@ mod tests {
                 top_k,
                 filter_docs.as_deref(),
             );
-            for filter_probe in [ProbeCost::BITSET, ProbeCost::VECTORIZED_PREDICATE] {
+            for filter_probe in [ProbeCost::BITSET, ProbeCost::DICT_BLOCK] {
                 let (checkpoints_optimized, _) =
                     compute_checkpoints_block_wand_intersection_with_probe(
                         make_scorers(),

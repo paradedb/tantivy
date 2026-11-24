@@ -781,7 +781,7 @@ mod tests {
 
         // Driver yields 100 docs (0..100). Cheap follower matches only multiples of 10 (10% hit
         // rate) with higher drive cost than expensive follower's low probe-setup test, while the
-        // expensive follower matches 50% of docs with `VECTORIZED_PREDICATE` probe cost.
+        // expensive follower matches 50% of docs with high-setup probe cost.
         // Regardless of input order, the cheap selective follower must be probed first so the
         // expensive follower only sees the ~10 surviving candidates instead of all 100.
         for reverse in [false, true] {

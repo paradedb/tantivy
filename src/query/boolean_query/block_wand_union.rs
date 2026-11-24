@@ -1070,7 +1070,7 @@ mod tests {
             test_filter in arb_test_filter(),
             filter_probe in prop_oneof![
                 Just(ProbeCost::BITSET),
-                Just(ProbeCost::VECTORIZED_PREDICATE),
+                Just(ProbeCost::DICT_BLOCK),
             ],
         ) {
             let (term_scorers, max_doc) = make_term_scorers(&posting_lists, &fieldnorms);
@@ -1179,7 +1179,7 @@ mod tests {
                 num_docs,
                 mode,
                 Some(&filter_docs),
-                ProbeCost::VECTORIZED_PREDICATE,
+                ProbeCost::DICT_BLOCK,
             );
             assert_eq!(early_cp.len(), deferred_cp.len(), "{name}");
             assert!(

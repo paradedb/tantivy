@@ -28,7 +28,8 @@ impl DriveCost {
 /// in units of one `TermScorer::advance()`.
 ///
 /// Zero for in-memory docsets (`TermScorer`, `BitSetDocSet`, `RangeDocSet`, `PhraseScorer`);
-/// large for cross-boundary vectorized predicates (`PredicateColumnDocSet`).
+/// non-zero for lazy SSTable dictionary block decoding (`CachedDictPredicateDocSet`) or
+/// cross-boundary vectorized predicates (`PredicateColumnDocSet`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProbeSetupCost(pub u64);
 
@@ -94,11 +95,11 @@ impl ProbeCost {
     /// populated `CachedDictPredicateDocSet`).
     pub const FAST_FIELD_LOOKUP: Self = Self::per_doc(10);
 
-    /// Cross-boundary vectorized predicate probe (`PredicateColumnDocSet`): high fixed per-call
-    /// batch setup plus fast-field decode and external predicate evaluation.
-    pub const VECTORIZED_PREDICATE: Self = Self {
-        setup: ProbeSetupCost(300),
-        per_doc: ProbePerDocCost(15),
+    /// Lazy SSTable dictionary block decode + lookup (unpopulated `CachedDictPredicateDocSet`):
+    /// fixed block read/decompression setup plus ordinal lookup per probed document.
+    pub const DICT_BLOCK: Self = Self {
+        setup: ProbeSetupCost(64),
+        per_doc: ProbePerDocCost(10),
     };
 
     /// Minimum `setup` above which amortizing over a candidate batch beats buffering overhead

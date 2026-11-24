@@ -123,6 +123,10 @@ impl TermPredicate for ModuloPredicate {
         }
         Ok(())
     }
+
+    fn probe_cost(&self) -> crate::ProbeCost {
+        crate::ProbeCost::per_doc(5)
+    }
 }
 
 impl Expr {

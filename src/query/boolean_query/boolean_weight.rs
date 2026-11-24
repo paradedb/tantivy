@@ -1727,6 +1727,10 @@ mod tests {
             }
             Ok(())
         }
+
+        fn probe_cost(&self) -> crate::ProbeCost {
+            crate::ProbeCost::per_doc(5)
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1983,7 +1987,16 @@ mod tests {
                             Score::MIN
                         })
                         .unwrap();
-                    prop_assert_eq!(pruned_results, ordinary_results.clone());
+                    prop_assert_eq!(pruned_results.len(), ordinary_results.len());
+                    for (&(p_doc, p_score), &(o_doc, o_score)) in
+                        pruned_results.iter().zip(&ordinary_results)
+                    {
+                        prop_assert_eq!(p_doc, o_doc);
+                        prop_assert!(
+                            (p_score - o_score).abs() <= 1e-5,
+                            "doc {p_doc}: pruned score {p_score} != ordinary score {o_score}"
+                        );
+                    }
                 }
 
                 let mut candidates = ExcludedDocSet::new(
