@@ -356,6 +356,7 @@ impl Directory for ManagedDirectory {
     fn load_metas(&self, inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
         self.directory.load_metas(inventory)
     }
+
     fn supports_garbage_collection(&self) -> bool {
         self.directory.supports_garbage_collection()
     }
@@ -366,6 +367,10 @@ impl Directory for ManagedDirectory {
 
     fn wants_cancel(&self) -> bool {
         self.directory.wants_cancel()
+    }
+
+    fn log(&self, message: &str) {
+        self.directory.log(message);
     }
 }
 

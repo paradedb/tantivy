@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io, thread};
 
+use log::Level;
+
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
@@ -60,7 +62,7 @@ impl<T: Send + Sync + 'static> From<Box<T>> for DirectoryLock {
 impl Drop for DirectoryLockGuard {
     fn drop(&mut self) {
         if let Err(e) = self.directory.delete(&self.path) {
-            error!("Failed to remove the lock file. {e:?}");
+            error!("Failed to remove the lock file. {:?}", e);
         }
     }
 }
@@ -268,6 +270,7 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
             "load_metas not implemented".to_string(),
         ))
     }
+
     /// Returns true if this directory supports garbage collection.  The default assumption is
     /// `true`
     fn supports_garbage_collection(&self) -> bool {
@@ -287,6 +290,11 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// merge processes but could be used for anything
     fn wants_cancel(&self) -> bool {
         false
+    }
+
+    /// Send a logging message to the Directory to handle in its own way
+    fn log(&self, message: &str) {
+        log!(Level::Info, "{message}");
     }
 }
 
