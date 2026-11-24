@@ -372,7 +372,7 @@ struct QuantFixtureClusterer {
 }
 
 impl IvfClusterer for QuantFixtureClusterer {
-    fn training_sample_ratio(&self) -> f32 {
+    fn training_sample_ratio(&self, _: &VectorOptions, _: usize) -> f32 {
         0.5
     }
 
@@ -380,6 +380,7 @@ impl IvfClusterer for QuantFixtureClusterer {
         &self,
         options: &VectorOptions,
         _source: &mut dyn VectorSource,
+        _: f32,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), self.dim);
         let values = match self.metric {

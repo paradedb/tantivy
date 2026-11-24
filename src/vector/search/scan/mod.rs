@@ -32,6 +32,7 @@ use self::plan::{price, Read, ReadCosts, SparsePricing};
 use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
+use crate::docset::BLOCK_WINDOW;
 use crate::error::DataCorruption;
 use crate::query::Weight;
 use crate::schema::Metric;
@@ -196,6 +197,10 @@ pub(crate) struct ScanTrace {
     pub(crate) exact_scores: Vec<f32>,
     /// Clusters whose unseen rows were scored from the whole band.
     pub(crate) whole_band_admissions: usize,
+    /// `(row, layer-0 upper endpoint)` of every row admission compared with a threshold.
+    pub(crate) admission_uppers: Vec<(BlockAddress, f32)>,
+    /// `(row, upper endpoint)` of every row the late filter refined, after its last layer.
+    pub(crate) late_filter_uppers: Vec<(BlockAddress, f32)>,
 }
 
 // --- Quantized state ---
@@ -229,6 +234,8 @@ struct QuantizedState<'a> {
     centroid_reads: usize,
     #[cfg(test)]
     whole_band_admissions: usize,
+    #[cfg(test)]
+    admission_uppers: Vec<(BlockAddress, f32)>,
     #[cfg(test)]
     plan_override: Option<PlanOverride>,
     #[cfg(test)]
@@ -272,6 +279,8 @@ impl<'a> QuantizedState<'a> {
             centroid_reads: 0,
             #[cfg(test)]
             whole_band_admissions: 0,
+            #[cfg(test)]
+            admission_uppers: Vec::new(),
             #[cfg(test)]
             plan_override: config.plan_override,
             #[cfg(test)]
@@ -481,6 +490,13 @@ impl<'a> QuantizedState<'a> {
                 .filter(|&(_, &upper)| threshold.admits(UpperEndpoint(upper)))
                 .map(|(&row, _)| row),
         );
+        #[cfg(test)]
+        self.admission_uppers.extend(
+            offsets
+                .iter()
+                .zip(&self.admission_upper)
+                .map(|(&row, &upper)| (BlockAddress::new(whole.cluster as u32, row), upper)),
+        );
         let at = self.candidates.push_selected(
             whole,
             centroid,
@@ -510,6 +526,13 @@ impl<'a> QuantizedState<'a> {
             if threshold.admits(upper) {
                 self.admission_keep.push(index as u32);
             }
+        }
+        #[cfg(test)]
+        for (index, row) in rows.local_rows().enumerate() {
+            let upper = Estimate(self.admission_columns.estimates[index])
+                .upper(self.admission_columns.sigmas[index], kappa);
+            self.admission_uppers
+                .push((BlockAddress::new(rows.cluster as u32, row as u32), upper.0));
         }
     }
 
@@ -552,10 +575,12 @@ impl<'a> QuantizedState<'a> {
     /// Drops block `b`'s candidates whose upper endpoint fell below the shared slot since the last
     /// boundary, before the block is read; returns the rows dropped.
     fn recheck(&mut self, b: usize, bound: &mut PruningBound) -> usize {
+        let segment_ord = self.segment_ord;
         match bound.shared_threshold() {
-            Some(score) => self.candidates.recheck(
+            Some(kth) => self.candidates.recheck(
                 b,
-                Threshold(crate::vector::search::interval::LowerEndpoint(score)),
+                Threshold(crate::vector::search::interval::LowerEndpoint(kth)),
+                |row| bound.counts(segment_ord, row, kth),
             ),
             None => 0,
         }
@@ -597,10 +622,21 @@ impl<'a> QuantizedState<'a> {
         if !self.late_filter {
             bound.offer(self.candidates.live_candidates(self.segment_ord));
         }
-        let threshold = bound
-            .shared_threshold()
-            .map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score)));
-        self.candidates.band(threshold);
+        let kth = bound.shared_threshold();
+        let segment_ord = self.segment_ord;
+        let counted = |row| kth.is_some_and(|kth| bound.counts(segment_ord, row, kth));
+        self.candidates.band(
+            kth.map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
+            |row| {
+                // At layer 0 the bound holds each row at the lower endpoint of the interval
+                // tested here, so a counted row always reaches the threshold.
+                debug_assert!(
+                    layer > 0 || !counted(row),
+                    "layer 0 dropped counted {row:?}"
+                );
+                layer > 0 && counted(row)
+            },
+        );
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
         report
@@ -1086,6 +1122,11 @@ where
                 for (i, &offset) in offsets.iter().enumerate() {
                     let upper = Estimate(state.admission_columns.estimates[i])
                         .upper(state.admission_columns.sigmas[i], state.candidates.kappa());
+                    #[cfg(test)]
+                    self.report
+                        .trace
+                        .late_filter_uppers
+                        .push((BlockAddress::new(cluster as u32, offset), upper.0));
                     if threshold.is_none_or(|bar| upper.0 >= bar) {
                         let docs = doc_cache.entry(cluster).or_default();
                         if docs.is_empty() {
@@ -1105,10 +1146,24 @@ where
                 self.report.layers.last_mut().unwrap().survivors += refined.len();
             }
             // Restore score order after block-local refinement, then recheck the threshold as
-            // each batch's matching exact scores improve the shared top-k.
+            // each batch's matching exact scores improve the shared top-k. Before
+            // `shared_threshold` is populated, no candidate can prune early, so size
+            // warmup chunks up to the remaining slots needed for `top_n` (capped at
+            // `BLOCK_WINDOW`) to amortize filter setup and `seek_danger_batch` without
+            // overshooting exact vector reads.
             refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
-            for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
+            let mut refined_offset = 0;
+            while refined_offset < refined.len() {
                 let threshold = self.bound.shared_threshold();
+                let chunk_len = if threshold.is_some() {
+                    MAX_SHORTLIST_FILTER_BATCH_SIZE
+                } else {
+                    let remaining = self.top_n.saturating_sub(self.bound.len());
+                    remaining.clamp(MAX_SHORTLIST_FILTER_BATCH_SIZE, BLOCK_WINDOW as usize)
+                };
+                let end = (refined_offset + chunk_len).min(refined.len());
+                let candidates = &refined[refined_offset..end];
+                refined_offset = end;
                 indexed.clear();
                 indexed.extend(
                     candidates
@@ -1326,6 +1381,7 @@ where
             #[cfg(test)]
             {
                 report.trace.whole_band_admissions = state.whole_band_admissions;
+                report.trace.admission_uppers = state.admission_uppers.clone();
             }
         }
         #[cfg(test)]

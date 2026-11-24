@@ -290,19 +290,17 @@ where
         let score = self.query.score_row(bytes).score();
         #[cfg(test)]
         self.exact_scores.push(score);
-        bound.offer([Candidate::exact(
-            RowAddress {
-                segment_ord: self.segment_ord,
-                block_address: BlockAddress::new(selected.cluster as u32, local_row as u32),
-            },
-            score,
-        )]);
+        let address = RowAddress {
+            segment_ord: self.segment_ord,
+            block_address: BlockAddress::new(selected.cluster as u32, local_row as u32),
+        };
+        bound.offer([Candidate::exact(address, score)]);
         if let Some(fold) = fold {
             fold.score(score);
         }
-        // Rows that cannot enter the top k skip the tie-break and the doc id lookup: below the
-        // shared floor, or below the result heap's own threshold.
-        if bound.shared_threshold().is_some_and(|kth| score < kth)
+        // Rows that cannot enter the top k skip the tie-break and the doc id lookup. A row the
+        // shared threshold counts is kept, even when it scores below that threshold.
+        if bound.excludes_exact(address, score)
             || self
                 .topn
                 .threshold

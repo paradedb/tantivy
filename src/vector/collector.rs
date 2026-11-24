@@ -3524,7 +3524,9 @@ mod late_filter_tests {
     };
     use crate::schema::Metric;
     use crate::vector::filter::DocFilter;
-    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
+    use crate::vector::search::interval::Estimate;
+    use crate::vector::test_support::{Fixture, FixtureSpec};
     use crate::vector::tests::exhaustive_params;
     use crate::vector::{
         AdaptiveProbeParams, AtomicVectorWork, LocatedPath, PostFilterStage, SharedVectorWork,
@@ -3559,6 +3561,105 @@ mod late_filter_tests {
         fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
             self.inner.explain(reader, doc)
         }
+    }
+
+    /// Checks that `fruit` holds the oracle's top `top_n`, except for rows the scan pruned on their
+    /// upper endpoint. Only matching rows' exact scores set the threshold, so it never passes the
+    /// last returned score, and the last upper endpoint of a pruned row is below that score.
+    fn assert_oracle_or_interval_misses(
+        fixture: &Fixture,
+        filter: &dyn Query,
+        query: &[f32],
+        top_n: usize,
+        fruit: &VectorSimilarityFruit,
+    ) -> std::result::Result<(), TestCaseError> {
+        let ranked = fixture.oracle(filter, query, usize::MAX)?;
+        let mut results = fruit.results.iter().peekable();
+        let mut dropped = Vec::new();
+        for hit in &ranked {
+            match results.peek() {
+                None => break,
+                Some(&kept) if kept == hit => {
+                    results.next();
+                }
+                Some(_) => dropped.push(*hit),
+            }
+        }
+        prop_assert!(
+            results.peek().is_none(),
+            "results out of the oracle's order"
+        );
+        prop_assert_eq!(fruit.results.len(), top_n.min(ranked.len()));
+        // Drops are rare, so the returned rows keep `last_upper` exercised in every case.
+        for &(_, address) in &fruit.results {
+            prop_assert!(
+                last_upper(fixture, &fruit.stats, address)?.is_some(),
+                "no upper endpoint traced for {:?}",
+                address
+            );
+        }
+        let Some(&(last_score, _)) = fruit.results.last() else {
+            return Ok(());
+        };
+        for (score, address) in dropped {
+            let upper = last_upper(fixture, &fruit.stats, address)?;
+            prop_assert!(
+                upper.is_some_and(|upper| upper < last_score),
+                "dropped {:?}: upper {:?}, exact {}, last returned {}",
+                address,
+                upper,
+                score,
+                last_score
+            );
+        }
+        Ok(())
+    }
+
+    /// The last upper endpoint the scan compared with the threshold for `address`'s row: the late
+    /// filter's after refining it, else layer 0's from the shortlist or from admission.
+    fn last_upper(
+        fixture: &Fixture,
+        stats: &[ProbeStats],
+        address: DocAddress,
+    ) -> Result<Option<f32>> {
+        let searcher = fixture.index.reader()?.searcher();
+        let vectors = searcher
+            .segment_reader(address.segment_ord)
+            .vector_index(fixture.field)?;
+        // A replicated doc has a row in each of its clusters.
+        let mut rows = Vec::new();
+        let mut docs = Vec::new();
+        for cluster in 0..vectors.num_blocks() {
+            vectors.read_doc_ids(cluster, &mut docs)?;
+            rows.extend(
+                docs.iter()
+                    .enumerate()
+                    .filter(|&(_, &doc)| doc == address.doc_id)
+                    .map(|(row, _)| BlockAddress::new(cluster as u32, row as u32)),
+            );
+        }
+        let trace = &stats[address.segment_ord as usize].quantized_trace;
+        let last = |traced: &[(BlockAddress, f32)]| {
+            traced
+                .iter()
+                .rev()
+                .find(|(row, _)| rows.contains(row))
+                .map(|&(_, upper)| upper)
+        };
+        // The late filter traces one layer-0 shortlist for each routing window.
+        let shortlisted = trace.layer_columns.iter().rev().find_map(|columns| {
+            columns
+                .iter()
+                .find(|(row, _)| rows.contains(row))
+                .map(|&(_, bits)| {
+                    Estimate(f32::from_bits(bits[2]))
+                        .upper(f32::from_bits(bits[3]), QUANTIZED_BOUNDARY_KAPPA)
+                        .0
+                })
+        });
+        Ok(last(&trace.late_filter_uppers)
+            .or(shortlisted)
+            .or_else(|| last(&trace.admission_uppers)))
     }
 
     const FILTER_PROPERTY_CASES: u32 = 32;
@@ -3754,7 +3855,7 @@ mod late_filter_tests {
                 &segments,
                 |_| {},
             )?)?;
-            prop_assert_eq!(fruit.results, fixture.oracle(&filter, &query, top_n)?);
+            assert_oracle_or_interval_misses(&fixture, &filter, &query, top_n, &fruit)?;
             prop_assert!(fruit
                 .stats
                 .iter()

@@ -879,6 +879,35 @@ fn scan_matches_oracle() -> crate::Result<()> {
     Ok(())
 }
 
+/// When exactly k rows match, the threshold counts every one of them, so the scan returns them
+/// all. No row is dropped at a layer boundary, at a recheck or at its exact score.
+#[test]
+fn every_row_returns_when_exactly_k_rows_match() -> crate::Result<()> {
+    let (dim, clusters) = (64, 8);
+    let cases: [(Metric, &[u8], &str, usize); 2] = [
+        (Metric::L2, &[1, 4], "few", 20),
+        (Metric::Dot, &[1, 2, 4], "some", 50),
+    ];
+    for (metric, schedule, label, k) in cases {
+        let fixture = FixtureSpec::clustered(metric, dim, clusters, 800)
+            .schedule(schedule)
+            .label("few", |ordinal| ordinal % 40 == 3)
+            .label("some", |ordinal| ordinal % 16 == 1)
+            .build()?;
+        let filter = fixture.filter(label);
+        for seed in 0..200 {
+            let query = Lcg(seed).vector(dim, 0.5);
+            let fruit = fixture.search(&filter, &query, k, routed_exhaustive_params(clusters))?;
+            assert_eq!(
+                fruit.results,
+                fixture.oracle(&filter, &query, k)?,
+                "{metric:?} {schedule:?} {label} seed={seed}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // --- Routing edge cases ---
 
 /// A query nearest one centroid whose true nearest neighbour sits in the other cluster: a

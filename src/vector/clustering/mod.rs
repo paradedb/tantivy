@@ -5,24 +5,52 @@ use std::ops::Range;
 
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
-use crate::{DocId, TantivyError};
+use crate::{DocId, Result, TantivyError};
 
 pub(crate) mod soar;
 mod superkmeans;
 
 pub use superkmeans::{
-    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DEFAULT_TRAINING_SAMPLE_RATIO,
+    SuperKMeansClusterer, DEFAULT_TARGET_LEAF_SIZE, DESIRED_TRAINING_VECTORS_PER_LIST,
+    MINIMUM_TRAINING_VECTORS_PER_LIST,
 };
 
-pub trait IvfClusterer: Send + Sync + 'static {
-    /// Fraction of vectors sampled for training, in `(0, 1]`.
-    fn training_sample_ratio(&self) -> f32;
+/// A router candidate with its exact squared Euclidean distance to the vector.
+#[derive(Clone, Copy, Debug)]
+pub struct IvfAssignmentCandidate {
+    pub centroid: u32,
+    pub distance: f32,
+}
 
-    /// Trains centroids.
+/// A router's shortlist of assignment candidates for one vector, as
+/// [`IvfClusterer::assign_routed`] takes it.
+pub type AssignmentShortlist<'a> =
+    &'a (dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync);
+
+/// One assigned batch, handed over while its rows are still decoded.
+#[derive(Clone, Debug)]
+pub struct AssignedBatch<'a> {
+    /// Scan positions of the batch's rows.
+    pub rows: Range<usize>,
+    /// The batch's rows as the source returned them, one per position in `rows`.
+    pub vectors: &'a IvfMatrix<f32>,
+    /// Primary and optional second cluster per row.
+    pub pairs: &'a [(u32, Option<u32>)],
+}
+
+/// Rows per batch the default [`IvfClusterer::assign_batches`] reads back.
+const ASSIGNED_BATCH_ROWS: usize = 4_096;
+
+pub trait IvfClusterer: Send + Sync + 'static {
+    /// Fraction of `num_rows` vectors sampled for training, in `(0, 1]`.
+    fn training_sample_ratio(&self, options: &VectorOptions, num_rows: usize) -> f32;
+
+    /// Trains centroids using the resolved `training_sample_ratio` for this segment.
     fn train(
         &self,
         options: &VectorOptions,
         source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
     ) -> crate::Result<IvfCentroids>;
 
     /// Assigns vectors to centroids.
@@ -50,6 +78,77 @@ pub trait IvfClusterer: Send + Sync + 'static {
             .into_iter()
             .map(|cluster| (cluster, None))
             .collect())
+    }
+
+    /// Assigns through a bounded shortlist from the index's existing centroid router.
+    /// Candidates must have distinct valid centroid IDs and exact L2 distances.
+    /// Custom clusterers retain their assignment policy unless they override this method.
+    fn assign_routed(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        _candidates: &(dyn Fn(&[f32]) -> Result<Vec<IvfAssignmentCandidate>> + Sync),
+    ) -> Result<Vec<(u32, Option<u32>)>> {
+        assign_exhaustive(self, options, source, centroids, lambda)
+    }
+
+    /// Assigns every vector and calls `sink` once per batch, in scan order: through
+    /// [`Self::assign_routed`] when `candidates` is given, else [`Self::assign_pairs`] when
+    /// `lambda` is, else [`Self::assign`].
+    ///
+    /// The default assigns the whole source through the methods above, then reads it again batch
+    /// by batch.
+    fn assign_batches(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: Option<f32>,
+        candidates: Option<AssignmentShortlist<'_>>,
+        sink: &mut dyn FnMut(AssignedBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let pairs = match candidates {
+            Some(candidates) => {
+                self.assign_routed(options, source, centroids, lambda, candidates)?
+            }
+            None => assign_exhaustive(self, options, source, centroids, lambda)?,
+        };
+        let num_rows = source.num_rows();
+        if pairs.len() != num_rows {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IvfClusterer assigned {} clusters for {num_rows} vectors",
+                pairs.len()
+            )));
+        }
+        for start in (0..num_rows).step_by(ASSIGNED_BATCH_ROWS) {
+            let end = (start + ASSIGNED_BATCH_ROWS).min(num_rows);
+            let IvfTrainingVectors::F32(batch) = source.read_range(start..end)?;
+            sink(AssignedBatch {
+                rows: start..end,
+                vectors: &batch.matrix,
+                pairs: &pairs[start..end],
+            })?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn assign_exhaustive<C: IvfClusterer + ?Sized>(
+    clusterer: &C,
+    options: &VectorOptions,
+    source: &mut dyn VectorSource,
+    centroids: &IvfCentroids,
+    lambda: Option<f32>,
+) -> Result<Vec<(u32, Option<u32>)>> {
+    match lambda {
+        Some(lambda) => clusterer.assign_pairs(options, source, centroids, lambda),
+        None => Ok(clusterer
+            .assign(options, source, centroids)?
+            .into_iter()
+            .map(|cluster| (cluster, None))
+            .collect()),
     }
 }
 

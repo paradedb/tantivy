@@ -187,7 +187,7 @@ pub(crate) struct Grid2DClusterer {
 }
 
 impl IvfClusterer for Grid2DClusterer {
-    fn training_sample_ratio(&self) -> f32 {
+    fn training_sample_ratio(&self, _: &VectorOptions, _: usize) -> f32 {
         1.0
     }
 
@@ -195,6 +195,7 @@ impl IvfClusterer for Grid2DClusterer {
         &self,
         options: &VectorOptions,
         _source: &mut dyn VectorSource,
+        _: f32,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         let num_centroids = self.centroids.len();
@@ -1545,13 +1546,14 @@ mod centroid_storage_tests {
     }
 
     impl IvfClusterer for TestClusterer {
-        fn training_sample_ratio(&self) -> f32 {
+        fn training_sample_ratio(&self, _: &VectorOptions, _: usize) -> f32 {
             1.0
         }
         fn train(
             &self,
             options: &VectorOptions,
             source: &mut dyn VectorSource,
+            _: f32,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
             let num_centroids = self.num_centroids;

@@ -20,6 +20,7 @@ use rustc_hash::FxHashMap;
 
 use crate::collector::SharedThreshold;
 use crate::vector::write::RowAddress;
+use crate::vector::BlockAddress;
 use crate::{Score, SegmentOrdinal};
 
 // --- Scores ---
@@ -149,11 +150,22 @@ impl TopK {
         self.k
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.by_addr.len()
+    }
+
     /// The entries currently held, for seeding another bound.
     pub(crate) fn candidates(&self) -> impl Iterator<Item = Candidate> + '_ {
         self.by_addr
             .iter()
             .map(|(&address, &bound)| Candidate { address, bound })
+    }
+
+    /// Whether the map holds `address` with a lower endpoint at or above `floor`.
+    fn holds_at_or_above(&self, address: &RowAddress, floor: f32) -> bool {
+        self.by_addr
+            .get(address)
+            .is_some_and(|bound| bound.lower() >= floor)
     }
 
     /// The worst lower endpoint once `k` candidates are in.
@@ -340,6 +352,39 @@ impl PruningBound {
             .load()
             .map(|(score, _)| score)
             .filter(|score| score.is_finite())
+    }
+
+    /// Whether the local top k holds the row at `block_address` of `segment_ord` at or above
+    /// `kth`, a value of the shared threshold. The row is then one of the k rows the threshold
+    /// counts.
+    ///
+    /// Such a row is never pruned. Its refined upper endpoint or its exact score can land below
+    /// its own lower endpoint, and pruning it leaves fewer than k rows.
+    pub(crate) fn counts(
+        &self,
+        segment_ord: SegmentOrdinal,
+        block_address: BlockAddress,
+        kth: f32,
+    ) -> bool {
+        let address = RowAddress {
+            segment_ord,
+            block_address,
+        };
+        self.top.holds_at_or_above(&address, kth)
+    }
+
+    /// Whether the exact `score` of `address` is below the shared threshold, so the row cannot
+    /// enter the top k. A row the threshold counts is never excluded.
+    pub(crate) fn excludes_exact(&self, address: RowAddress, score: f32) -> bool {
+        let Some(kth) = self.shared_threshold() else {
+            return false;
+        };
+        score < kth && !self.counts(address.segment_ord, address.block_address, kth)
+    }
+
+    /// Number of candidates currently held in the local top-k.
+    pub(crate) fn len(&self) -> usize {
+        self.top.len()
     }
 
     /// Upserts competitive bounds by [`RowAddress`]. When the local top holds `k` values and the
@@ -828,6 +873,35 @@ mod tests {
             assert_eq!(far.candidates.row_labels(), [0]);
         }
 
+        /// A row the threshold counts stays a candidate when a later layer refines its upper
+        /// endpoint below its own layer-0 lower, at a boundary and at a recheck. A row the bound
+        /// does not hold, and a held row below a threshold another segment published, are still
+        /// dropped.
+        #[test]
+        fn test_refined_upper_below_its_own_lower_stays_in() {
+            // The lower endpoints are 10, 7 and 4. The bound holds rows 0 and 1, and row 1's lower
+            // is the threshold. A later layer then refines row 1 to an upper endpoint of 6.7.
+            let refined = || {
+                let rows = [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 5.0, 0.5)];
+                let mut harness = admitted(2, 2.0, &rows);
+                assert_eq!(harness.slot_threshold(2), Some(7.0));
+                harness.candidates.columns.estimates[1] = 6.5;
+                harness.candidates.columns.sigmas[1] = 0.1;
+                harness
+            };
+
+            let mut boundary = refined();
+            boundary.band(2, 2.0);
+            assert_eq!(boundary.candidates.row_labels(), [0, 1]);
+            assert_eq!(boundary.slot_threshold(2), Some(7.0));
+
+            let mut rechecked = refined();
+            assert_eq!(rechecked.recheck(0, 7.0), 1);
+            assert_eq!(rechecked.candidates.row_labels(), [0, 1]);
+            assert_eq!(rechecked.recheck(0, 8.0), 1);
+            assert_eq!(rechecked.candidates.row_labels(), [0]);
+        }
+
         /// Exact offer for the same address replaces the interval (no double-count) and only
         /// raises that row's lower endpoint.
         #[test]
@@ -1039,7 +1113,7 @@ mod tests {
                     harness.candidates.remove_rows(b, &removed);
                     rows.retain(|row| removed.binary_search(&(row.0 as u32)).is_err());
                 }
-                harness.candidates.band(None);
+                harness.candidates.band(None, |_| false);
                 let expected = harness_of(&kept);
                 assert_eq!(
                     harness.candidates.column_trace(true),
@@ -1194,6 +1268,31 @@ mod tests {
             let mut above = exact_bound(Arc::clone(&shared_topk_threshold), 2, &[9.0, 8.0]);
             assert_eq!(above.shared_threshold(), Some(8.0));
             assert_eq!(slot_score(&slot), Some(8.0));
+        }
+
+        /// A row whose interval sets the k-th lower stays in when its exact score lands one ulp
+        /// below that lower. A row the bound does not hold, and a held row below a threshold
+        /// another segment published, are still excluded.
+        #[test]
+        fn test_exact_score_below_its_own_lower_stays_in() {
+            let slot = Arc::new(AtomicSharedThreshold::default());
+            let mut bound = PruningBound::new(2, slot.clone());
+            let lower = -0.069_337_17_f32;
+            bound.offer([
+                Candidate::interval(addr(0), lower, -0.069_336_99),
+                Candidate::interval(addr(1), 0.5, 0.6),
+            ]);
+            assert_eq!(bound.shared_threshold(), Some(lower));
+
+            let below = lower.next_down();
+            bound.offer([Candidate::exact(addr(0), below)]);
+            assert!(!bound.excludes_exact(addr(0), below));
+            assert!(bound.excludes_exact(addr(7), below));
+            assert!(!bound.excludes_exact(addr(7), lower));
+
+            let _ = exact_bound(slot, 1, &[1.0]);
+            assert_eq!(bound.shared_threshold(), Some(1.0));
+            assert!(bound.excludes_exact(addr(0), below));
         }
 
         /// Threads publishing interleaved, rising thresholds into one slot leave the slot at the
