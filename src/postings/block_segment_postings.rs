@@ -339,6 +339,28 @@ impl BlockSegmentPostings {
         self.block_loaded
     }
 
+    pub(crate) fn block_max_score_up_to(
+        &mut self,
+        target: DocId,
+        fieldnorms: &FieldNormReader,
+        weight: &Bm25Weight,
+    ) -> (Score, DocId) {
+        let mut bound = self.block_max_score(fieldnorms, weight);
+        if self.skip_reader.last_doc_in_block() >= target {
+            return (bound, self.skip_reader.last_doc_in_block());
+        }
+        let mut impacts = self.skip_reader.clone();
+        while impacts.last_doc_in_block() < target {
+            impacts.advance();
+            bound = bound.max(
+                impacts
+                    .block_max_score(weight)
+                    .unwrap_or_else(|| weight.max_score()),
+            );
+        }
+        (bound, impacts.last_doc_in_block())
+    }
+
     pub(crate) fn load_block(&mut self) {
         if self.block_is_loaded() {
             return;

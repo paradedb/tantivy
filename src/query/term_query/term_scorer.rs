@@ -74,6 +74,14 @@ impl TermScorer {
             .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
     }
 
+    pub(crate) fn block_max_score_up_to(&mut self, target: DocId) -> (Score, DocId) {
+        self.postings.block_cursor.block_max_score_up_to(
+            target,
+            &self.fieldnorm_reader,
+            &self.similarity_weight,
+        )
+    }
+
     pub fn term_freq(&self) -> u32 {
         self.postings.term_freq()
     }

@@ -9,6 +9,23 @@ use crate::query::Explanation;
 use crate::schema::{Field, Schema};
 use crate::{DocAddress, SegmentReader, Term};
 
+/// Pruning strategy for scored term disjunctions collected through
+/// [`Weight::for_each_pruning`], including score-ordered top-k searches.
+///
+/// Single-term queries, intersections, unsupported score combiners, and cursor-based
+/// [`Weight::pruning_scorer`] retain their existing execution paths.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum DisjunctionPruning {
+    /// Select the strategy automatically for each segment.
+    #[default]
+    Auto,
+    /// Use Block-WAND for eligible multi-term disjunctions.
+    BlockWand,
+    /// Use Block-Max MaxScore for eligible multi-term disjunctions, bypassing
+    /// the automatic term-count and postings-density cutoffs.
+    BlockMaxScore,
+}
+
 /// Argument used in `Query::weight(..)`
 #[derive(Copy, Clone)]
 pub enum EnableScoring<'a> {
@@ -22,6 +39,9 @@ pub enum EnableScoring<'a> {
         /// Normally this should be the [Searcher], but you can specify a custom
         /// one to adjust the statistics.
         statistics_provider: &'a dyn Bm25StatisticsProvider,
+
+        /// Pruning strategy for scored term disjunctions.
+        disjunction_pruning: DisjunctionPruning,
     },
     /// Pass this to disable scoring.
     /// This can improve performance.
@@ -39,6 +59,7 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             searcher,
             statistics_provider: searcher,
+            disjunction_pruning: DisjunctionPruning::Auto,
         }
     }
 
@@ -50,6 +71,33 @@ impl<'a> EnableScoring<'a> {
         EnableScoring::Enabled {
             statistics_provider,
             searcher,
+            disjunction_pruning: DisjunctionPruning::Auto,
+        }
+    }
+
+    /// Override disjunction pruning for this scoring context. Constructors default
+    /// to [`DisjunctionPruning::Auto`]. Has no effect when scoring is disabled.
+    #[must_use]
+    pub fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
+        if let Self::Enabled {
+            disjunction_pruning,
+            ..
+        } = &mut self
+        {
+            *disjunction_pruning = pruning;
+        }
+        self
+    }
+
+    /// Returns the requested strategy, or [`DisjunctionPruning::Auto`] if scoring
+    /// is disabled.
+    pub fn disjunction_pruning(&self) -> DisjunctionPruning {
+        match self {
+            Self::Enabled {
+                disjunction_pruning,
+                ..
+            } => *disjunction_pruning,
+            Self::Disabled { .. } => DisjunctionPruning::Auto,
         }
     }
 
@@ -208,3 +256,47 @@ impl QueryClone for Box<dyn Query> {
 }
 
 impl_downcast!(Query);
+
+#[cfg(test)]
+mod tests {
+    use super::{DisjunctionPruning, EnableScoring};
+    use crate::schema::Schema;
+    use crate::Index;
+
+    #[test]
+    fn test_disjunction_pruning_defaults_and_overrides() -> crate::Result<()> {
+        let index = Index::create_in_ram(Schema::builder().build());
+        let searcher = index.reader()?.searcher();
+        assert_eq!(DisjunctionPruning::default(), DisjunctionPruning::Auto);
+        for scoring in [
+            EnableScoring::enabled_from_searcher(&searcher),
+            EnableScoring::enabled_from_statistics_provider(&searcher, &searcher),
+        ] {
+            assert_eq!(scoring.disjunction_pruning(), DisjunctionPruning::Auto);
+            for pruning in [
+                DisjunctionPruning::BlockWand,
+                DisjunctionPruning::BlockMaxScore,
+            ] {
+                let overridden = scoring.with_disjunction_pruning(pruning);
+                assert!(overridden.is_scoring_enabled());
+                assert_eq!(overridden.disjunction_pruning(), pruning);
+                assert_eq!(scoring.disjunction_pruning(), DisjunctionPruning::Auto);
+                assert_eq!(
+                    overridden
+                        .with_disjunction_pruning(DisjunctionPruning::Auto)
+                        .disjunction_pruning(),
+                    DisjunctionPruning::Auto
+                );
+            }
+        }
+        for scoring in [
+            EnableScoring::disabled_from_searcher(&searcher),
+            EnableScoring::disabled_from_schema(searcher.schema()),
+        ] {
+            let overridden = scoring.with_disjunction_pruning(DisjunctionPruning::BlockMaxScore);
+            assert!(!overridden.is_scoring_enabled());
+            assert_eq!(overridden.disjunction_pruning(), DisjunctionPruning::Auto);
+        }
+        Ok(())
+    }
+}
