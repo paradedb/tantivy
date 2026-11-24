@@ -1,4 +1,4 @@
-use super::scorer::{BasicPruningScorer, PruningScorer};
+use super::scorer::{BasicPruningScorer, PruningScorer, UnpositionedScorer};
 use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
@@ -115,26 +115,23 @@ pub trait Weight: Send + Sync + 'static {
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
 
-    /// Returns an unpositioned scorer for the given segment when the caller will probe it against
-    /// an upstream candidate set described by `candidate_hint`.
+    /// Returns an [`UnpositionedScorer`] for the given segment when the caller will probe it
+    /// against an upstream candidate set described by `candidate_hint`.
     ///
     /// Weights whose strategy selection depends on the upstream candidate count or dynamic score
     /// pruning (such as `TermSetWeight`) override this to pick candidate-probing strategies (e.g.
     /// fast-field point lookups via `seek_danger` or lazy SSTable block caching) instead of
     /// full-segment bitset construction or an eager scan to the first matching document.
-    ///
-    /// Immediately after construction, `scorer.doc()` returns [`TERMINATED`](crate::TERMINATED) if
-    /// the segment is known to have no matches, and `0` (or the first match) otherwise. Callers
-    /// must position the scorer via `seek_danger` (until `Found` is returned) or `seek` before
-    /// relying on `doc()`, `score()`, or `advance()`.
     fn scorer_for_candidates_unpositioned(
         &self,
         reader: &SegmentReader,
         boost: Score,
         candidate_hint: CandidateHint,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         let _ = candidate_hint;
-        self.scorer(reader, boost)
+        Ok(UnpositionedScorer::from_positioned(
+            self.scorer(reader, boost)?,
+        ))
     }
 
     /// Returns a pruning scorer for the given segment.

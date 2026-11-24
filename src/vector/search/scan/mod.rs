@@ -32,6 +32,7 @@ use self::plan::{price, Read, ReadCosts, SparsePricing};
 use self::rate::AdmissionHistograms;
 use crate::collector::sort_key::Comparator;
 use crate::collector::SegmentSortKeyComputer;
+use crate::docset::BLOCK_WINDOW;
 use crate::error::DataCorruption;
 use crate::query::Weight;
 use crate::schema::Metric;
@@ -1145,10 +1146,24 @@ where
                 self.report.layers.last_mut().unwrap().survivors += refined.len();
             }
             // Restore score order after block-local refinement, then recheck the threshold as
-            // each batch's matching exact scores improve the shared top-k.
+            // each batch's matching exact scores improve the shared top-k. Before
+            // `shared_threshold` is populated, no candidate can prune early, so size
+            // warmup chunks up to the remaining slots needed for `top_n` (capped at
+            // `BLOCK_WINDOW`) to amortize filter setup and `seek_danger_batch` without
+            // overshooting exact vector reads.
             refined.sort_unstable_by_key(|candidate| Reverse(*candidate));
-            for candidates in refined.chunks(MAX_SHORTLIST_FILTER_BATCH_SIZE) {
+            let mut refined_offset = 0;
+            while refined_offset < refined.len() {
                 let threshold = self.bound.shared_threshold();
+                let chunk_len = if threshold.is_some() {
+                    MAX_SHORTLIST_FILTER_BATCH_SIZE
+                } else {
+                    let remaining = self.top_n.saturating_sub(self.bound.len());
+                    remaining.clamp(MAX_SHORTLIST_FILTER_BATCH_SIZE, BLOCK_WINDOW as usize)
+                };
+                let end = (refined_offset + chunk_len).min(refined.len());
+                let candidates = &refined[refined_offset..end];
+                refined_offset = end;
                 indexed.clear();
                 indexed.extend(
                     candidates

@@ -1,5 +1,10 @@
-use crate::docset::{DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult, TERMINATED};
-use crate::query::Scorer;
+use common::TinySet;
+
+use crate::docset::{
+    fill_all_candidates_mask, DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult,
+    BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED,
+};
+use crate::query::{Scorer, UnpositionedScorer};
 use crate::{DocId, Score};
 
 /// An exclusion set is a set of documents
@@ -9,6 +14,29 @@ use crate::{DocId, Score};
 pub trait ExclusionSet: Send {
     /// Returns `true` if the given `doc` is in the exclusion set.
     fn contains(&mut self, doc: DocId) -> bool;
+
+    /// Clears bit `i` of `mask` for every active candidate `docs[i]` present in this exclusion set.
+    ///
+    /// `docs` must be strictly increasing (`< TERMINATED`) and monotonic across calls, and
+    /// `mask` must have length `>= docs.len().div_ceil(64)` with no bits set at positions
+    /// `>= docs.len()`.
+    fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
+        let words = docs.len().div_ceil(64);
+        debug_assert!(mask.len() >= words);
+        for (word_idx, word) in mask[..words].iter_mut().enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+            let base = word_idx * 64;
+            let mut keep = TinySet::EMPTY;
+            for bit in *word {
+                if !self.contains(docs[base + bit as usize]) {
+                    keep.insert_mut(bit);
+                }
+            }
+            *word = keep;
+        }
+    }
 
     /// Estimated cost to probe membership in this exclusion set.
     fn probe_cost(&self) -> ProbeCost {
@@ -37,6 +65,60 @@ impl<TDocSet: DocSet> ExcludedDocSet<TDocSet> {
     }
 }
 
+fn remove_excluded_batch_impl(
+    lower_bound: &mut DocId,
+    docs: &[DocId],
+    mask: &mut [TinySet],
+    probe: impl FnOnce(&[DocId], &mut [TinySet]) -> DocId,
+) {
+    let words = docs.len().div_ceil(64);
+    if words == 0 {
+        return;
+    }
+    debug_assert!(mask.len() >= words);
+    let mut stack_buf = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+    let mut heap_buf = Vec::new();
+    let excl: &mut [TinySet] = if words <= stack_buf.len() {
+        &mut stack_buf[..words]
+    } else {
+        heap_buf.resize(words, TinySet::EMPTY);
+        &mut heap_buf
+    };
+    let mut any = false;
+    for (word_idx, &word) in mask[..words].iter().enumerate() {
+        if word.is_empty() {
+            continue;
+        }
+        let base = word_idx * 64;
+        let word_last = docs[(base + 63).min(docs.len() - 1)];
+        if word_last < *lower_bound {
+            continue;
+        }
+        if docs[base] >= *lower_bound {
+            excl[word_idx] = word;
+            any = true;
+        } else {
+            let mut active = TinySet::EMPTY;
+            for bit in word {
+                if docs[base + bit as usize] >= *lower_bound {
+                    active.insert_mut(bit);
+                }
+            }
+            excl[word_idx] = active;
+            any |= !active.is_empty();
+        }
+    }
+    if !any {
+        return;
+    }
+    let next_bound = probe(docs, excl);
+    *lower_bound = (*lower_bound).max(next_bound);
+    for (m, &e) in mask[..words].iter_mut().zip(excl.iter()) {
+        let keep = m.into_u64() & !e.into_u64();
+        *m = TinySet::deserialize(keep.to_le_bytes());
+    }
+}
+
 impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
@@ -52,15 +134,68 @@ impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
         }
     }
 
+    fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
+        remove_excluded_batch_impl(&mut self.lower_bound, docs, mask, |d, m| {
+            self.docset.seek_danger_batch(d, m)
+        });
+    }
+
     fn probe_cost(&self) -> ProbeCost {
         self.docset.cost().probe
     }
 }
 
-impl<TDocSet: DocSet> ExclusionSet for Vec<ExcludedDocSet<TDocSet>> {
+impl ExcludedDocSet<UnpositionedScorer> {
+    /// Wraps an [`UnpositionedScorer`] as an exclusion set without positioning it.
+    pub fn from_unpositioned(scorer: UnpositionedScorer) -> Self {
+        let lower_bound = scorer.lower_bound();
+        ExcludedDocSet {
+            docset: scorer,
+            lower_bound,
+        }
+    }
+}
+
+impl ExclusionSet for ExcludedDocSet<UnpositionedScorer> {
+    #[inline]
+    fn contains(&mut self, doc: DocId) -> bool {
+        if doc < self.lower_bound {
+            return false;
+        }
+        match self.docset.seek_danger(doc) {
+            SeekDangerResult::Found => true,
+            SeekDangerResult::SeekLowerBound(lower_bound) => {
+                self.lower_bound = lower_bound;
+                false
+            }
+        }
+    }
+
+    fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
+        remove_excluded_batch_impl(&mut self.lower_bound, docs, mask, |d, m| {
+            self.docset.seek_danger_batch(d, m)
+        });
+    }
+
+    fn probe_cost(&self) -> ProbeCost {
+        self.docset.cost().probe
+    }
+}
+
+impl<TExclusionSet: ExclusionSet> ExclusionSet for Vec<TExclusionSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
         self.iter_mut().any(|docset| docset.contains(doc))
+    }
+
+    fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
+        let words = docs.len().div_ceil(64);
+        for docset in self {
+            if mask[..words].iter().all(|w| w.is_empty()) {
+                break;
+            }
+            docset.remove_excluded_batch(docs, mask);
+        }
     }
 
     fn probe_cost(&self) -> ProbeCost {
@@ -150,6 +285,15 @@ where
         }
     }
 
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        let next_bound = self.underlying_docset.seek_danger_batch(docs, mask);
+        let words = docs.len().div_ceil(64);
+        if !mask[..words].iter().all(|w| w.is_empty()) {
+            self.exclusion_set.remove_excluded_batch(docs, mask);
+        }
+        next_bound
+    }
+
     /// With no underlying docs in the range there is nothing to exclude. With some, the answer
     /// needs the walk this type avoids, so it stays unknown.
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
@@ -193,6 +337,460 @@ where
     #[inline]
     fn constant_score(&self) -> Option<Score> {
         self.underlying_docset.constant_score()
+    }
+}
+
+/// Progressive candidate batch size for streaming batched filters (`64 -> 256 -> 1024`),
+/// bounding `LIMIT k` overshoot on the first refill while amortizing fixed setup on full scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatchSizeRamp {
+    Small,
+    Medium,
+    Full,
+}
+
+impl BatchSizeRamp {
+    #[inline]
+    pub(crate) const fn limit(self) -> usize {
+        match self {
+            Self::Small => 64,
+            Self::Medium => 256,
+            Self::Full => BLOCK_WINDOW as usize,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn promote(&mut self) {
+        *self = match *self {
+            Self::Small => Self::Medium,
+            Self::Medium | Self::Full => Self::Full,
+        };
+    }
+}
+
+/// Buffered surviving candidates covering `[current_doc, end)` for progressive batch scorers.
+#[derive(Default)]
+pub(crate) struct CandidateBuffer {
+    pub(crate) docs: Vec<DocId>,
+    pub(crate) scores: Vec<Score>,
+    pub(crate) idx: usize,
+    /// Exclusive upper bound of the doc ID range whose matches are materialized in `docs[idx..]`.
+    /// `0` when no buffered range is active (unpositioned or invalidated after probing past
+    /// `end`).
+    pub(crate) end: DocId,
+}
+
+impl CandidateBuffer {
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.docs.clear();
+        self.scores.clear();
+        self.idx = 0;
+        self.end = 0;
+    }
+
+    #[inline]
+    pub(crate) fn remaining(&self) -> &[DocId] {
+        &self.docs[self.idx..]
+    }
+
+    /// Probes `target` inside `[current_doc, self.end)`. Returns `None` if `target >= self.end`.
+    #[inline]
+    pub(crate) fn seek_danger_within(
+        &mut self,
+        target: DocId,
+    ) -> Option<(SeekDangerResult, Option<Score>)> {
+        if target >= self.end {
+            return None;
+        }
+        let rem = &self.docs[self.idx..];
+        let rel = rem.partition_point(|&d| d < target);
+        let idx = self.idx + rel;
+        if idx < self.docs.len() && self.docs[idx] == target {
+            self.idx = idx;
+            let score = self.scores.get(idx).copied();
+            return Some((SeekDangerResult::Found, score));
+        }
+        let next = if idx < self.docs.len() {
+            self.docs[idx]
+        } else {
+            self.end
+        };
+        Some((SeekDangerResult::SeekLowerBound(next), None))
+    }
+
+    /// Filters `docs` / `mask` against buffered matches `< self.end` and delegates `>= self.end`
+    /// to `probe_suffix`.
+    pub(crate) fn seek_danger_batch_with_fallback(
+        &mut self,
+        docs: &[DocId],
+        mask: &mut [TinySet],
+        mut probe_suffix: impl FnMut(&[DocId], &mut [TinySet]) -> DocId,
+    ) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        let split = docs.partition_point(|&d| d < self.end);
+        if split == 0 {
+            self.clear();
+            return probe_suffix(docs, mask);
+        }
+        let rem = &self.docs[self.idx..];
+        if split == docs.len() {
+            let mut s_idx = 0usize;
+            for (word_idx, word) in mask[..docs.len().div_ceil(64)].iter_mut().enumerate() {
+                if word.is_empty() {
+                    continue;
+                }
+                let base = word_idx * 64;
+                let mut keep = 0u64;
+                for bit in *word {
+                    let doc = docs[base + bit as usize];
+                    while s_idx < rem.len() && rem[s_idx] < doc {
+                        s_idx += 1;
+                    }
+                    if s_idx < rem.len() && rem[s_idx] == doc {
+                        keep |= 1u64 << bit;
+                        s_idx += 1;
+                    }
+                }
+                *word = TinySet::deserialize(keep.to_le_bytes());
+            }
+            let last = docs[docs.len() - 1];
+            let pos = rem.partition_point(|&d| d <= last);
+            return if pos < rem.len() { rem[pos] } else { self.end };
+        }
+
+        // Straddling batch: match `docs[..split]` against `rem` and delegate `docs[split..]`.
+        let prefix_words = split.div_ceil(64);
+        let mut s_idx = 0usize;
+        for (word_idx, word) in mask[..prefix_words].iter_mut().enumerate() {
+            if word.is_empty() {
+                continue;
+            }
+            let base = word_idx * 64;
+            let mut keep = 0u64;
+            for bit in *word {
+                let i = base + bit as usize;
+                if i >= split {
+                    keep |= 1u64 << bit;
+                    continue;
+                }
+                let doc = docs[i];
+                while s_idx < rem.len() && rem[s_idx] < doc {
+                    s_idx += 1;
+                }
+                if s_idx < rem.len() && rem[s_idx] == doc {
+                    keep |= 1u64 << bit;
+                    s_idx += 1;
+                }
+            }
+            *word = TinySet::deserialize(keep.to_le_bytes());
+        }
+        let suffix = &docs[split..];
+        let mut sub_mask = vec![TinySet::EMPTY; suffix.len().div_ceil(64)];
+        for j in 0..suffix.len() {
+            let src_idx = split + j;
+            if mask[src_idx / 64].contains((src_idx % 64) as u32) {
+                sub_mask[j / 64].insert_mut((j % 64) as u32);
+            }
+        }
+        let bound = probe_suffix(suffix, &mut sub_mask);
+        for j in 0..suffix.len() {
+            if !sub_mask[j / 64].contains((j % 64) as u32) {
+                let src_idx = split + j;
+                mask[src_idx / 64].remove_mut((src_idx % 64) as u32);
+            }
+        }
+        self.clear();
+        bound
+    }
+
+    /// Resolves `is_empty_in_range(start, end)` against buffered matches `< self.end`.
+    /// Returns `Some(is_empty)` if resolved, or `None` if the caller must also check
+    /// `[start.max(self.end), end]`.
+    #[inline]
+    pub(crate) fn is_empty_in_range_within(&self, start: DocId, end: DocId) -> Option<bool> {
+        if start > end {
+            return Some(true);
+        }
+        if start >= self.end {
+            return None;
+        }
+        let rem = self.remaining();
+        let pos = rem.partition_point(|&d| d < start);
+        if pos < rem.len() && rem[pos] <= end {
+            return Some(false);
+        }
+        if end < self.end {
+            return Some(true);
+        }
+        None
+    }
+}
+
+/// Batched counterpart to [`Exclude`] used when `exclusion_set` has high fixed per-call probe
+/// setup (`ProbeCost::prefers_batching`). Buffers candidates from `underlying` and probes
+/// `exclusion_set` via [`ExclusionSet::remove_excluded_batch`].
+pub(crate) struct BatchExcludeScorer<TScorer, TExclusionSet> {
+    underlying: TScorer,
+    exclusion_set: TExclusionSet,
+    underlying_const_score: Option<Score>,
+    ramp: BatchSizeRamp,
+    buf: CandidateBuffer,
+    current: (DocId, Score),
+}
+
+impl<TScorer, TExclusionSet> BatchExcludeScorer<TScorer, TExclusionSet>
+where
+    TScorer: Scorer,
+    TExclusionSet: ExclusionSet,
+{
+    pub(crate) fn new(underlying: TScorer, exclusion_set: TExclusionSet) -> Self {
+        let underlying_const_score = underlying.constant_score();
+        let mut scorer = Self {
+            underlying,
+            exclusion_set,
+            underlying_const_score,
+            ramp: BatchSizeRamp::Small,
+            buf: CandidateBuffer::default(),
+            current: (TERMINATED, underlying_const_score.unwrap_or(0.0)),
+        };
+        scorer.refill();
+        scorer
+    }
+
+    fn refill(&mut self) {
+        self.buf.clear();
+        let has_var_score = self.underlying_const_score.is_none();
+        let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+
+        loop {
+            let mut doc = self.underlying.doc();
+            if doc == TERMINATED {
+                self.buf.end = TERMINATED;
+                self.current.0 = TERMINATED;
+                return;
+            }
+            let target_len = self.ramp.limit();
+            self.ramp.promote();
+            self.buf.docs.clear();
+            if has_var_score {
+                self.buf.scores.clear();
+                while doc != TERMINATED && self.buf.docs.len() < target_len {
+                    self.buf.docs.push(doc);
+                    self.buf.scores.push(self.underlying.score());
+                    doc = self.underlying.advance();
+                }
+            } else {
+                while doc != TERMINATED && self.buf.docs.len() < target_len {
+                    self.buf.docs.push(doc);
+                    doc = self.underlying.advance();
+                }
+            }
+            let n = self.buf.docs.len();
+            let words = n.div_ceil(64);
+            fill_all_candidates_mask(n, &mut mask);
+            self.exclusion_set
+                .remove_excluded_batch(&self.buf.docs, &mut mask[..words]);
+
+            let mut write = 0usize;
+            for (word_idx, &word) in mask[..words].iter().enumerate() {
+                let base = word_idx * 64;
+                for bit in word {
+                    let i = base + bit as usize;
+                    self.buf.docs[write] = self.buf.docs[i];
+                    if has_var_score {
+                        self.buf.scores[write] = self.buf.scores[i];
+                    }
+                    write += 1;
+                }
+            }
+            self.buf.docs.truncate(write);
+            if has_var_score {
+                self.buf.scores.truncate(write);
+            }
+            if write > 0 {
+                self.buf.end = self.underlying.doc();
+                self.current = (
+                    self.buf.docs[0],
+                    self.underlying_const_score
+                        .unwrap_or_else(|| self.buf.scores[0]),
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl<TScorer, TExclusionSet> DocSet for BatchExcludeScorer<TScorer, TExclusionSet>
+where
+    TScorer: Scorer,
+    TExclusionSet: ExclusionSet,
+{
+    #[inline]
+    fn advance(&mut self) -> DocId {
+        if self.current.0 == TERMINATED {
+            return TERMINATED;
+        }
+        self.buf.idx += 1;
+        if self.buf.idx < self.buf.docs.len() {
+            self.current = (
+                self.buf.docs[self.buf.idx],
+                self.underlying_const_score
+                    .unwrap_or_else(|| self.buf.scores[self.buf.idx]),
+            );
+            return self.current.0;
+        }
+        self.refill();
+        self.current.0
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target <= self.current.0 {
+            return self.current.0;
+        }
+        if target >= TERMINATED {
+            self.buf.clear();
+            self.buf.end = TERMINATED;
+            self.underlying.seek(TERMINATED);
+            self.current.0 = TERMINATED;
+            return TERMINATED;
+        }
+        if target < self.buf.end {
+            if let Some(&last_buf) = self.buf.docs.last() {
+                if target <= last_buf {
+                    let rel = self.buf.remaining().partition_point(|&d| d < target);
+                    self.buf.idx += rel;
+                    self.current = (
+                        self.buf.docs[self.buf.idx],
+                        self.underlying_const_score
+                            .unwrap_or_else(|| self.buf.scores[self.buf.idx]),
+                    );
+                    return self.current.0;
+                }
+            }
+        }
+        if self.underlying.doc() < target {
+            self.underlying.seek(target);
+        }
+        self.refill();
+        self.current.0
+    }
+
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= TERMINATED || self.current.0 == TERMINATED {
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
+        }
+        if let Some((result, score)) = self.buf.seek_danger_within(target) {
+            if result == SeekDangerResult::Found {
+                self.current = (
+                    target,
+                    self.underlying_const_score
+                        .unwrap_or_else(|| score.unwrap_or(0.0)),
+                );
+            }
+            return result;
+        }
+        self.buf.clear();
+        match self.underlying.seek_danger(target) {
+            SeekDangerResult::Found if self.exclusion_set.contains(target) => {
+                SeekDangerResult::SeekLowerBound(target + 1)
+            }
+            SeekDangerResult::Found => {
+                let score = self
+                    .underlying_const_score
+                    .unwrap_or_else(|| self.underlying.score());
+                self.current = (target, score);
+                self.underlying.advance();
+                self.buf.docs.push(target);
+                if self.underlying_const_score.is_none() {
+                    self.buf.scores.push(score);
+                }
+                self.buf.idx = 0;
+                self.buf.end = self.underlying.doc();
+                SeekDangerResult::Found
+            }
+            SeekDangerResult::SeekLowerBound(lb) => {
+                if lb == TERMINATED {
+                    self.current.0 = TERMINATED;
+                }
+                SeekDangerResult::SeekLowerBound(lb)
+            }
+        }
+    }
+
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if docs.is_empty() {
+            return 0;
+        }
+        if self.current.0 == TERMINATED {
+            mask[..docs.len().div_ceil(64)].fill(TinySet::EMPTY);
+            return TERMINATED;
+        }
+        let underlying = &mut self.underlying;
+        let exclusion_set = &mut self.exclusion_set;
+        self.buf
+            .seek_danger_batch_with_fallback(docs, mask, |suffix, sub_mask| {
+                let next_bound = underlying.seek_danger_batch(suffix, sub_mask);
+                let words = suffix.len().div_ceil(64);
+                if !sub_mask[..words].iter().all(|w| w.is_empty()) {
+                    exclusion_set.remove_excluded_batch(suffix, sub_mask);
+                }
+                next_bound
+            })
+    }
+
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        if self.current.0 == TERMINATED {
+            return true;
+        }
+        if let Some(empty) = self.buf.is_empty_in_range_within(start, end) {
+            return empty;
+        }
+        self.underlying
+            .is_empty_in_range(start.max(self.buf.end), end)
+    }
+
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.underlying.size_hint()
+    }
+
+    fn cost(&self) -> DocSetCost {
+        let underlying = self.underlying.cost();
+        let excl_probe = self.exclusion_set.probe_cost();
+        let hint = u64::from(self.underlying.size_hint());
+        let batches = hint.div_ceil(u64::from(BLOCK_WINDOW));
+        let batch_work = DriveCost(
+            batches
+                .saturating_mul(excl_probe.setup.0)
+                .saturating_add(hint.saturating_mul(excl_probe.per_doc.0)),
+        );
+        DocSetCost::new(
+            underlying.drive.saturating_add(batch_work),
+            underlying.probe.saturating_add(excl_probe),
+        )
+    }
+}
+
+impl<TScorer, TExclusionSet> Scorer for BatchExcludeScorer<TScorer, TExclusionSet>
+where
+    TScorer: Scorer + 'static,
+    TExclusionSet: ExclusionSet + 'static,
+{
+    #[inline]
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.underlying_const_score
     }
 }
 

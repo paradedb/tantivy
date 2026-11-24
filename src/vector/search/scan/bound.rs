@@ -150,6 +150,10 @@ impl TopK {
         self.k
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.by_addr.len()
+    }
+
     /// The entries currently held, for seeding another bound.
     pub(crate) fn candidates(&self) -> impl Iterator<Item = Candidate> + '_ {
         self.by_addr
@@ -376,6 +380,11 @@ impl PruningBound {
             return false;
         };
         score < kth && !self.counts(address.segment_ord, address.block_address, kth)
+    }
+
+    /// Number of candidates currently held in the local top-k.
+    pub(crate) fn len(&self) -> usize {
+        self.top.len()
     }
 
     /// Upserts competitive bounds by [`RowAddress`]. When the local top holds `k` values and the
