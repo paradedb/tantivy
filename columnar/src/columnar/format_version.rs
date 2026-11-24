@@ -1,5 +1,10 @@
 use core::fmt;
 use std::fmt::{Display, Formatter};
+use std::io;
+use std::io::Write;
+
+use common::HasLen;
+use common::file_slice::FileSlice;
 
 use crate::InvalidData;
 
@@ -23,13 +28,14 @@ pub fn parse_footer(footer_bytes: [u8; VERSION_FOOTER_NUM_BYTES]) -> Result<Vers
     Version::try_from_bytes(footer_bytes[0..4].try_into().unwrap())
 }
 
-pub const CURRENT_VERSION: Version = Version::V2;
+pub const CURRENT_VERSION: Version = Version::V3;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Version {
     V1 = 1u32,
     V2 = 2u32,
+    V3 = 3u32,
 }
 
 impl Display for Version {
@@ -37,6 +43,7 @@ impl Display for Version {
         match self {
             Version::V1 => write!(f, "v1"),
             Version::V2 => write!(f, "v2"),
+            Version::V3 => write!(f, "v3"),
         }
     }
 }
@@ -51,8 +58,60 @@ impl Version {
         match code {
             1u32 => Ok(Version::V1),
             2u32 => Ok(Version::V2),
+            3u32 => Ok(Version::V3),
             _ => Err(InvalidData),
         }
+    }
+
+    /// Width of a length footer, the byte length written after a column index, a multivalued
+    /// index's optional index and a dictionary. A merge can grow them past 4 GiB, so V3 uses `u64`.
+    pub(crate) fn len_footer_num_bytes(self) -> usize {
+        match self {
+            Version::V1 | Version::V2 => std::mem::size_of::<u32>(),
+            Version::V3 => std::mem::size_of::<u64>(),
+        }
+    }
+
+    /// Appends `len` as a length footer of this version.
+    pub(crate) fn write_len_footer(self, len: u64, output: &mut impl Write) -> io::Result<()> {
+        match self {
+            Version::V1 | Version::V2 => {
+                let len = u32::try_from(len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{len} bytes do not fit the u32 length of columnar format {self}"),
+                    )
+                })?;
+                output.write_all(&len.to_le_bytes())
+            }
+            Version::V3 => output.write_all(&len.to_le_bytes()),
+        }
+    }
+
+    /// Splits the length footer off `file_slice` and returns the body with the length it holds.
+    /// The length covers a prefix of the body, so a larger value is corrupt.
+    pub(crate) fn split_len_footer(self, file_slice: FileSlice) -> io::Result<(FileSlice, usize)> {
+        let (body, footer) = file_slice.split_from_end(self.len_footer_num_bytes());
+        let footer = footer.read_bytes()?;
+        let len = match self {
+            Version::V1 | Version::V2 => {
+                u64::from(u32::from_le_bytes(footer.as_slice().try_into().unwrap()))
+            }
+            Version::V3 => u64::from_le_bytes(footer.as_slice().try_into().unwrap()),
+        };
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|len| *len <= body.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "columnar section of {len} bytes exceeds its {} byte body",
+                        body.len()
+                    ),
+                )
+            })?;
+        Ok((body, len))
     }
 }
 
@@ -65,7 +124,7 @@ mod tests {
     #[test]
     fn test_footer_deserialization() {
         let parsed_version: Version = parse_footer(footer()).unwrap();
-        assert_eq!(Version::V2, parsed_version);
+        assert_eq!(Version::V3, parsed_version);
     }
 
     #[test]
@@ -83,6 +142,42 @@ mod tests {
                 valid_versions.insert(i);
             }
         }
-        assert_eq!(valid_versions.len(), 2);
+        assert_eq!(valid_versions.len(), 3);
+    }
+
+    #[test]
+    fn test_len_footer_round_trip() {
+        for version in [Version::V1, Version::V2, Version::V3] {
+            for len in [0usize, 1, 7] {
+                let mut buffer = vec![0xABu8; 7];
+                version.write_len_footer(len as u64, &mut buffer).unwrap();
+                assert_eq!(buffer.len(), 7 + version.len_footer_num_bytes());
+                let (body, parsed) = version.split_len_footer(FileSlice::from(buffer)).unwrap();
+                assert_eq!(body.len(), 7);
+                assert_eq!(parsed, len);
+            }
+        }
+    }
+
+    #[test]
+    fn test_len_footer_past_u32() {
+        let len = u64::from(u32::MAX) + 1;
+        let mut buffer = Vec::new();
+        Version::V3.write_len_footer(len, &mut buffer).unwrap();
+        assert_eq!(buffer, len.to_le_bytes());
+        for version in [Version::V1, Version::V2] {
+            let error = version.write_len_footer(len, &mut Vec::new()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn test_len_footer_rejects_length_past_body() {
+        let mut buffer = vec![0u8; 3];
+        Version::V3.write_len_footer(4, &mut buffer).unwrap();
+        let error = Version::V3
+            .split_len_footer(FileSlice::from(buffer))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
