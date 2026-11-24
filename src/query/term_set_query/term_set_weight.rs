@@ -294,6 +294,7 @@ impl TermSetWeight {
         predicate: Arc<dyn TermPredicate>,
         bounds: BoundsRange<Term>,
         requested_postings: ExactPostings,
+        exact_fast_field: ExactFastField,
         strategy_config: TermSetStrategyConfig,
     ) -> crate::Result<Self> {
         if matches!(
@@ -304,15 +305,18 @@ impl TermSetWeight {
                 "TermPredicateQuery does not support field {field:?} of type {field_type:?}"
             )));
         }
-        let (fast_substrate, exact_postings) = classify_substrates(
-            field_type,
-            requested_postings,
-            ExactFastField::Available,
-            false,
-        );
+        let (fast_substrate, exact_postings) =
+            classify_substrates(field_type, requested_postings, exact_fast_field, false);
         if fast_substrate == FastSubstrate::None && exact_postings == ExactPostings::Unavailable {
+            let hint = if matches!(field_type, FieldType::Str(opts) if opts.is_fast()) {
+                " (fast-field and indexing tokenizers differ under ExactFastField::Infer; pass \
+                 ExactFastField::Available if the fast field stores exact predicate values)"
+            } else {
+                ""
+            };
             return Err(TantivyError::SchemaError(format!(
-                "Field {field:?} has neither a supported fast-field column nor exact postings"
+                "Field {field:?} has neither a supported fast-field column nor exact \
+                 postings{hint}"
             )));
         }
         Ok(Self {

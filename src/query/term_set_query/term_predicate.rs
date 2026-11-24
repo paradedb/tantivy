@@ -37,16 +37,18 @@ pub enum ExactPostings {
     Unavailable,
 }
 
-/// Whether a `Str` field's fast-field dictionary stores the exact same terms as its
-/// inverted index when both are present.
+/// Whether a `Str` field's fast-field dictionary stores exact terms matching the query's
+/// value domain when an inverted index is also present.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum ExactFastField {
     /// Infer from schema: allow `FieldType::Str` fast-field dictionary only when the
     /// field is not indexed or the fast-field and indexing tokenizer names match.
     #[default]
     Infer,
-    /// Caller guarantees the fast-field dictionary stores identical whole-value terms
-    /// (for example aliased identity tokenizers like `"keyword"` indexing + `"raw"` fast field).
+    /// Caller guarantees the fast-field dictionary stores exact values for the query
+    /// (for example aliased identity tokenizers like `"keyword"` indexing + `"raw"` fast field,
+    /// or a raw fast field on a tokenized `TEXT | FAST` field when postings are disabled via
+    /// [`ExactPostings::Unavailable`]).
     Available,
 }
 
@@ -85,6 +87,7 @@ pub struct TermPredicateQuery {
     predicate: Arc<dyn TermPredicate>,
     bounds: BoundsRange<Term>,
     exact_postings: ExactPostings,
+    exact_fast_field: ExactFastField,
     strategy_config: TermSetStrategyConfig,
 }
 
@@ -96,6 +99,7 @@ impl TermPredicateQuery {
             predicate,
             bounds: BoundsRange::new(Bound::Unbounded, Bound::Unbounded),
             exact_postings: ExactPostings::Available,
+            exact_fast_field: ExactFastField::default(),
             strategy_config: TermSetStrategyConfig::default(),
         }
     }
@@ -109,6 +113,14 @@ impl TermPredicateQuery {
     /// Specify whether the field's inverted index carries exact whole-value postings.
     pub fn with_exact_postings(mut self, exact_postings: ExactPostings) -> Self {
         self.exact_postings = exact_postings;
+        self
+    }
+
+    /// Specify whether a `Str` fast-field dictionary stores exact values for this predicate
+    /// (for example aliased identity tokenizers or a raw fast field when tokenized postings are
+    /// disabled via [`ExactPostings::Unavailable`]).
+    pub fn with_exact_fast_field(mut self, exact_fast_field: ExactFastField) -> Self {
+        self.exact_fast_field = exact_fast_field;
         self
     }
 
@@ -128,6 +140,7 @@ impl Query for TermPredicateQuery {
             Arc::clone(&self.predicate),
             self.bounds.clone(),
             self.exact_postings,
+            self.exact_fast_field,
             self.strategy_config.clone(),
         )?
         .with_bitmap_postings(enable_scoring.bitmap_postings_enabled());
@@ -2111,6 +2124,7 @@ mod tests {
                     pred.clone(),
                     bounds,
                     ExactPostings::Unavailable,
+                    ExactFastField::Infer,
                     TermSetStrategyConfig::default(),
                 )
                 .unwrap()
@@ -2495,7 +2509,7 @@ mod tests {
                 .set_index_option(IndexRecordOption::Basic),
         );
         let kw_field = sb.add_text_field("kw", kw_opts.clone());
-        let title_field = sb.add_text_field("title", TEXT);
+        let title_field = sb.add_text_field("title", TEXT | FAST);
         let index = Index::create_in_ram(sb.build());
         index
             .tokenizers()
@@ -2511,7 +2525,9 @@ mod tests {
         {
             let mut writer = index.writer_for_tests()?;
             for doc_id in 0..4_000usize {
-                let title = if doc_id < 400 && doc_id % 20 == 0 {
+                let title = if doc_id == 0 {
+                    "Hello World"
+                } else if doc_id < 400 && doc_id % 20 == 0 {
                     "how how using using get get create create"
                 } else if doc_id % 10 == 0 {
                     match (doc_id / 10) % 4 {
@@ -2544,12 +2560,19 @@ mod tests {
                     .collect(),
             )
         };
-        let large_terms: Vec<Term> = unique_keys
+        let large_strings: Vec<String> = unique_keys
             .iter()
             .enumerate()
             .filter(|(i, _)| i % 2 == 0)
-            .map(|(_, s)| Term::from_field_text(kw_field, s))
+            .map(|(_, s)| s.clone())
             .collect();
+        let large_terms: Vec<Term> = large_strings
+            .iter()
+            .map(|s| Term::from_field_text(kw_field, s))
+            .collect();
+        let large_pred = Arc::new(SetPredicate::from_strings(
+            large_strings.iter().map(String::as_str),
+        ));
 
         // Default `ExactFastField::Infer` locks aliased `"keyword"`/`"raw"` out of the fast field.
         let infer_sink = Arc::new(AtomicU8::new(0));
@@ -2572,6 +2595,31 @@ mod tests {
         assert_eq!(expected_top.len(), 10);
         assert_eq!(
             infer_sink.load(Ordering::Relaxed),
+            StrategyTag::Automaton as u8
+        );
+
+        let pred_infer_sink = Arc::new(AtomicU8::new(0));
+        let pred_infer_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermPredicateQuery::new(kw_field, large_pred.clone()).with_strategy_config(
+                        TermSetStrategyConfig {
+                            strategy_sink: Some(pred_infer_sink.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                    0.0,
+                )),
+            ),
+        ]);
+        assert_eq!(
+            searcher.search(&pred_infer_q, &TopDocs::with_limit(10).order_by_score())?,
+            expected_top
+        );
+        assert_eq!(
+            pred_infer_sink.load(Ordering::Relaxed),
             StrategyTag::Automaton as u8
         );
 
@@ -2600,6 +2648,31 @@ mod tests {
             StrategyTag::Linear as u8
         );
 
+        let pred_avail_sink = Arc::new(AtomicU8::new(0));
+        let pred_avail_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermPredicateQuery::new(kw_field, large_pred)
+                        .with_exact_fast_field(ExactFastField::Available)
+                        .with_strategy_config(TermSetStrategyConfig {
+                            strategy_sink: Some(pred_avail_sink.clone()),
+                            ..Default::default()
+                        }),
+                    0.0,
+                )),
+            ),
+        ]);
+        assert_eq!(
+            searcher.search(&pred_avail_q, &TopDocs::with_limit(10).order_by_score())?,
+            expected_top
+        );
+        assert_eq!(
+            pred_avail_sink.load(Ordering::Relaxed),
+            StrategyTag::Linear as u8
+        );
+
         let small_terms = vec![
             Term::from_field_text(kw_field, &unique_keys[0]),
             Term::from_field_text(kw_field, &unique_keys[20]),
@@ -2618,8 +2691,54 @@ mod tests {
             StrategyTag::Bitset as u8
         );
 
-        // 2. Sorted `"keyword"` + `set_fast(Some("raw"))`: `Infer` stays on postings while
-        //    `Available` unlocks `Gallop` with identical matches.
+        // `TEXT | FAST` (`"default"` indexing vs `"raw"` fast field):
+        // - Default `(ExactPostings::Available, ExactFastField::Infer)` locks out the raw fast
+        //   field so it stays on tokenized postings without mixing domains.
+        // - Disabling postings without opting into `ExactFastField::Available` fails closed.
+        // - Opting into `ExactFastField::Available` + `ExactPostings::Unavailable` queries raw
+        //   fast-field values directly.
+        let raw_title_pred = Arc::new(SetPredicate::from_strings(["Hello World"]));
+        let token_title_pred = Arc::new(SetPredicate::from_strings(["hello"]));
+        assert_eq!(
+            searcher
+                .search(
+                    &TermPredicateQuery::new(title_field, raw_title_pred.clone()),
+                    &DocSetCollector,
+                )?
+                .len(),
+            0
+        );
+        assert_eq!(
+            searcher
+                .search(
+                    &TermPredicateQuery::new(title_field, token_title_pred),
+                    &DocSetCollector,
+                )?
+                .len(),
+            1
+        );
+        assert!(matches!(
+            searcher.search(
+                &TermPredicateQuery::new(title_field, raw_title_pred.clone())
+                    .with_exact_postings(ExactPostings::Unavailable),
+                &DocSetCollector,
+            ),
+            Err(crate::TantivyError::SchemaError(_))
+        ));
+        assert_eq!(
+            searcher
+                .search(
+                    &TermPredicateQuery::new(title_field, raw_title_pred)
+                        .with_exact_postings(ExactPostings::Unavailable)
+                        .with_exact_fast_field(ExactFastField::Available),
+                    &DocSetCollector,
+                )?
+                .len(),
+            1
+        );
+
+        // 2. Sorted `"keyword"` + `set_fast("raw")`: `Infer` stays on postings while `Available`
+        //    unlocks `Gallop` with identical matches.
         let mut ssb = SchemaBuilder::new();
         let sorted_kw = ssb.add_text_field("kw", kw_opts);
         let sorted_index = Index::builder()
@@ -2647,6 +2766,7 @@ mod tests {
             Term::from_field_text(sorted_kw, "k-00010"),
             Term::from_field_text(sorted_kw, "k-01500"),
         ];
+        let probe_pred = Arc::new(SetPredicate::from_strings(["k-00010", "k-01500"]));
 
         let sorted_infer_sink = Arc::new(AtomicU8::new(0));
         let sorted_infer_hits = sorted_searcher.search(
@@ -2659,6 +2779,22 @@ mod tests {
         assert_eq!(sorted_infer_hits.len(), 2);
         assert_eq!(
             sorted_infer_sink.load(Ordering::Relaxed),
+            StrategyTag::Bitset as u8
+        );
+
+        let sorted_pred_infer_sink = Arc::new(AtomicU8::new(0));
+        let sorted_pred_infer_hits = sorted_searcher.search(
+            &TermPredicateQuery::new(sorted_kw, probe_pred.clone()).with_strategy_config(
+                TermSetStrategyConfig {
+                    strategy_sink: Some(sorted_pred_infer_sink.clone()),
+                    ..Default::default()
+                },
+            ),
+            &DocSetCollector,
+        )?;
+        assert_eq!(sorted_pred_infer_hits, sorted_infer_hits);
+        assert_eq!(
+            sorted_pred_infer_sink.load(Ordering::Relaxed),
             StrategyTag::Bitset as u8
         );
 
@@ -2675,6 +2811,22 @@ mod tests {
         assert_eq!(sorted_avail_hits, sorted_infer_hits);
         assert_eq!(
             sorted_avail_sink.load(Ordering::Relaxed),
+            StrategyTag::Gallop as u8
+        );
+
+        let sorted_pred_avail_sink = Arc::new(AtomicU8::new(0));
+        let sorted_pred_avail_hits = sorted_searcher.search(
+            &TermPredicateQuery::new(sorted_kw, probe_pred)
+                .with_exact_fast_field(ExactFastField::Available)
+                .with_strategy_config(TermSetStrategyConfig {
+                    strategy_sink: Some(sorted_pred_avail_sink.clone()),
+                    ..Default::default()
+                }),
+            &DocSetCollector,
+        )?;
+        assert_eq!(sorted_pred_avail_hits, sorted_infer_hits);
+        assert_eq!(
+            sorted_pred_avail_sink.load(Ordering::Relaxed),
             StrategyTag::Gallop as u8
         );
         Ok(())

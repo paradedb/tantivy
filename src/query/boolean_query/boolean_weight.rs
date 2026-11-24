@@ -23,7 +23,7 @@ use crate::query::{
 use crate::{DocId, Score, TERMINATED};
 
 fn intersect_scorers(
-    scorers: Vec<Box<dyn Scorer>>,
+    mut scorers: Vec<Box<dyn Scorer>>,
     num_docs: u32,
     scoring_enabled: bool,
     bitmap_enabled: bool,
@@ -44,6 +44,11 @@ fn intersect_scorers(
                 })
         })
     {
+        for scorer in &mut scorers {
+            if scorer.doc() == 0 && scorer.seek(0) == TERMINATED {
+                return Box::new(EmptyScorer);
+            }
+        }
         Box::new(BitmapCombination::new(
             scorers,
             BitmapOperation::Intersection,
@@ -1654,102 +1659,363 @@ fn is_include_occur(occur: Occur) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use columnar::ColumnType;
+    use common::TinySet;
+    use proptest::prelude::*;
 
     use super::{BooleanWeight, ExecutionMode};
+    use crate::query::bitmap_combination::BitmapCombination;
     use crate::query::{
         AllQuery, Bm25Weight, BooleanQuery, CandidateHint, DisjunctionPruning, EnableScoring,
-        ExcludedDocSet, ExclusionSet, Occur, Query, RangeQuery, SumCombiner, TermQuery, TermScorer,
+        ExactPostings, ExcludedDocSet, ExclusionSet, FastFieldTermSetQuery, Occur, Query,
+        RangeQuery, SumCombiner, TermPredicate, TermPredicateQuery, TermQuery, TermScorer,
     };
-    use crate::schema::{IndexRecordOption, Schema, FAST, TEXT};
-    use crate::{Bm25Params, Index, Term, TERMINATED};
+    use crate::schema::{IndexRecordOption, Schema, TextOptions, FAST, TEXT};
+    use crate::{Bm25Params, DocId, Index, Score, Term, TERMINATED};
+
+    #[derive(Debug)]
+    struct ModPredicate {
+        modulus: u32,
+        rem: u32,
+    }
+
+    impl ModPredicate {
+        fn matches_doc(&self, doc: DocId) -> bool {
+            self.rem < self.modulus && doc % self.modulus == self.rem
+        }
+    }
+
+    impl TermPredicate for ModPredicate {
+        fn filter_bytes(
+            &self,
+            data: &[u8],
+            offsets: &[u32],
+            out: &mut [TinySet],
+        ) -> crate::Result<()> {
+            for i in 0..offsets.len().saturating_sub(1) {
+                let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
+                if let Some(num) = std::str::from_utf8(slice)
+                    .ok()
+                    .and_then(|s| s.strip_prefix("k-"))
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    if self.matches_doc(num) {
+                        out[i / 64].insert_mut((i % 64) as u32);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn filter_monotonic_u64s(
+            &self,
+            _col_type: ColumnType,
+            values: &[u64],
+            out: &mut [TinySet],
+        ) -> crate::Result<()> {
+            for (i, &v) in values.iter().enumerate() {
+                if let Ok(doc) = u32::try_from(v) {
+                    if self.matches_doc(doc) {
+                        out[i / 64].insert_mut((i % 64) as u32);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TermKind {
+        Half,
+        Div7,
+        Div8,
+        Div9,
+        Rare,
+    }
+
+    impl TermKind {
+        fn token(self) -> &'static str {
+            match self {
+                TermKind::Half => "half",
+                TermKind::Div7 => "d7",
+                TermKind::Div8 => "d8",
+                TermKind::Div9 => "d9",
+                TermKind::Rare => "rare",
+            }
+        }
+
+        fn matches(self, doc: DocId) -> bool {
+            match self {
+                TermKind::Half => doc % 2 == 0,
+                TermKind::Div7 => doc % 7 == 0,
+                TermKind::Div8 => doc % 8 == 0,
+                TermKind::Div9 => doc % 9 == 0,
+                TermKind::Rare => doc % 64 == 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ClauseLeaf {
+        All,
+        Term(TermKind),
+        Range { lo: u32, hi: u32 },
+        NumTermSet { start: u32, step: u32, count: u32 },
+        NumPredicate { modulus: u32, rem: u32 },
+        DictPredicate { modulus: u32, rem: u32 },
+    }
+
+    impl ClauseLeaf {
+        fn is_fast_field(&self) -> bool {
+            !matches!(self, ClauseLeaf::All | ClauseLeaf::Term(_))
+        }
+
+        fn matches(&self, doc: DocId) -> bool {
+            match *self {
+                ClauseLeaf::All => true,
+                ClauseLeaf::Term(kind) => kind.matches(doc),
+                ClauseLeaf::Range { lo, hi } => doc >= lo && doc < hi,
+                ClauseLeaf::NumTermSet { start, step, count } => {
+                    doc >= start && (doc - start) % step == 0 && (doc - start) / step < count
+                }
+                ClauseLeaf::NumPredicate { modulus, rem }
+                | ClauseLeaf::DictPredicate { modulus, rem } => {
+                    rem < modulus && doc % modulus == rem
+                }
+            }
+        }
+
+        fn to_query(
+            &self,
+            text: crate::schema::Field,
+            value: crate::schema::Field,
+            tag: crate::schema::Field,
+        ) -> Box<dyn Query> {
+            match *self {
+                ClauseLeaf::All => Box::new(AllQuery),
+                ClauseLeaf::Term(kind) => Box::new(TermQuery::new(
+                    Term::from_field_text(text, kind.token()),
+                    IndexRecordOption::WithFreqs,
+                )),
+                ClauseLeaf::Range { lo, hi } => Box::new(RangeQuery::new(
+                    Bound::Included(Term::from_field_u64(value, u64::from(lo))),
+                    Bound::Excluded(Term::from_field_u64(value, u64::from(hi))),
+                )),
+                ClauseLeaf::NumTermSet { start, step, count } => {
+                    let terms = (0..count)
+                        .map(|i| Term::from_field_u64(value, u64::from(start + i * step)));
+                    Box::new(FastFieldTermSetQuery::new(terms))
+                }
+                ClauseLeaf::NumPredicate { modulus, rem } => Box::new(
+                    TermPredicateQuery::new(value, Arc::new(ModPredicate { modulus, rem }))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                ),
+                ClauseLeaf::DictPredicate { modulus, rem } => Box::new(
+                    TermPredicateQuery::new(tag, Arc::new(ModPredicate { modulus, rem }))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                ),
+            }
+        }
+    }
+
+    fn arb_clause(num_docs: u32) -> impl Strategy<Value = (Occur, ClauseLeaf)> {
+        let occur = prop_oneof![
+            5 => Just(Occur::Must),
+            2 => Just(Occur::Should),
+            1 => Just(Occur::MustNot),
+        ];
+        let term = prop_oneof![
+            Just(TermKind::Half),
+            Just(TermKind::Div7),
+            Just(TermKind::Div8),
+            Just(TermKind::Div9),
+            Just(TermKind::Rare),
+        ];
+        let leaf = prop_oneof![
+            1 => Just(ClauseLeaf::All),
+            5 => term.prop_map(ClauseLeaf::Term),
+            2 => (0..=num_docs, 0..=num_docs).prop_map(|(a, b)| ClauseLeaf::Range {
+                lo: a.min(b),
+                hi: a.max(b),
+            }),
+            2 => (0u32..16, 1u32..16, 0u32..40).prop_map(|(start, step, count)| {
+                ClauseLeaf::NumTermSet { start, step, count }
+            }),
+            2 => (2u32..12).prop_flat_map(|modulus| {
+                (0..=modulus).prop_map(move |rem| ClauseLeaf::NumPredicate { modulus, rem })
+            }),
+            2 => (2u32..12).prop_flat_map(|modulus| {
+                (0..=modulus).prop_map(move |rem| ClauseLeaf::DictPredicate { modulus, rem })
+            }),
+        ];
+        (occur, leaf)
+    }
+
+    fn expected_boolean_matches(
+        clauses: &[(Occur, ClauseLeaf)],
+        min_should: usize,
+        num_docs: u32,
+    ) -> Vec<DocId> {
+        let has_must = clauses.iter().any(|(o, _)| *o == Occur::Must);
+        let should_count = clauses.iter().filter(|(o, _)| *o == Occur::Should).count();
+        let required_should = if min_should == 0 && !has_must && should_count > 0 {
+            1
+        } else {
+            min_should
+        };
+        if !has_must && should_count == 0 {
+            return Vec::new();
+        }
+        (0..num_docs)
+            .filter(|&doc| {
+                let mut matched_should = 0usize;
+                for (occur, leaf) in clauses {
+                    let hit = leaf.matches(doc);
+                    match occur {
+                        Occur::Must if !hit => return false,
+                        Occur::MustNot if hit => return false,
+                        Occur::Should if hit => matched_should += 1,
+                        _ => {}
+                    }
+                }
+                matched_should >= required_should
+            })
+            .collect()
+    }
 
     #[test]
     fn candidate_scorer_preserves_boolean_matches_and_scores() -> crate::Result<()> {
-        const DOCUMENTS: u64 = 16;
+        const DOCUMENTS: u32 = 1200;
         let mut schema = Schema::builder();
         let value = schema.add_u64_field("value", FAST);
-        let text = schema.add_text_field("text", TEXT);
+        let tag = schema.add_text_field("tag", TextOptions::default().set_fast("raw"));
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer_for_tests()?;
         for doc in 0..DOCUMENTS {
-            writer.add_document(
-                doc!(value => doc, text => if doc % 2 == 0 { "even" } else { "odd" }),
-            )?;
+            let mut tokens = Vec::new();
+            for kind in [
+                TermKind::Half,
+                TermKind::Div7,
+                TermKind::Div8,
+                TermKind::Div9,
+                TermKind::Rare,
+            ] {
+                if kind.matches(doc) {
+                    tokens.push(kind.token());
+                }
+            }
+            writer.add_document(doc!(
+                value => u64::from(doc),
+                tag => format!("k-{doc:04}"),
+                text => tokens.join(" "),
+            ))?;
         }
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         let reader = searcher.segment_reader(0);
-        let range = || -> Box<dyn Query> {
-            Box::new(RangeQuery::new(
-                Bound::Included(Term::from_field_u64(value, 4)),
-                Bound::Excluded(Term::from_field_u64(value, 12)),
-            ))
-        };
-        let term = || -> Box<dyn Query> {
-            Box::new(TermQuery::new(
-                Term::from_field_text(text, "even"),
-                IndexRecordOption::Basic,
-            ))
-        };
-        let queries = [
-            BooleanQuery::new(vec![
-                (Occur::Must, Box::new(AllQuery)),
-                (Occur::Must, range()),
-            ]),
-            BooleanQuery::new(vec![
-                (Occur::Must, range()),
-                (Occur::Must, Box::new(AllQuery)),
-            ]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, term())]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, range())]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::MustNot, term())]),
-            BooleanQuery::new(vec![
-                (Occur::Should, range()),
-                (Occur::Should, Box::new(AllQuery)),
-            ]),
-            BooleanQuery::with_minimum_required_clauses(
-                vec![(Occur::Must, range()), (Occur::Should, term())],
-                1,
-            ),
-            BooleanQuery::with_minimum_required_clauses(
-                vec![(Occur::Must, range()), (Occur::Must, Box::new(AllQuery))],
-                1,
-            ),
-        ];
-        for scoring in [
-            EnableScoring::disabled_from_searcher(&searcher),
-            EnableScoring::enabled_from_searcher(&searcher),
-        ] {
-            for query in &queries {
-                let weight = query.weight(scoring)?;
-                let mut ordinary = weight.scorer(reader, 1.0)?;
-                let mut expected = Vec::new();
+        let hit_bitmap_with_deferred_fast_must = AtomicBool::new(false);
+
+        proptest!(ProptestConfig::with_cases(128), |(
+            clauses in prop::collection::vec(arb_clause(DOCUMENTS), 2..=5),
+            min_should in 0usize..=2,
+        )| {
+            let query = BooleanQuery::with_minimum_required_clauses(
+                clauses
+                    .iter()
+                    .map(|(occur, leaf)| (*occur, leaf.to_query(text, value, tag)))
+                    .collect(),
+                min_should,
+            );
+            let expected_docs = expected_boolean_matches(&clauses, min_should, DOCUMENTS);
+            let has_fast_must = clauses
+                .iter()
+                .any(|(o, leaf)| *o == Occur::Must && leaf.is_fast_field());
+
+            for scoring in [
+                EnableScoring::disabled_from_searcher(&searcher),
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+                EnableScoring::enabled_from_searcher(&searcher),
+            ] {
+                let weight = query.weight(scoring).unwrap();
+                let mut ordinary = weight.scorer(reader, 1.0).unwrap();
+                if !scoring.is_scoring_enabled()
+                    && scoring.bitmap_postings_enabled()
+                    && has_fast_must
+                    && ordinary.is::<BitmapCombination>()
+                {
+                    hit_bitmap_with_deferred_fast_must.store(true, Ordering::Relaxed);
+                }
+                let mut ordinary_results = Vec::new();
                 while ordinary.doc() != TERMINATED {
-                    expected.push((ordinary.doc(), ordinary.score()));
+                    ordinary_results.push((ordinary.doc(), ordinary.score()));
                     ordinary.advance();
                 }
-                let mut candidates =
-                    ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
-                        reader,
-                        1.0,
-                        CandidateHint::Estimated(reader.max_doc()),
-                    )?);
+                let ordinary_docs: Vec<_> = ordinary_results.iter().map(|&(doc, _)| doc).collect();
+                prop_assert_eq!(&ordinary_docs, &expected_docs);
+
+                if !scoring.is_scoring_enabled() {
+                    let mut batch_docs = Vec::new();
+                    weight
+                        .for_each_no_score_batch(reader, &mut |batch| {
+                            batch.for_each_doc_block(|docs| batch_docs.extend_from_slice(docs));
+                        })
+                        .unwrap();
+                    prop_assert_eq!(&batch_docs, &expected_docs);
+                } else {
+                    let mut pruned_results = Vec::new();
+                    weight
+                        .for_each_pruning(Score::MIN, reader, &mut |doc, score| {
+                            pruned_results.push((doc, score));
+                            Score::MIN
+                        })
+                        .unwrap();
+                    prop_assert_eq!(pruned_results, ordinary_results.clone());
+                }
+
+                let mut candidates = ExcludedDocSet::new(
+                    weight
+                        .scorer_for_candidates_unpositioned(
+                            reader,
+                            1.0,
+                            CandidateHint::Estimated(reader.max_doc()),
+                        )
+                        .unwrap(),
+                );
                 let actual_docs: Vec<_> = (0..reader.max_doc())
                     .filter(|&doc| candidates.contains(doc))
                     .collect();
-                let expected_docs: Vec<_> = expected.iter().map(|&(doc, _)| doc).collect();
-                assert_eq!(actual_docs, expected_docs, "query={query:?}");
-                let mut candidate = weight.scorer_for_candidates_unpositioned(
-                    reader,
-                    1.0,
-                    CandidateHint::Estimated(reader.max_doc()),
-                )?;
-                for (doc, score) in expected {
-                    assert_eq!(candidate.seek(doc), doc, "query={query:?}");
-                    assert_eq!(candidate.score(), score, "query={query:?}");
+                prop_assert_eq!(&actual_docs, &expected_docs);
+
+                let mut candidate = weight
+                    .scorer_for_candidates_unpositioned(
+                        reader,
+                        1.0,
+                        CandidateHint::Estimated(reader.max_doc()),
+                    )
+                    .unwrap();
+                for (doc, score) in ordinary_results {
+                    prop_assert_eq!(candidate.seek(doc), doc);
+                    prop_assert_eq!(candidate.score(), score);
                 }
             }
-        }
+        });
+
+        assert!(
+            hit_bitmap_with_deferred_fast_must.load(Ordering::Relaxed),
+            "proptest should cover BitmapCombination with deferred fast-field Must clauses"
+        );
         Ok(())
     }
 
