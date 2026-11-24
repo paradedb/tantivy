@@ -59,19 +59,14 @@ pub trait TermPredicate: fmt::Debug + Send + Sync + 'static {
     ///
     /// `out` is pre-sized to `num_items.div_ceil(64)` and cleared to `TinySet::EMPTY`;
     /// implementations set bit `i % 64` of `out[i / 64]` for each matching item `i`.
-    fn filter_bytes(&self, data: &[u8], offsets: &[u32], out: &mut [TinySet]) -> crate::Result<()>;
+    fn filter_bytes(&self, data: &[u8], offsets: &[u32], out: &mut [TinySet]);
 
     /// Evaluate membership on `values.len()` `MonotonicallyMappableToU64`-encoded values
     /// of `col_type` (`I64`, `U64`, `F64`, `Bool`, `DateTime`).
     ///
     /// `out` is pre-sized to `values.len().div_ceil(64)` and cleared to `TinySet::EMPTY`;
     /// implementations set bit `i % 64` of `out[i / 64]` for each matching item `i`.
-    fn filter_monotonic_u64s(
-        &self,
-        col_type: ColumnType,
-        values: &[u64],
-        out: &mut [TinySet],
-    ) -> crate::Result<()>;
+    fn filter_monotonic_u64s(&self, col_type: ColumnType, values: &[u64], out: &mut [TinySet]);
 
     /// Optional cardinality hint (`K`) when the caller knows the build-side distinct key count.
     fn estimated_distinct_keys(&self) -> Option<u64> {
@@ -249,7 +244,7 @@ impl<M> BytesBatcher<M> {
         on_match: &mut impl FnMut(&M, &[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
         prepare_tinyset_buf(&mut self.out, self.meta.len());
-        predicate.filter_bytes(&self.data, &self.offsets, &mut self.out)?;
+        predicate.filter_bytes(&self.data, &self.offsets, &mut self.out);
         let data = &self.data;
         let offsets = &self.offsets;
         let meta = &self.meta;
@@ -317,7 +312,7 @@ impl<M> U64Batcher<M> {
         on_match: &mut impl FnMut(&M, u64) -> crate::Result<()>,
     ) -> crate::Result<()> {
         prepare_tinyset_buf(&mut self.out, self.vals.len());
-        predicate.filter_monotonic_u64s(col_type, &self.vals, &mut self.out)?;
+        predicate.filter_monotonic_u64s(col_type, &self.vals, &mut self.out);
         let vals = &self.vals;
         let meta = &self.meta;
         try_for_each_set_bit(&self.out, vals.len(), |idx| on_match(&meta[idx], vals[idx]))?;
@@ -424,32 +419,27 @@ impl DictKeyProbe {
     /// Keys in `(data, offsets)` must be sorted ascending (which holds for every decoded
     /// SSTable block and ascending sequence of blocks), enabling a bounded forward scan for
     /// `SortedTerms` and a single vectorized call for `Predicate`.
-    fn matches_sorted_batch(
-        &self,
-        data: &[u8],
-        offsets: &[u32],
-        out: &mut Vec<TinySet>,
-    ) -> crate::Result<()> {
+    fn matches_sorted_batch(&self, data: &[u8], offsets: &[u32], out: &mut Vec<TinySet>) {
         let count = offsets.len().saturating_sub(1);
         prepare_tinyset_buf(out, count);
         if count == 0 {
-            return Ok(());
+            return;
         }
         match self {
             DictKeyProbe::SortedTerms(terms) => {
                 if terms.is_empty() {
-                    return Ok(());
+                    return;
                 }
                 let first = &data[offsets[0] as usize..offsets[1] as usize];
                 let last = &data[offsets[count - 1] as usize..offsets[count] as usize];
                 let lo = terms.partition_point(|t| t.as_slice() < first);
                 if lo >= terms.len() {
-                    return Ok(());
+                    return;
                 }
                 let hi = lo + terms[lo..].partition_point(|t| t.as_slice() <= last);
                 let slice = &terms[lo..hi];
                 if slice.is_empty() {
-                    return Ok(());
+                    return;
                 }
                 let mut cursor = 0usize;
                 for i in 0..count {
@@ -476,7 +466,6 @@ impl DictKeyProbe {
                         }
                     }
                 }
-                Ok(())
             }
             DictKeyProbe::Predicate(pred) => pred.filter_bytes(data, offsets, out),
         }
@@ -520,7 +509,7 @@ fn evaluate_blocks_into_cache(
     tested_ords: &mut BitSet,
     matched_ords: &mut BitSet,
     scratch: &mut DictEvalScratch,
-) -> crate::Result<()> {
+) -> io::Result<()> {
     if block_addrs.is_empty() {
         return Ok(());
     }
@@ -549,32 +538,29 @@ fn evaluate_blocks_into_cache(
     }
     scratch.offsets.push(0u32);
 
-    let flush = |scratch: &mut DictEvalScratch,
-                 tested_ords: &mut BitSet,
-                 matched_ords: &mut BitSet|
-     -> crate::Result<()> {
-        if !scratch.batch_ords.is_empty() {
-            probe.matches_sorted_batch(&scratch.data, &scratch.offsets, &mut scratch.out)?;
-            try_for_each_set_bit(&scratch.out, scratch.batch_ords.len(), |idx| {
-                matched_ords.insert(scratch.batch_ords[idx]);
-                Ok(())
-            })?;
-            for &ord in scratch.batch_ords.iter() {
+    let flush =
+        |scratch: &mut DictEvalScratch, tested_ords: &mut BitSet, matched_ords: &mut BitSet| {
+            if !scratch.batch_ords.is_empty() {
+                probe.matches_sorted_batch(&scratch.data, &scratch.offsets, &mut scratch.out);
+                let _ = try_for_each_set_bit(&scratch.out, scratch.batch_ords.len(), |idx| {
+                    matched_ords.insert(scratch.batch_ords[idx]);
+                    Ok(())
+                });
+                for &ord in scratch.batch_ords.iter() {
+                    tested_ords.insert(ord);
+                }
+                scratch.data.clear();
+                scratch.offsets.clear();
+                scratch.offsets.push(0u32);
+                scratch.batch_ords.clear();
+            }
+            for &ord in scratch.skipped_ords.iter() {
                 tested_ords.insert(ord);
             }
-            scratch.data.clear();
-            scratch.offsets.clear();
-            scratch.offsets.push(0u32);
-            scratch.batch_ords.clear();
-        }
-        for &ord in scratch.skipped_ords.iter() {
-            tested_ords.insert(ord);
-        }
-        scratch.skipped_ords.clear();
-        Ok(())
-    };
+            scratch.skipped_ords.clear();
+        };
 
-    dict.visit_blocks_coalesced(block_addrs, |ord, key| -> crate::Result<()> {
+    dict.visit_blocks_coalesced(block_addrs, |ord, key| -> io::Result<()> {
         let Ok(ord_u32) = u32::try_from(ord) else {
             return Ok(());
         };
@@ -589,14 +575,15 @@ fn evaluate_blocks_into_cache(
             || (!scratch.batch_ords.is_empty()
                 && scratch.data.len().saturating_add(key.len()) > i32::MAX as usize)
         {
-            flush(scratch, tested_ords, matched_ords)?;
+            flush(scratch, tested_ords, matched_ords);
         }
         scratch.data.extend_from_slice(key);
         scratch.offsets.push(scratch.data.len() as u32);
         scratch.batch_ords.push(ord_u32);
         Ok(())
     })?;
-    flush(scratch, tested_ords, matched_ords)
+    flush(scratch, tested_ords, matched_ords);
+    Ok(())
 }
 
 /// Completes a partially populated `BlockCached` entry into a full `matched_ords` `BitSet`
@@ -1201,13 +1188,11 @@ impl PredicateColumnDocSet {
                 self.column
                     .values
                     .get_range(u64::from(base), &mut self.scratch_vals);
-                self.predicate
-                    .filter_monotonic_u64s(
-                        self.col_type,
-                        &self.scratch_vals,
-                        &mut self.window_mask[..num_words],
-                    )
-                    .expect("numeric predicate evaluation should succeed");
+                self.predicate.filter_monotonic_u64s(
+                    self.col_type,
+                    &self.scratch_vals,
+                    &mut self.window_mask[..num_words],
+                );
                 return;
             }
             Cardinality::Full => {
@@ -1263,9 +1248,11 @@ impl PredicateColumnDocSet {
             return;
         }
         prepare_tinyset_buf(&mut self.scratch_out, self.scratch_vals.len());
-        self.predicate
-            .filter_monotonic_u64s(self.col_type, &self.scratch_vals, &mut self.scratch_out)
-            .expect("numeric predicate evaluation should succeed");
+        self.predicate.filter_monotonic_u64s(
+            self.col_type,
+            &self.scratch_vals,
+            &mut self.scratch_out,
+        );
         let val_docs = &self.scratch_val_docs;
         let window_mask = &mut self.window_mask;
         let _ = try_for_each_set_bit(&self.scratch_out, val_docs.len(), |idx| {
@@ -1384,9 +1371,11 @@ impl DocSet for PredicateColumnDocSet {
                         return false;
                     }
                     let mut out = [TinySet::EMPTY; 1];
-                    self.predicate
-                        .filter_monotonic_u64s(self.col_type, std::slice::from_ref(&v), &mut out)
-                        .expect("numeric predicate evaluation should succeed");
+                    self.predicate.filter_monotonic_u64s(
+                        self.col_type,
+                        std::slice::from_ref(&v),
+                        &mut out,
+                    );
                     out[0].contains(0)
                 })
             }
@@ -1401,13 +1390,11 @@ impl DocSet for PredicateColumnDocSet {
                     false
                 } else {
                     prepare_tinyset_buf(&mut self.scratch_out, self.scratch_vals.len());
-                    self.predicate
-                        .filter_monotonic_u64s(
-                            self.col_type,
-                            &self.scratch_vals,
-                            &mut self.scratch_out,
-                        )
-                        .expect("numeric predicate evaluation should succeed");
+                    self.predicate.filter_monotonic_u64s(
+                        self.col_type,
+                        &self.scratch_vals,
+                        &mut self.scratch_out,
+                    );
                     self.scratch_out.iter().any(|w| !w.is_empty())
                 }
             }
@@ -1476,9 +1463,11 @@ impl DocSet for PredicateColumnDocSet {
                     self.column.values.get_vals(docs, &mut self.scratch_vals);
                 }
                 mask[..words].fill(TinySet::EMPTY);
-                self.predicate
-                    .filter_monotonic_u64s(self.col_type, &self.scratch_vals, &mut mask[..words])
-                    .expect("numeric predicate evaluation should succeed");
+                self.predicate.filter_monotonic_u64s(
+                    self.col_type,
+                    &self.scratch_vals,
+                    &mut mask[..words],
+                );
                 return next_bound;
             }
             Cardinality::Full if all_active_and_in_bounds => {
@@ -1622,9 +1611,11 @@ impl DocSet for PredicateColumnDocSet {
             return next_bound;
         }
         prepare_tinyset_buf(&mut self.scratch_out, self.scratch_vals.len());
-        self.predicate
-            .filter_monotonic_u64s(self.col_type, &self.scratch_vals, &mut self.scratch_out)
-            .expect("numeric predicate evaluation should succeed");
+        self.predicate.filter_monotonic_u64s(
+            self.col_type,
+            &self.scratch_vals,
+            &mut self.scratch_out,
+        );
         let val_docs = &self.scratch_val_docs;
         let _ = try_for_each_set_bit(&self.scratch_out, val_docs.len(), |idx| {
             let pos = val_docs[idx];
@@ -1773,12 +1764,7 @@ mod tests {
     }
 
     impl TermPredicate for SetPredicate {
-        fn filter_bytes(
-            &self,
-            data: &[u8],
-            offsets: &[u32],
-            out: &mut [TinySet],
-        ) -> crate::Result<()> {
+        fn filter_bytes(&self, data: &[u8], offsets: &[u32], out: &mut [TinySet]) {
             let count = offsets.len().saturating_sub(1);
             self.bytes_telemetry.calls.fetch_add(1, Ordering::Relaxed);
             self.bytes_telemetry
@@ -1790,15 +1776,9 @@ mod tests {
                     out[i / 64].insert_mut((i % 64) as u32);
                 }
             }
-            Ok(())
         }
 
-        fn filter_monotonic_u64s(
-            &self,
-            col_type: ColumnType,
-            values: &[u64],
-            out: &mut [TinySet],
-        ) -> crate::Result<()> {
+        fn filter_monotonic_u64s(&self, col_type: ColumnType, values: &[u64], out: &mut [TinySet]) {
             assert_eq!(col_type, ColumnType::I64);
             self.u64_telemetry.calls.fetch_add(1, Ordering::Relaxed);
             self.u64_telemetry
@@ -1809,7 +1789,6 @@ mod tests {
                     out[i / 64].insert_mut((i % 64) as u32);
                 }
             }
-            Ok(())
         }
 
         fn estimated_distinct_keys(&self) -> Option<u64> {
@@ -1841,16 +1820,21 @@ mod tests {
             let (narrow, broad) = make_pair();
             let (narrow_s, broad_s) = (build(narrow)?, build(broad.clone())?);
             assert!(narrow_s.size_hint() < broad_s.size_hint());
-            let driver: Box<dyn crate::query::Scorer> = Box::new(crate::query::ConstScorer::new(
-                crate::query::VecDocSet::from(driver_docs.to_vec()),
-                1.0,
+            let driver = crate::query::UnpositionedScorer::from_positioned(Box::new(
+                crate::query::ConstScorer::new(
+                    crate::query::VecDocSet::from(driver_docs.to_vec()),
+                    1.0,
+                ),
             ));
             let scorers = if reverse {
                 vec![broad_s, narrow_s, driver]
             } else {
                 vec![driver, narrow_s, broad_s]
             };
-            let mut inter = crate::query::intersect_scorers(scorers, segment.num_docs());
+            let mut inter = crate::query::intersection::intersect_candidate_scorers(
+                scorers,
+                segment.num_docs(),
+            );
             let mut matched = Vec::new();
             while inter.doc() != TERMINATED {
                 matched.push(inter.doc());
@@ -2811,7 +2795,7 @@ mod tests {
                     CandidateHint::Estimated(1),
                 )
                 .unwrap();
-            if num_s.doc() != TERMINATED {
+            if !num_s.is_empty() {
                 prop_assert_eq!(
                     num_s.cost().probe,
                     crate::ProbeCost::FAST_FIELD.saturating_add(pred.probe_cost())

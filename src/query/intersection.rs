@@ -7,7 +7,7 @@ use crate::docset::{
     BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
 };
 use crate::query::term_query::TermScorer;
-use crate::query::{EmptyScorer, Scorer};
+use crate::query::{EmptyScorer, Scorer, UnpositionedScorer};
 use crate::{DocId, Score};
 
 const BATCH_FILTER_ORDER_EXPECTED_LEN: u64 = 256;
@@ -15,22 +15,29 @@ const BATCH_FILTER_ORDER_EXPECTED_LEN: u64 = 256;
 /// Orders intersection participants so index `0` is the cheapest driver (`cost().drive`,
 /// tie-breaking by `size_hint()`), and followers `[1..]` are ordered by expected probe cost per
 /// eliminated candidate (`probe.scalar() / (1 - selectivity)`), tie-breaking by `drive`.
-fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_num_docs: u32) {
-    if docsets.len() <= 1 {
+fn order_by_drive_and_probe<T>(
+    items: &mut [T],
+    segment_num_docs: u32,
+    cost_and_hint: impl Fn(&T) -> (DocSetCost, u32),
+) {
+    if items.len() <= 1 {
         return;
     }
-    let driver_idx = docsets
+    let driver_idx = items
         .iter()
         .enumerate()
-        .min_by_key(|(_, d)| (d.cost().drive, d.size_hint()))
+        .min_by_key(|(_, item)| {
+            let (cost, hint) = cost_and_hint(item);
+            (cost.drive, hint)
+        })
         .map(|(i, _)| i)
         .unwrap();
-    docsets.swap(0, driver_idx);
+    items.swap(0, driver_idx);
     let num_docs = f64::from(segment_num_docs.max(1));
-    docsets[1..].sort_by(|a, b| {
-        let rank = |d: &TDocSet| -> (f64, DriveCost) {
-            let cost = d.cost();
-            let selectivity = (f64::from(d.size_hint()) / num_docs).clamp(0.0, 1.0);
+    items[1..].sort_by(|a, b| {
+        let rank = |item: &T| -> (f64, DriveCost) {
+            let (cost, hint) = cost_and_hint(item);
+            let selectivity = (f64::from(hint) / num_docs).clamp(0.0, 1.0);
             let elim = (1.0 - selectivity).max(1e-6);
             (cost.probe.scalar() as f64 / elim, cost.drive)
         };
@@ -40,13 +47,21 @@ fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_
     });
 }
 
-fn order_batch_filters(filters: &mut [Box<dyn Scorer>], segment_num_docs: u32) {
+fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_num_docs: u32) {
+    order_by_drive_and_probe(docsets, segment_num_docs, |d| (d.cost(), d.size_hint()));
+}
+
+fn order_unpositioned_scorers(scorers: &mut [UnpositionedScorer], segment_num_docs: u32) {
+    order_by_drive_and_probe(scorers, segment_num_docs, |s| (s.cost(), s.size_hint()));
+}
+
+fn order_batch_filters(filters: &mut [UnpositionedScorer], segment_num_docs: u32) {
     if filters.len() <= 1 {
         return;
     }
     let num_docs = f64::from(segment_num_docs.max(1));
     filters.sort_by(|a, b| {
-        let rank = |d: &Box<dyn Scorer>| -> (f64, DriveCost) {
+        let rank = |d: &UnpositionedScorer| -> (f64, DriveCost) {
             let cost = d.cost();
             let selectivity = (f64::from(d.size_hint()) / num_docs).clamp(0.0, 1.0);
             let elim = (1.0 - selectivity).max(1e-6);
@@ -60,31 +75,43 @@ fn order_batch_filters(filters: &mut [Box<dyn Scorer>], segment_num_docs: u32) {
     });
 }
 
-fn intersect_scalar_scorers(
+fn go_to_first_unpositioned(scorers: &mut [UnpositionedScorer]) -> DocId {
+    let mut candidate = scorers
+        .iter()
+        .map(UnpositionedScorer::lower_bound)
+        .max()
+        .expect("go_to_first_unpositioned requires at least one scorer");
+    let (first, rest) = scorers.split_first_mut().unwrap();
+    'outer: while candidate < TERMINATED {
+        candidate = first.position_at(candidate);
+        if candidate == TERMINATED {
+            break;
+        }
+        for scorer in rest.iter_mut() {
+            if let SeekDangerResult::SeekLowerBound(seek_lower_bound) =
+                scorer.seek_danger(candidate)
+            {
+                debug_assert!(
+                    seek_lower_bound == TERMINATED || seek_lower_bound > candidate,
+                    "seek_lower_bound {seek_lower_bound} must be greater than candidate \
+                     {candidate}"
+                );
+                candidate = seek_lower_bound;
+                continue 'outer;
+            }
+        }
+        return candidate;
+    }
+    for scorer in rest.iter_mut() {
+        scorer.position_at(TERMINATED);
+    }
+    first.position_at(TERMINATED)
+}
+
+fn box_intersection_pair(
     mut scorers: Vec<Box<dyn Scorer>>,
     segment_num_docs: u32,
-    positioned: bool,
 ) -> Box<dyn Scorer> {
-    if scorers.is_empty() {
-        return Box::new(EmptyScorer);
-    }
-    if scorers.len() == 1 {
-        let mut s = scorers.pop().unwrap();
-        if positioned && s.doc() == 0 {
-            s.seek(0);
-        }
-        return s;
-    }
-    order_intersection_docsets(&mut scorers, segment_num_docs);
-    if positioned {
-        let doc = go_to_first_doc(&mut scorers[..]);
-        if doc == TERMINATED {
-            return Box::new(EmptyScorer);
-        }
-    } else if scorers.iter().any(|s| s.doc() == TERMINATED) {
-        return Box::new(EmptyScorer);
-    }
-    // We know that we have at least 2 elements.
     let left = scorers.remove(0);
     let right = scorers.remove(0);
     let all_term_scorers = [&left, &right]
@@ -106,26 +133,59 @@ fn intersect_scalar_scorers(
     })
 }
 
-fn intersect_scorers_impl(
-    mut scorers: Vec<Box<dyn Scorer>>,
+fn intersect_scalar_positioned(
+    mut scorers: Vec<UnpositionedScorer>,
     segment_num_docs: u32,
-    positioned: bool,
 ) -> Box<dyn Scorer> {
     if scorers.is_empty() {
         return Box::new(EmptyScorer);
     }
     if scorers.len() == 1 {
-        let mut s = scorers.pop().unwrap();
-        if positioned && s.doc() == 0 {
-            s.seek(0);
-        }
-        return s;
+        return scorers.pop().unwrap().into_positioned();
     }
+    order_unpositioned_scorers(&mut scorers, segment_num_docs);
+    if scorers.iter().any(UnpositionedScorer::is_empty) {
+        return Box::new(EmptyScorer);
+    }
+    if go_to_first_unpositioned(&mut scorers[..]) == TERMINATED {
+        return Box::new(EmptyScorer);
+    }
+    let positioned = scorers
+        .into_iter()
+        .map(UnpositionedScorer::into_positioned)
+        .collect();
+    box_intersection_pair(positioned, segment_num_docs)
+}
+
+fn intersect_scalar_unpositioned(
+    mut scorers: Vec<UnpositionedScorer>,
+    segment_num_docs: u32,
+) -> UnpositionedScorer {
+    if scorers.is_empty() {
+        return UnpositionedScorer::from_positioned(Box::new(EmptyScorer));
+    }
+    if scorers.len() == 1 {
+        return scorers.pop().unwrap();
+    }
+    order_unpositioned_scorers(&mut scorers, segment_num_docs);
+    if scorers.iter().any(UnpositionedScorer::is_empty) {
+        return UnpositionedScorer::from_positioned(Box::new(EmptyScorer));
+    }
+    let raw = scorers
+        .into_iter()
+        .map(UnpositionedScorer::into_raw_unpositioned)
+        .collect();
+    UnpositionedScorer::from_unpositioned(box_intersection_pair(raw, segment_num_docs))
+}
+
+fn split_batch_filters(
+    mut scorers: Vec<UnpositionedScorer>,
+) -> (Vec<UnpositionedScorer>, Vec<UnpositionedScorer>) {
     let has_batch_follower = scorers
         .iter()
         .any(|s| s.cost().probe.prefers_batching() && s.constant_score().is_some());
     if !has_batch_follower {
-        return intersect_scalar_scorers(scorers, segment_num_docs, positioned);
+        return (scorers, Vec::new());
     }
 
     // Select the cheapest-to-drive scorer first so a narrow batchable scorer (e.g. bounded
@@ -148,20 +208,30 @@ fn intersect_scorers_impl(
             scalar_scorers.push(scorer);
         }
     }
+    (scalar_scorers, batch_filters)
+}
+
+pub(crate) fn intersect_candidate_scorers(
+    mut scorers: Vec<UnpositionedScorer>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    if scorers.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if scorers.len() == 1 {
+        return scorers.pop().unwrap().into_positioned();
+    }
+    let (scalar_scorers, mut batch_filters) = split_batch_filters(scorers);
     if batch_filters.is_empty() {
-        return intersect_scalar_scorers(scalar_scorers, segment_num_docs, positioned);
+        return intersect_scalar_positioned(scalar_scorers, segment_num_docs);
     }
 
-    let inner = intersect_scalar_scorers(scalar_scorers, segment_num_docs, positioned);
-    if inner.doc() == TERMINATED || batch_filters.iter().any(|f| f.doc() == TERMINATED) {
+    let inner = intersect_scalar_positioned(scalar_scorers, segment_num_docs);
+    if inner.doc() == TERMINATED || batch_filters.iter().any(UnpositionedScorer::is_empty) {
         return Box::new(EmptyScorer);
     }
     order_batch_filters(&mut batch_filters, segment_num_docs);
-    let filtered = if positioned {
-        BatchFilteredScorer::new(inner, batch_filters, segment_num_docs)
-    } else {
-        BatchFilteredScorer::new_unpositioned(inner, batch_filters, segment_num_docs)
-    };
+    let filtered = BatchFilteredScorer::new(inner, batch_filters, segment_num_docs);
     if filtered.doc() == TERMINATED {
         Box::new(EmptyScorer)
     } else {
@@ -182,16 +252,43 @@ fn intersect_scorers_impl(
 /// num_docs_segment is the number of documents in the segment. It is used for estimating the
 /// `size_hint` of the intersection.
 pub fn intersect_scorers(scorers: Vec<Box<dyn Scorer>>, segment_num_docs: u32) -> Box<dyn Scorer> {
-    intersect_scorers_impl(scorers, segment_num_docs, true)
+    intersect_candidate_scorers(
+        scorers
+            .into_iter()
+            .map(UnpositionedScorer::from_positioned)
+            .collect(),
+        segment_num_docs,
+    )
 }
 
 /// Unpositioned counterpart to [`intersect_scorers`] for filters that will be probed via
 /// `seek_danger` / `seek_danger_batch` / `is_empty_in_range` rather than immediately driven.
 pub(crate) fn intersect_scorers_unpositioned(
-    scorers: Vec<Box<dyn Scorer>>,
+    mut scorers: Vec<UnpositionedScorer>,
     segment_num_docs: u32,
-) -> Box<dyn Scorer> {
-    intersect_scorers_impl(scorers, segment_num_docs, false)
+) -> UnpositionedScorer {
+    if scorers.is_empty() {
+        return UnpositionedScorer::from_positioned(Box::new(EmptyScorer));
+    }
+    if scorers.len() == 1 {
+        return scorers.pop().unwrap();
+    }
+    let (scalar_scorers, mut batch_filters) = split_batch_filters(scorers);
+    if batch_filters.is_empty() {
+        return intersect_scalar_unpositioned(scalar_scorers, segment_num_docs);
+    }
+
+    let inner = intersect_scalar_unpositioned(scalar_scorers, segment_num_docs);
+    if inner.is_empty() || batch_filters.iter().any(UnpositionedScorer::is_empty) {
+        return UnpositionedScorer::from_positioned(Box::new(EmptyScorer));
+    }
+    order_batch_filters(&mut batch_filters, segment_num_docs);
+    let filtered = BatchFilteredScorer::new_unpositioned(inner, batch_filters, segment_num_docs);
+    if filtered.doc() == TERMINATED {
+        UnpositionedScorer::from_positioned(Box::new(EmptyScorer))
+    } else {
+        UnpositionedScorer::from_unpositioned(Box::new(filtered))
+    }
 }
 
 /// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
@@ -596,8 +693,8 @@ where
 /// leapfrog skipping back into `inner`, so in-memory docsets with zero setup cost stay
 /// on scalar [`Intersection`].
 pub(crate) struct BatchFilteredScorer {
-    inner: Box<dyn Scorer>,
-    batch_filters: Vec<Box<dyn Scorer>>,
+    inner: UnpositionedScorer,
+    batch_filters: Vec<UnpositionedScorer>,
     inner_const_score: Option<Score>,
     filter_score: Score,
     segment_num_docs: u32,
@@ -611,22 +708,23 @@ pub(crate) struct BatchFilteredScorer {
 impl BatchFilteredScorer {
     pub(crate) fn new(
         inner: Box<dyn Scorer>,
-        batch_filters: Vec<Box<dyn Scorer>>,
+        batch_filters: Vec<UnpositionedScorer>,
         segment_num_docs: u32,
     ) -> Self {
-        let mut s = Self::new_unpositioned(inner, batch_filters, segment_num_docs);
+        let mut s = Self::new_unpositioned(
+            UnpositionedScorer::from_positioned(inner),
+            batch_filters,
+            segment_num_docs,
+        );
         if s.current.0 != TERMINATED {
-            if s.current.0 == 0 {
-                s.inner.seek(0);
-            }
             s.refill();
         }
         s
     }
 
     pub(crate) fn new_unpositioned(
-        inner: Box<dyn Scorer>,
-        batch_filters: Vec<Box<dyn Scorer>>,
+        inner: UnpositionedScorer,
+        batch_filters: Vec<UnpositionedScorer>,
         segment_num_docs: u32,
     ) -> Self {
         let inner_const_score = inner.constant_score();
@@ -637,15 +735,14 @@ impl BatchFilteredScorer {
                     .expect("BatchFilteredScorer filters must have constant_score")
             })
             .sum();
-        let empty =
-            inner.doc() == TERMINATED || batch_filters.iter().any(|f| f.doc() == TERMINATED);
+        let empty = inner.is_empty() || batch_filters.iter().any(UnpositionedScorer::is_empty);
         let start_bound = if empty {
             TERMINATED
         } else {
             batch_filters
                 .iter()
-                .map(|f| f.doc())
-                .fold(inner.doc(), DocId::max)
+                .map(UnpositionedScorer::lower_bound)
+                .fold(inner.lower_bound(), DocId::max)
         };
         let initial_score = inner_const_score.map_or(0.0, |s| s + filter_score);
         Self {
@@ -679,15 +776,12 @@ impl BatchFilteredScorer {
 
         loop {
             if self.next_inner_seek >= TERMINATED {
-                self.inner.seek(TERMINATED);
+                self.inner.position_at(TERMINATED);
                 self.buf.end = TERMINATED;
                 self.current.0 = TERMINATED;
                 return;
             }
-            if self.inner.doc() < self.next_inner_seek {
-                self.inner.seek(self.next_inner_seek);
-            }
-            let mut doc = self.inner.doc();
+            let mut doc = self.inner.position_at(self.next_inner_seek);
             if doc == TERMINATED {
                 self.buf.end = TERMINATED;
                 self.current.0 = TERMINATED;
@@ -696,16 +790,17 @@ impl BatchFilteredScorer {
             let target_len = self.ramp.limit();
             self.ramp.promote();
             self.buf.docs.clear();
+            let inner = self.inner.positioned_mut();
             if has_var_score {
                 self.buf.scores.clear();
                 while doc != TERMINATED && self.buf.docs.len() < target_len {
                     self.buf.docs.push(doc);
-                    self.buf.scores.push(self.inner.score());
-                    doc = self.inner.advance();
+                    self.buf.scores.push(inner.score());
+                    doc = inner.advance();
                 }
             } else {
                 while self.buf.docs.len() + COLLECT_BLOCK_BUFFER_LEN <= target_len {
-                    let count = self.inner.fill_buffer(&mut fill_chunk);
+                    let count = inner.fill_buffer(&mut fill_chunk);
                     if count == 0 {
                         break;
                     }
@@ -751,7 +846,7 @@ impl BatchFilteredScorer {
                 self.buf.scores.truncate(write);
             }
             if write > 0 {
-                self.buf.end = self.next_inner_seek.max(self.inner.doc());
+                self.buf.end = self.next_inner_seek.max(self.inner.lower_bound());
                 self.current = (self.buf.docs[0], self.score_for_buf_idx(0));
                 return;
             }
@@ -766,7 +861,6 @@ impl DocSet for BatchFilteredScorer {
             return TERMINATED;
         }
         if !self.positioned {
-            self.inner.seek(self.current.0);
             self.refill();
             return self.current.0;
         }
@@ -790,7 +884,7 @@ impl DocSet for BatchFilteredScorer {
             self.buf.clear();
             self.buf.end = TERMINATED;
             self.next_inner_seek = TERMINATED;
-            self.inner.seek(TERMINATED);
+            self.inner.position_at(TERMINATED);
             self.current.0 = TERMINATED;
             self.positioned = true;
             return TERMINATED;
@@ -812,13 +906,10 @@ impl DocSet for BatchFilteredScorer {
         if self.next_inner_seek >= TERMINATED {
             self.buf.clear();
             self.buf.end = TERMINATED;
-            self.inner.seek(TERMINATED);
+            self.inner.position_at(TERMINATED);
             self.current.0 = TERMINATED;
             self.positioned = true;
             return TERMINATED;
-        }
-        if self.inner.doc() < self.next_inner_seek {
-            self.inner.seek(self.next_inner_seek);
         }
         self.refill();
         self.current.0
@@ -859,7 +950,7 @@ impl DocSet for BatchFilteredScorer {
         }
         let score = match self.inner_const_score {
             Some(s) => s + self.filter_score,
-            None => self.inner.score() + self.filter_score,
+            None => self.inner.positioned_mut().score() + self.filter_score,
         };
         self.current = (target, score);
         self.positioned = true;
@@ -916,7 +1007,7 @@ impl DocSet for BatchFilteredScorer {
     fn size_hint(&self) -> u32 {
         estimate_intersection(
             std::iter::once(self.inner.size_hint())
-                .chain(self.batch_filters.iter().map(DocSet::size_hint)),
+                .chain(self.batch_filters.iter().map(UnpositionedScorer::size_hint)),
             self.segment_num_docs,
         )
     }
@@ -1353,5 +1444,174 @@ mod tests {
                 cheap_probes.load(Ordering::Relaxed),
             );
         }
+    }
+
+    #[test]
+    fn unpositioned_composite_intersection_and_batch_filtered_positioning() {
+        use proptest::prelude::*;
+
+        use super::{intersect_candidate_scorers, intersect_scorers_unpositioned};
+        use crate::docset::{DocSetCost, DriveCost, ProbeCost, ProbePerDocCost, ProbeSetupCost};
+        use crate::query::UnpositionedScorer;
+
+        /// Test scorer that mimics leaf fast-field unpositioned docsets: reports `doc() == 0`
+        /// until explicitly positioned via `seek`, even when doc `0` is not a match, and
+        /// `debug_assert!`s that `advance()` is never called before positioning.
+        struct DeferredLeafScorer {
+            inner: VecDocSet,
+            cost: DocSetCost,
+            positioned: bool,
+        }
+
+        impl DeferredLeafScorer {
+            fn new_unpositioned(docs: Vec<DocId>, cost: DocSetCost) -> UnpositionedScorer {
+                let empty = docs.is_empty();
+                UnpositionedScorer::from_unpositioned(Box::new(Self {
+                    inner: VecDocSet::from(docs),
+                    cost,
+                    positioned: empty,
+                }))
+            }
+
+            fn new_positioned(docs: Vec<DocId>, cost: DocSetCost) -> UnpositionedScorer {
+                UnpositionedScorer::from_positioned(Box::new(Self {
+                    inner: VecDocSet::from(docs),
+                    cost,
+                    positioned: true,
+                }))
+            }
+        }
+
+        impl DocSet for DeferredLeafScorer {
+            fn advance(&mut self) -> DocId {
+                debug_assert!(self.positioned, "advance() called on unpositioned leaf");
+                self.inner.advance()
+            }
+
+            fn seek(&mut self, target: DocId) -> DocId {
+                self.positioned = true;
+                let doc = self.inner.doc();
+                if doc < target {
+                    self.inner.seek(target)
+                } else {
+                    doc
+                }
+            }
+
+            fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+                let res = self.inner.seek_danger(target);
+                if res == SeekDangerResult::Found {
+                    self.positioned = true;
+                }
+                res
+            }
+
+            fn doc(&self) -> DocId {
+                if self.positioned {
+                    self.inner.doc()
+                } else {
+                    0
+                }
+            }
+
+            fn size_hint(&self) -> u32 {
+                self.inner.size_hint()
+            }
+
+            fn cost(&self) -> DocSetCost {
+                self.cost
+            }
+        }
+
+        impl Scorer for DeferredLeafScorer {
+            fn score(&mut self) -> Score {
+                1.0
+            }
+
+            fn constant_score(&self) -> Option<Score> {
+                Some(1.0)
+            }
+        }
+
+        fn drain_scorer(mut scorer: Box<dyn Scorer>) -> Vec<DocId> {
+            let mut out = Vec::new();
+            while scorer.doc() != TERMINATED {
+                out.push(scorer.doc());
+                scorer.advance();
+            }
+            out
+        }
+
+        let cost_of = |drive: u64, batch_probe: bool| {
+            let probe = if batch_probe {
+                ProbeCost::new(ProbeSetupCost(300), ProbePerDocCost(10))
+            } else {
+                ProbeCost::FAST_FIELD
+            };
+            DocSetCost::new(DriveCost(drive), probe)
+        };
+
+        let arb_docs = prop::collection::btree_set(0u32..32, 0..16)
+            .prop_map(|s| s.into_iter().collect::<Vec<_>>());
+        let arb_spec = (arb_docs, any::<bool>(), any::<bool>(), 10u64..500);
+
+        proptest!(ProptestConfig::with_cases(128), |(
+            inner_specs in prop::collection::vec(arb_spec.clone(), 2..=4),
+            outer_spec in arb_spec,
+        )| {
+            let make = |(docs, unpos, batch, drive): &(Vec<DocId>, bool, bool, u64)| {
+                let cost = cost_of(*drive, *batch);
+                if *unpos {
+                    DeferredLeafScorer::new_unpositioned(docs.clone(), cost)
+                } else {
+                    DeferredLeafScorer::new_positioned(docs.clone(), cost)
+                }
+            };
+
+            let inner_expected: Vec<DocId> = (0..32u32)
+                .filter(|d| inner_specs.iter().all(|(docs, ..)| docs.binary_search(d).is_ok()))
+                .collect();
+            let outer_expected: Vec<DocId> = inner_expected
+                .iter()
+                .copied()
+                .filter(|d| outer_spec.0.binary_search(d).is_ok())
+                .collect();
+
+            // 1. Direct `intersect_scorers_unpositioned` -> `.into_positioned()`.
+            let unpos = intersect_scorers_unpositioned(
+                inner_specs.iter().map(make).collect(),
+                32,
+            );
+            prop_assert_eq!(drain_scorer(unpos.into_positioned()), inner_expected.clone());
+
+            // 2. Calling `seek(lower_bound)` directly on the unpositioned composite (including
+            //    `seek(0)` on `BatchFilteredScorer::new_unpositioned` with unpositioned `inner`).
+            let mut raw = intersect_scorers_unpositioned(
+                inner_specs.iter().map(make).collect(),
+                32,
+            )
+            .into_raw_unpositioned();
+            let start = raw.doc();
+            if start != TERMINATED {
+                raw.seek(start);
+            }
+            prop_assert_eq!(drain_scorer(raw), inner_expected.clone());
+
+            // 3. Direct `intersect_candidate_scorers`.
+            let direct = intersect_candidate_scorers(
+                inner_specs.iter().map(make).collect(),
+                32,
+            );
+            prop_assert_eq!(drain_scorer(direct), inner_expected);
+
+            // 4. Nesting the unpositioned composite (which may have `lower_bound() > 0` while
+            //    unpositioned) inside an outer `intersect_candidate_scorers`.
+            let composite = intersect_scorers_unpositioned(
+                inner_specs.iter().map(make).collect(),
+                32,
+            );
+            let nested = intersect_candidate_scorers(vec![composite, make(&outer_spec)], 32);
+            prop_assert_eq!(drain_scorer(nested), outer_expected);
+        });
     }
 }

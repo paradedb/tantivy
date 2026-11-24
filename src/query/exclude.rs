@@ -4,7 +4,7 @@ use crate::docset::{
     fill_all_candidates_mask, DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult,
     BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED,
 };
-use crate::query::Scorer;
+use crate::query::{Scorer, UnpositionedScorer};
 use crate::{DocId, Score};
 
 /// An exclusion set is a set of documents
@@ -65,6 +65,60 @@ impl<TDocSet: DocSet> ExcludedDocSet<TDocSet> {
     }
 }
 
+fn remove_excluded_batch_impl(
+    lower_bound: &mut DocId,
+    docs: &[DocId],
+    mask: &mut [TinySet],
+    probe: impl FnOnce(&[DocId], &mut [TinySet]) -> DocId,
+) {
+    let words = docs.len().div_ceil(64);
+    if words == 0 {
+        return;
+    }
+    debug_assert!(mask.len() >= words);
+    let mut stack_buf = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+    let mut heap_buf = Vec::new();
+    let excl: &mut [TinySet] = if words <= stack_buf.len() {
+        &mut stack_buf[..words]
+    } else {
+        heap_buf.resize(words, TinySet::EMPTY);
+        &mut heap_buf
+    };
+    let mut any = false;
+    for (word_idx, &word) in mask[..words].iter().enumerate() {
+        if word.is_empty() {
+            continue;
+        }
+        let base = word_idx * 64;
+        let word_last = docs[(base + 63).min(docs.len() - 1)];
+        if word_last < *lower_bound {
+            continue;
+        }
+        if docs[base] >= *lower_bound {
+            excl[word_idx] = word;
+            any = true;
+        } else {
+            let mut active = TinySet::EMPTY;
+            for bit in word {
+                if docs[base + bit as usize] >= *lower_bound {
+                    active.insert_mut(bit);
+                }
+            }
+            excl[word_idx] = active;
+            any |= !active.is_empty();
+        }
+    }
+    if !any {
+        return;
+    }
+    let next_bound = probe(docs, excl);
+    *lower_bound = (*lower_bound).max(next_bound);
+    for (m, &e) in mask[..words].iter_mut().zip(excl.iter()) {
+        let keep = m.into_u64() & !e.into_u64();
+        *m = TinySet::deserialize(keep.to_le_bytes());
+    }
+}
+
 impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
@@ -81,52 +135,9 @@ impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     }
 
     fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
-        let words = docs.len().div_ceil(64);
-        if words == 0 {
-            return;
-        }
-        debug_assert!(mask.len() >= words);
-        let mut stack_buf = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
-        let mut heap_buf = Vec::new();
-        let excl: &mut [TinySet] = if words <= stack_buf.len() {
-            &mut stack_buf[..words]
-        } else {
-            heap_buf.resize(words, TinySet::EMPTY);
-            &mut heap_buf
-        };
-        let mut any = false;
-        for (word_idx, &word) in mask[..words].iter().enumerate() {
-            if word.is_empty() {
-                continue;
-            }
-            let base = word_idx * 64;
-            let word_last = docs[(base + 63).min(docs.len() - 1)];
-            if word_last < self.lower_bound {
-                continue;
-            }
-            if docs[base] >= self.lower_bound {
-                excl[word_idx] = word;
-                any = true;
-            } else {
-                let mut active = TinySet::EMPTY;
-                for bit in word {
-                    if docs[base + bit as usize] >= self.lower_bound {
-                        active.insert_mut(bit);
-                    }
-                }
-                excl[word_idx] = active;
-                any |= !active.is_empty();
-            }
-        }
-        if !any {
-            return;
-        }
-        let next_bound = self.docset.seek_danger_batch(docs, excl);
-        self.lower_bound = self.lower_bound.max(next_bound);
-        for (m, &e) in mask[..words].iter_mut().zip(excl.iter()) {
-            let keep = m.into_u64() & !e.into_u64();
-            *m = TinySet::deserialize(keep.to_le_bytes());
-        }
+        remove_excluded_batch_impl(&mut self.lower_bound, docs, mask, |d, m| {
+            self.docset.seek_danger_batch(d, m)
+        });
     }
 
     fn probe_cost(&self) -> ProbeCost {
@@ -134,7 +145,44 @@ impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     }
 }
 
-impl<TDocSet: DocSet> ExclusionSet for Vec<ExcludedDocSet<TDocSet>> {
+impl ExcludedDocSet<UnpositionedScorer> {
+    /// Wraps an [`UnpositionedScorer`] as an exclusion set without positioning it.
+    pub fn from_unpositioned(scorer: UnpositionedScorer) -> Self {
+        let lower_bound = scorer.lower_bound();
+        ExcludedDocSet {
+            docset: scorer,
+            lower_bound,
+        }
+    }
+}
+
+impl ExclusionSet for ExcludedDocSet<UnpositionedScorer> {
+    #[inline]
+    fn contains(&mut self, doc: DocId) -> bool {
+        if doc < self.lower_bound {
+            return false;
+        }
+        match self.docset.seek_danger(doc) {
+            SeekDangerResult::Found => true,
+            SeekDangerResult::SeekLowerBound(lower_bound) => {
+                self.lower_bound = lower_bound;
+                false
+            }
+        }
+    }
+
+    fn remove_excluded_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) {
+        remove_excluded_batch_impl(&mut self.lower_bound, docs, mask, |d, m| {
+            self.docset.seek_danger_batch(d, m)
+        });
+    }
+
+    fn probe_cost(&self) -> ProbeCost {
+        self.docset.cost().probe
+    }
+}
+
+impl<TExclusionSet: ExclusionSet> ExclusionSet for Vec<TExclusionSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
         self.iter_mut().any(|docset| docset.contains(doc))

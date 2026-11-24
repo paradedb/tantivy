@@ -5,7 +5,9 @@ use common::TinySet;
 use super::scorer::PruningScorer;
 use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{CandidateHint, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
+};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
@@ -99,7 +101,7 @@ impl Weight for BoostWeight {
         reader: &SegmentReader,
         boost: Score,
         candidate_hint: CandidateHint,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         self.weight
             .scorer_for_candidates_unpositioned(reader, boost * self.boost, candidate_hint)
     }

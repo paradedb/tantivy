@@ -103,19 +103,13 @@ enum Expr {
 struct ModuloPredicate;
 
 impl TermPredicate for ModuloPredicate {
-    fn filter_bytes(
-        &self,
-        data: &[u8],
-        offsets: &[u32],
-        out: &mut [common::TinySet],
-    ) -> crate::Result<()> {
+    fn filter_bytes(&self, data: &[u8], offsets: &[u32], out: &mut [common::TinySet]) {
         for i in 0..offsets.len().saturating_sub(1) {
             let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
             if slice.last().is_some_and(|b| b % 2 == 0) {
                 out[i / 64].insert_mut((i % 64) as u32);
             }
         }
-        Ok(())
     }
 
     fn filter_monotonic_u64s(
@@ -123,13 +117,12 @@ impl TermPredicate for ModuloPredicate {
         _col_type: columnar::ColumnType,
         values: &[u64],
         out: &mut [common::TinySet],
-    ) -> crate::Result<()> {
+    ) {
         for (i, &v) in values.iter().enumerate() {
             if (3..8).contains(&v) {
                 out[i / 64].insert_mut((i % 64) as u32);
             }
         }
-        Ok(())
     }
 
     fn probe_cost(&self) -> crate::ProbeCost {
@@ -546,13 +539,14 @@ fn seek_danger_implementation_inventory() {
     for &(path, count) in FORK_INVENTORY {
         covered.insert(path.to_string(), count);
     }
-    // Trait default (used by TermScorer) and the Box / &mut forwarding impls.
+    // Trait default (used by TermScorer) and the Box / &mut / UnpositionedScorer forwarding impls.
     covered.insert("docset.rs".to_string(), 3);
-    // Test-only spies for routed vector candidate filtering and probe-cost unit tests.
+    covered.insert("query/scorer.rs".to_string(), 1);
+    // Test-only spies for routed vector candidate filtering and intersection unit tests.
     covered.insert("vector/filter.rs".to_string(), 1);
     *covered
         .entry("query/intersection.rs".to_string())
-        .or_insert(0) += 1;
+        .or_insert(0) += 2;
     covered.insert(
         "query/boolean_query/block_wand_intersection.rs".to_string(),
         1,
@@ -601,6 +595,8 @@ fn seek_danger_batch_implementation_inventory() {
         ("query/exclude.rs", 2),
         ("query/intersection.rs", 2),
         ("query/reqopt_scorer.rs", 1),
+        // Forwarding wrapper `UnpositionedScorer`.
+        ("query/scorer.rs", 1),
         ("query/term_set_query/term_predicate.rs", 2),
     ]
     .into_iter()

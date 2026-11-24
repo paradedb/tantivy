@@ -3,7 +3,9 @@ use std::fmt;
 use common::TinySet;
 
 use crate::docset::{SeekDangerResult, BLOCK_NUM_TINYBITSETS, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{CandidateHint, EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
+};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -95,11 +97,11 @@ impl Weight for ConstWeight {
         reader: &SegmentReader,
         boost: Score,
         candidate_hint: CandidateHint,
-    ) -> crate::Result<Box<dyn Scorer>> {
-        let inner_scorer =
-            self.weight
-                .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)?;
-        Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    ) -> crate::Result<UnpositionedScorer> {
+        Ok(self
+            .weight
+            .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)?
+            .map_scorer(|inner| Box::new(ConstScorer::new(inner, boost * self.score))))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {

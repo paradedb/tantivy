@@ -8,7 +8,8 @@ use itertools::Either;
 use crate::docset::{fill_all_candidates_mask, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{
-    for_each_docset_buffered, AllScorer, CandidateHint, ExcludedDocSet, ExclusionSet, Weight,
+    for_each_docset_buffered, AllScorer, CandidateHint, ExcludedDocSet, ExclusionSet,
+    UnpositionedScorer, Weight,
 };
 use crate::schema::Field;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -250,7 +251,7 @@ impl VectorFilterStrategy {
             1.0,
             CandidateHint::Estimated(candidates.len() as u32),
         )?;
-        let lower_bound = scorer.doc();
+        let lower_bound = scorer.lower_bound();
         if lower_bound == TERMINATED {
             candidates.clear();
             return Ok(());
@@ -313,7 +314,7 @@ impl VectorFilterStrategy {
             }
         ) && matches!(filter, DocFilter::Shortlist)
         {
-            Some(ExcludedDocSet::new(
+            Some(ExcludedDocSet::from_unpositioned(
                 weight.scorer_for_candidates_unpositioned(
                     segment,
                     1.0,
@@ -409,7 +410,7 @@ impl VectorFilterStrategy {
                 1.0,
                 CandidateHint::Estimated(candidate_count as u32),
             )?;
-            let mut lower_bound = scorer.doc();
+            let mut lower_bound = scorer.lower_bound();
             if lower_bound == TERMINATED {
                 docs = BitSet::with_max_value(segment.max_doc());
                 return Ok(DocFilter::Docs(Arc::new(docs)));
@@ -419,7 +420,7 @@ impl VectorFilterStrategy {
             let mut mask = [TinySet::EMPTY; POST_CLUSTER_BATCH_SIZE / 64];
             let flush_batch = |batch: &mut Vec<DocId>,
                                mask: &mut [TinySet],
-                               scorer: &mut dyn crate::DocSet,
+                               scorer: &mut UnpositionedScorer,
                                docs: &mut BitSet,
                                lower_bound: &mut DocId| {
                 let words = batch.len().div_ceil(64);
@@ -455,7 +456,7 @@ impl VectorFilterStrategy {
                         flush_batch(
                             &mut batch,
                             &mut mask,
-                            scorer.as_mut(),
+                            &mut scorer,
                             &mut docs,
                             &mut lower_bound,
                         );
@@ -467,7 +468,7 @@ impl VectorFilterStrategy {
                 flush_batch(
                     &mut batch,
                     &mut mask,
-                    scorer.as_mut(),
+                    &mut scorer,
                     &mut docs,
                     &mut lower_bound,
                 );
@@ -663,18 +664,20 @@ mod tests {
             _: &SegmentReader,
             boost: Score,
             candidate_hint: CandidateHint,
-        ) -> Result<Box<dyn Scorer>> {
+        ) -> Result<UnpositionedScorer> {
             let CandidateHint::Estimated(candidate_size) = candidate_hint else {
                 panic!("vector filter must pass CandidateHint::Estimated");
             };
             self.sizes.lock().unwrap().push(candidate_size);
-            Ok(Box::new(ConstScorer::new(
-                ProbeDocs {
-                    matches: Arc::clone(&self.matches),
-                    probes: Arc::clone(&self.probes),
-                    doc: 0,
-                },
-                boost,
+            Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                ConstScorer::new(
+                    ProbeDocs {
+                        matches: Arc::clone(&self.matches),
+                        probes: Arc::clone(&self.probes),
+                        doc: 0,
+                    },
+                    boost,
+                ),
             )))
         }
 

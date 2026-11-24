@@ -41,7 +41,7 @@ use crate::query::bitset::or_term_info_into_bitset;
 use crate::query::range_query::sorted_internals::sorted_doc_range_for_bounds;
 use crate::query::{
     AutomatonWeight, BitSetDocSet, CandidateHint, ConstScorer, EmptyScorer, Explanation, Scorer,
-    Weight,
+    UnpositionedScorer, Weight,
 };
 use crate::schema::{Field, FieldType, DATE_TIME_PRECISION_INDEXED};
 use crate::termdict::TermStreamer;
@@ -361,12 +361,12 @@ impl TermSetWeight {
         reader: &SegmentReader,
         boost: Score,
         candidate_hint: Option<CandidateHint>,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         if reader.max_doc() == 0 || self.filter.is_definitely_empty() {
             if matches!(self.filter, KeyFilter::Predicate { .. }) {
                 self.record_strategy_tag(StrategyTag::Empty);
             }
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         }
 
         let field_entry = reader.schema().get_field_entry(self.field);
@@ -383,7 +383,9 @@ impl TermSetWeight {
             FastSubstrate::Numeric => {
                 self.dispatch_numeric_fast(reader, field_name, field_type, boost, candidate_hint)
             }
-            FastSubstrate::None => self.dispatch_postings(reader, field_type, boost),
+            FastSubstrate::None => self
+                .dispatch_postings(reader, field_type, boost)
+                .map(UnpositionedScorer::from_positioned),
         }
     }
 
@@ -393,30 +395,37 @@ impl TermSetWeight {
         field_name: &str,
         boost: Score,
         candidate_hint: Option<CandidateHint>,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         let KeyFilter::Terms(explicit) = &self.filter else {
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         };
         let ExplicitTyped::Ipv6(values) = &explicit.typed else {
-            return self.dispatch_postings(
-                reader,
-                reader.schema().get_field_entry(self.field).field_type(),
-                boost,
-            );
+            return self
+                .dispatch_postings(
+                    reader,
+                    reader.schema().get_field_entry(self.field).field_type(),
+                    boost,
+                )
+                .map(UnpositionedScorer::from_positioned);
         };
         let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
             reader.fast_fields().column_opt(field_name)?
         else {
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         };
         self.record_strategy_tag(StrategyTag::Linear);
         let term_set: FxHashSet<Ipv6Addr> = values.iter().copied().collect();
-        let docset = if candidate_hint.is_some() {
-            TermSetDocSet::new_unpositioned(ip_addr_column, term_set)
+        if candidate_hint.is_some() {
+            let docset = TermSetDocSet::new_unpositioned(ip_addr_column, term_set);
+            Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                ConstScorer::new(docset, boost),
+            )))
         } else {
-            TermSetDocSet::new(ip_addr_column, term_set)
-        };
-        Ok(Box::new(ConstScorer::new(docset, boost)))
+            let docset = TermSetDocSet::new(ip_addr_column, term_set);
+            Ok(UnpositionedScorer::from_positioned(Box::new(
+                ConstScorer::new(docset, boost),
+            )))
+        }
     }
 
     fn get_or_init_dict_entry(
@@ -480,7 +489,7 @@ impl TermSetWeight {
         field_type: &FieldType,
         boost: Score,
         candidate_hint: Option<CandidateHint>,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         let bytes_col_opt: Option<BytesColumn> =
             if let Some(str_col) = reader.fast_fields().str(field_name)? {
                 Some(BytesColumn::from(str_col))
@@ -489,14 +498,14 @@ impl TermSetWeight {
             };
         let Some(bytes_col) = bytes_col_opt else {
             self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         };
 
         let n = bytes_col.num_rows();
         let num_terms = bytes_col.num_terms();
         if n == 0 || num_terms == 0 {
             self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         }
 
         let ords_col = bytes_col.ords();
@@ -533,7 +542,9 @@ impl TermSetWeight {
         };
 
         if candidate_hint.is_none() && !prefer_fast_column {
-            return self.dispatch_postings(reader, field_type, boost);
+            return self
+                .dispatch_postings(reader, field_type, boost)
+                .map(UnpositionedScorer::from_positioned);
         }
 
         let entry_arc = self.get_or_init_dict_entry(reader.segment_id(), &bytes_col)?;
@@ -588,12 +599,16 @@ impl TermSetWeight {
                     let docset = CachedDictPredicateDocSet::new_unpositioned(
                         bytes_col, ord_range, probe, entry_arc,
                     );
-                    return Ok(Box::new(ConstScorer::new(docset, boost)));
+                    return Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                        ConstScorer::new(docset, boost),
+                    )));
                 }
 
                 if !prefer_fast_column {
                     drop(entry);
-                    return self.dispatch_postings(reader, field_type, boost);
+                    return self
+                        .dispatch_postings(reader, field_type, boost)
+                        .map(UnpositionedScorer::from_positioned);
                 }
 
                 let (matched_ords, keys) = match state {
@@ -658,7 +673,7 @@ impl TermSetWeight {
 
         if ords_arc.len() == 0 {
             self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         }
 
         let retained_keys = if let Some(keys) = retained_keys {
@@ -710,7 +725,7 @@ impl TermSetWeight {
         field_type: &FieldType,
         boost: Score,
         candidate_hint: Option<CandidateHint>,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         let candidate_size = candidate_hint.map(CandidateHint::upper_bound);
         let Some((column, col_type)) = reader.fast_fields().u64_lenient_for_type(
             Some(&[
@@ -724,24 +739,26 @@ impl TermSetWeight {
         )?
         else {
             self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         };
 
         let n = column.num_docs();
         if n == 0 {
             self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
         }
 
         match &self.filter {
             KeyFilter::Terms(explicit) => {
                 let ExplicitTyped::Numeric(values) = &explicit.typed else {
-                    return self.dispatch_postings(reader, field_type, boost);
+                    return self
+                        .dispatch_postings(reader, field_type, boost)
+                        .map(UnpositionedScorer::from_positioned);
                 };
                 let range = sorted_range_in_column(values, &column);
                 if range.is_empty() {
                     self.record_strategy_tag(StrategyTag::Empty);
-                    return Ok(Box::new(EmptyScorer));
+                    return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                 }
                 let pruned_values = &values[range.clone()];
                 let pruned_bytes = &explicit.terms_bytes[range];
@@ -801,7 +818,7 @@ impl TermSetWeight {
             KeyFilter::Predicate { predicate, bounds } => {
                 let Some(value_range) = intersect_u64_bounds(bounds, &column) else {
                     self.record_strategy_tag(StrategyTag::Empty);
-                    return Ok(Box::new(EmptyScorer));
+                    return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                 };
 
                 let doc_bounds = reader
@@ -811,28 +828,33 @@ impl TermSetWeight {
                     .unwrap_or(0..n);
                 if doc_bounds.is_empty() {
                     self.record_strategy_tag(StrategyTag::Empty);
-                    return Ok(Box::new(EmptyScorer));
+                    return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                 }
 
                 self.record_strategy_tag(StrategyTag::Linear);
-                let docset = if candidate_size.is_some() {
-                    PredicateColumnDocSet::new_unpositioned(
+                if candidate_size.is_some() {
+                    let docset = PredicateColumnDocSet::new_unpositioned(
                         column,
                         col_type,
                         value_range,
                         doc_bounds,
                         Arc::clone(predicate),
-                    )
+                    );
+                    Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                        ConstScorer::new(docset, boost),
+                    )))
                 } else {
-                    PredicateColumnDocSet::new(
+                    let docset = PredicateColumnDocSet::new(
                         column,
                         col_type,
                         value_range,
                         doc_bounds,
                         Arc::clone(predicate),
-                    )
-                };
-                Ok(Box::new(ConstScorer::new(docset, boost)))
+                    );
+                    Ok(UnpositionedScorer::from_positioned(Box::new(
+                        ConstScorer::new(docset, boost),
+                    )))
+                }
             }
         }
     }
@@ -951,6 +973,7 @@ impl Weight for TermSetWeight {
 
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.scorer_with_candidates(reader, boost, None)
+            .map(UnpositionedScorer::into_positioned)
     }
 
     fn scorer_for_candidates_unpositioned(
@@ -958,7 +981,7 @@ impl Weight for TermSetWeight {
         reader: &SegmentReader,
         boost: Score,
         candidate_hint: CandidateHint,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<UnpositionedScorer> {
         self.scorer_with_candidates(reader, boost, Some(candidate_hint))
     }
 
@@ -984,27 +1007,35 @@ fn dispatch_u64_column<M: ValueMembership<u64>>(
     make_sorted_u64s: impl FnOnce() -> Vec<u64>,
     make_membership: impl FnOnce() -> M,
     try_make_postings_bitset: Option<Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>>,
-) -> crate::Result<Box<dyn Scorer>> {
+) -> crate::Result<UnpositionedScorer> {
     let candidate_size = planner_inputs.candidate_size;
     match select_strategy(reader, &column, planner_inputs, k_prime, cfg) {
-        StrategyChoice::Empty => Ok(Box::new(EmptyScorer)),
+        StrategyChoice::Empty => Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer))),
         StrategyChoice::Gallop(sort_order) => {
             let cardinality = column.get_cardinality();
             let docset =
                 TermSetGallopDocSet::new(column, sort_order, make_sorted_u64s(), cardinality);
-            Ok(Box::new(ConstScorer::new(docset, boost)))
+            Ok(UnpositionedScorer::from_positioned(Box::new(
+                ConstScorer::new(docset, boost),
+            )))
         }
         StrategyChoice::BitsetFromPostings if try_make_postings_bitset.is_some() => {
             (try_make_postings_bitset.expect("checked Some"))()
+                .map(UnpositionedScorer::from_positioned)
         }
         StrategyChoice::LinearScan | StrategyChoice::BitsetFromPostings => {
             let membership = make_membership();
-            let docset = if candidate_size.is_some() {
-                TermSetDocSet::new_unpositioned(column, membership)
+            if candidate_size.is_some() {
+                let docset = TermSetDocSet::new_unpositioned(column, membership);
+                Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                    ConstScorer::new(docset, boost),
+                )))
             } else {
-                TermSetDocSet::new(column, membership)
-            };
-            Ok(Box::new(ConstScorer::new(docset, boost)))
+                let docset = TermSetDocSet::new(column, membership);
+                Ok(UnpositionedScorer::from_positioned(Box::new(
+                    ConstScorer::new(docset, boost),
+                )))
+            }
         }
     }
 }
@@ -1466,7 +1497,8 @@ mod tests {
             CandidateHint::Estimated(1),
         )?;
         assert_eq!(sink.load(Ordering::Relaxed), StrategyTag::Linear as u8);
-        assert_eq!(scorer.doc(), 0);
+        assert!(!scorer.is_positioned());
+        assert_eq!(scorer.lower_bound(), 0);
         assert_eq!(
             scorer.seek_danger(0),
             crate::docset::SeekDangerResult::SeekLowerBound(1)
@@ -1496,7 +1528,7 @@ mod tests {
             CandidateHint::Estimated(1),
         )?;
         assert_eq!(empty_sink.load(Ordering::Relaxed), StrategyTag::Empty as u8);
-        assert_eq!(empty_scorer.doc(), TERMINATED);
+        assert!(empty_scorer.is_empty());
         Ok(())
     }
 }
