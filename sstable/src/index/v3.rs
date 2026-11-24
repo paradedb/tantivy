@@ -108,6 +108,14 @@ impl SSTableIndexV3 {
         self.block_addr_store.get(block_id)
     }
 
+    pub(crate) fn visit_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        cb: impl FnMut(BlockAddr),
+    ) -> io::Result<()> {
+        self.block_addr_store.visit_range(range, cb)
+    }
+
     /// Get the block id of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
@@ -216,6 +224,16 @@ impl SSTableIndexV3Empty {
     /// Get the [`BlockAddr`] of the requested block.
     pub(crate) fn get_block(&self, block_id: u64) -> Option<BlockAddr> {
         (block_id == 0).then(|| self.block_addr.clone())
+    }
+
+    pub(crate) fn visit_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        mut cb: impl FnMut(BlockAddr),
+    ) {
+        if range.contains(&0) {
+            cb(self.block_addr.clone());
+        }
     }
 
     /// Get the block id of the block that would contain `key`.
@@ -457,6 +475,43 @@ impl BlockAddrStore {
         };
         let bytes = self.block_bytes(&meta)?;
         Ok(meta.deserialize_block_addr(&bytes, block_id as usize % STORE_BLOCK_LEN))
+    }
+
+    fn visit_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        mut cb: impl FnMut(BlockAddr),
+    ) -> io::Result<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let start_id = *range.start() as usize;
+        let end_id = *range.end() as usize;
+        let first_store = start_id / STORE_BLOCK_LEN;
+        let last_store = end_id / STORE_BLOCK_LEN;
+        for store_id in first_store..=last_store {
+            let Some(meta) = self.get_block_meta(store_id)? else {
+                break;
+            };
+            let bytes = self.block_bytes(&meta)?;
+            let inner_start = if store_id == first_store {
+                start_id % STORE_BLOCK_LEN
+            } else {
+                0
+            };
+            let inner_end = if store_id == last_store {
+                end_id % STORE_BLOCK_LEN
+            } else {
+                STORE_BLOCK_LEN - 1
+            };
+            for inner in inner_start..=inner_end {
+                let Some(addr) = meta.deserialize_block_addr(&bytes, inner) else {
+                    return Ok(());
+                };
+                cb(addr);
+            }
+        }
+        Ok(())
     }
 
     fn binary_search_ord(&self, ord: TermOrdinal) -> io::Result<(u64, BlockAddr)> {

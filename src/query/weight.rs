@@ -70,6 +70,34 @@ pub(crate) fn for_each_pruning_scorer<TScorer: PruningScorer + ?Sized>(
     }
 }
 
+/// Context passed to [`Weight::scorer_for_candidates_unpositioned`] describing how the caller
+/// expects to probe the returned scorer.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum CandidateHint {
+    /// Caller expects to probe roughly `count` candidates (for example a vector shortlist or an
+    /// exhaustive conjunction with a selective driver).
+    Estimated(u32),
+    /// Caller will dynamically prune candidates by score (Block-WAND / Block-MaxScore) before
+    /// probing; actual probe count is unknown upfront and often much smaller than `upper_bound`.
+    Pruned { upper_bound: u32 },
+}
+
+impl CandidateHint {
+    /// Returns the estimated or upper-bound candidate count, clamped to at least `1`.
+    #[inline]
+    pub const fn upper_bound(self) -> u32 {
+        match self {
+            CandidateHint::Estimated(n) | CandidateHint::Pruned { upper_bound: n } => {
+                if n == 0 {
+                    1
+                } else {
+                    n
+                }
+            }
+        }
+    }
+}
+
 /// A Weight is the specialization of a `Query`
 /// for a given set of segments.
 ///
@@ -88,12 +116,12 @@ pub trait Weight: Send + Sync + 'static {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
 
     /// Returns an unpositioned scorer for the given segment when the caller will probe it against
-    /// an upstream candidate set of approximately `candidate_size` documents.
+    /// an upstream candidate set described by `candidate_hint`.
     ///
-    /// Weights whose strategy selection depends on the upstream candidate count (such as
-    /// `TermSetWeight`) override this to pick candidate-probing strategies (e.g. fast-field point
-    /// lookups via `seek_danger`) instead of full-segment bitset construction or an eager scan to
-    /// the first matching document.
+    /// Weights whose strategy selection depends on the upstream candidate count or dynamic score
+    /// pruning (such as `TermSetWeight`) override this to pick candidate-probing strategies (e.g.
+    /// fast-field point lookups via `seek_danger` or lazy SSTable block caching) instead of
+    /// full-segment bitset construction or an eager scan to the first matching document.
     ///
     /// Immediately after construction, `scorer.doc()` returns [`TERMINATED`](crate::TERMINATED) if
     /// the segment is known to have no matches, and `0` (or the first match) otherwise. Callers
@@ -103,9 +131,9 @@ pub trait Weight: Send + Sync + 'static {
         &self,
         reader: &SegmentReader,
         boost: Score,
-        candidate_size: u32,
+        candidate_hint: CandidateHint,
     ) -> crate::Result<Box<dyn Scorer>> {
-        let _ = candidate_size;
+        let _ = candidate_hint;
         self.scorer(reader, boost)
     }
 

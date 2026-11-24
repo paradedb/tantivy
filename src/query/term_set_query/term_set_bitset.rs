@@ -1,4 +1,4 @@
-//! `BitsetFromPostings` strategy for `FastFieldTermSetQuery`.
+//! `BitsetFromPostings` strategy for `TermSetWeight`.
 //!
 //! Performs lookups for the sorted query terms in the inverted-index
 //! term dictionary and OR's each matching posting list into a single
@@ -58,10 +58,12 @@ use crate::Score;
 /// correctness, but reuses the same slice for consistency.
 ///
 /// The key bytes must already match the dictionary's encoding for the
-/// field — for numeric fields this is `Term::serialized_value_bytes`
-/// (effectively `u64::to_be_bytes` for u64). The caller (`TermSetWeight`)
-/// pre-computes these bytes once at construction so per-segment
-/// dispatch is alloc-free.
+/// field: for numeric fields this is `Term::serialized_value_bytes`
+/// (effectively `u64::to_be_bytes` for u64). `TermSetWeight` pre-computes
+/// these bytes at construction for explicit `TermSetQuery` /
+/// `FastFieldTermSetQuery` inputs, and retains matched dictionary keys
+/// during `stream_predicate_dict_ordinals` for selective
+/// `TermPredicateQuery`s.
 ///
 /// Caller must guarantee the field has an inverted index; the function
 /// returns an error if `reader.inverted_index(field)` fails.

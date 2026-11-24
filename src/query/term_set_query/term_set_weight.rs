@@ -1,221 +1,225 @@
-//! `TermSetWeight` — a single `Weight` impl that holds every
-//! representation needed to dispatch any of the term-set strategies
-//! (`Gallop` / `LinearScan` / `BitsetFromPostings` / `Automaton` /
-//! `Empty`), built once at construction and consulted per-segment.
+//! Unified `TermSetWeight` executing both explicit `TermSetQuery` key sets and
+//! vectorized `TermPredicateQuery` filters across dictionary fast fields,
+//! numeric/IP fast fields, and inverted-index posting lists.
 //!
-//! ## Two orthogonal concerns, one type
-//!
-//! Dispatch separates two questions:
-//!
-//!   - "Which field representations are available?" — `is_fast()`, `is_indexed()`.
-//!   - "Which strategy wins on the current K/N/D?" — the planner's job.
-//!
-//! `BitsetFromPostings` only needs the field to be **indexed** (it
-//! reads posting lists, not a column), so non-fast indexed fields
-//! (text / string) still reach the bitset path — the planner picks
-//! between `BitsetFromPostings` (low K) and `Automaton` (high K) on
-//! those.
-//!
-//! `TermSetWeight` holds the bytes representation (consumed by Bitset
-//! + Automaton), an optional u64 representation (consumed by Gallop +
-//! Linear + Bitset on numeric-fast), a pre-built FST (consumed by
-//! Automaton), and a `fast_strategies_available` flag set at
-//! construction. The per-segment scorer opens the column only when
-//! fast is available, calls `select_strategy`, and dispatches all
-//! five variants including `Automaton` for non-fast indexed fields.
+//! Strategy selection separates two orthogonal costs:
+//! 1. Choosing the execution substrate (`BytesColumn` / `Column<u64>` fast field vs
+//!    `InvertedIndexReader` posting lists) based on segment sort order, upstream candidate
+//!    selectivity `C`, dictionary size `V`, and expected match count `K`.
+//! 2. Resolving matching dictionary entries on whichever dictionary was chosen (batched
+//!    block-skipping lookup for explicit sorted keys vs single-pass batch streaming for opaque
+//!    `TermPredicate`s).
 
-use std::io;
 use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::ops::{Bound, RangeInclusive};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::{fmt, io};
 
-use columnar::{Column, ColumnType};
-use rustc_hash::FxHashSet;
+use columnar::{BytesColumn, Column, ColumnType};
+use common::bounds::BoundsRange;
+use common::BitSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tantivy_fst::raw::CompiledAddr;
 use tantivy_fst::{Automaton, Map};
 
+use super::term_predicate::{
+    resolve_explicit_dict_ordinals, resolve_remaining_into_cache, stream_predicate_dict_ordinals,
+    BytesBatcher, CachedDictPredicateDocSet, DictEvalScratch, DictKeyProbe, ExactFastField,
+    ExactPostings, PredicateColumnDocSet, SegmentDictEntry, SegmentDictState, TermPredicate,
+    U64Batcher,
+};
 use super::term_set_bitset::bitset_from_postings_scorer;
 use super::term_set_gallop::TermSetGallopDocSet;
 use super::term_set_strategy::{
-    select_strategy, PlannerInputs, StrategyTag, TermSetStrategy, TermSetStrategyConfig,
+    max_admissible_bitset_keys, select_strategy, sorted_range_in_column, try_gallop_order,
+    PlannerInputs, StrategyChoice, StrategyTag, TermSetStrategyConfig,
 };
 use crate::docset::SeekDangerResult;
-use crate::index::SegmentReader;
-use crate::query::score_combiner::DoNothingCombiner;
+use crate::index::{SegmentId, SegmentReader};
+use crate::postings::TermInfo;
+use crate::query::bitset::or_term_info_into_bitset;
+use crate::query::range_query::sorted_internals::sorted_doc_range_for_bounds;
 use crate::query::{
-    AutomatonWeight, BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur,
-    Query, Scorer, Weight,
+    AutomatonWeight, BitSetDocSet, CandidateHint, ConstScorer, EmptyScorer, Explanation, Scorer,
+    Weight,
 };
 use crate::schema::{Field, FieldType, DATE_TIME_PRECISION_INDEXED};
+use crate::termdict::TermStreamer;
 use crate::{DocId, DocSet, Score, TantivyError, Term, TERMINATED};
 
-// ---------------------------------------------------------------------------
-// FastFieldTermSetQuery — preserved as a thin public Query type
-// ---------------------------------------------------------------------------
-
-/// Thin `Query` wrapper that delegates to `TermSetWeight`. Provided
-/// alongside [`TermSetQuery`] for consumers that prefer the "fast-only"
-/// name at the call site; the underlying dispatch path is identical.
-///
-/// [`TermSetQuery`]: super::TermSetQuery
-#[derive(Debug, Clone)]
-pub struct FastFieldTermSetQuery {
-    terms_map: std::collections::HashMap<Field, Vec<Term>>,
-    strategy_config: TermSetStrategyConfig,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastSubstrate {
+    None,
+    Dictionary,
+    Numeric,
+    Ipv6,
 }
 
-impl FastFieldTermSetQuery {
-    /// Create a new `FastFieldTermSetQuery`.
-    pub fn new<T: IntoIterator<Item = Term>>(terms: T) -> Self {
-        let mut terms_map: std::collections::HashMap<Field, Vec<Term>> =
-            std::collections::HashMap::new();
-        for term in terms {
-            terms_map.entry(term.field()).or_default().push(term);
-        }
-        FastFieldTermSetQuery {
-            terms_map,
-            strategy_config: TermSetStrategyConfig::default(),
-        }
-    }
-
-    /// Override the strategy thresholds and gates used when this query
-    /// runs. Consumers (paradedb) build the config from GUCs.
-    pub fn with_strategy_config(mut self, cfg: TermSetStrategyConfig) -> Self {
-        self.strategy_config = cfg;
-        self
-    }
-}
-
-impl Query for FastFieldTermSetQuery {
-    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        let schema = enable_scoring.schema();
-        let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
-        for (&field, terms) in &self.terms_map {
-            let field_entry = schema.get_field_entry(field);
-            let field_type = field_entry.field_type();
-            sub_queries.push((
-                Occur::Should,
-                Box::new(
-                    TermSetWeight::new(field, terms, field_type, self.strategy_config.clone())?
-                        .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
-                ),
-            ));
-        }
-        Ok(Box::new(
-            BooleanWeight::new(sub_queries, false, Box::new(DoNothingCombiner::default))
-                .with_bitmap_postings(enable_scoring.bitmap_postings_enabled()),
-        ))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TermSetWeight — the unified Weight
-// ---------------------------------------------------------------------------
-
-/// Internal representation of the input terms in their post-validation
-/// type. `Numeric` covers U64/I64/F64/Date (each Term decoded via
-/// `as_u64_lenient` to a u64 the column dispatch consumes). `Ipv6`
-/// holds parsed Ipv6Addr values. `Bytes` is the catch-all for fields
-/// whose dispatch only needs the byte encoding (text/string/json — and
-/// also numeric/IP when used purely on the inverted index).
 #[derive(Clone, Debug)]
-enum TermRepr {
-    /// Numeric Terms decoded as `u64`. Present when at least one Term's
-    /// value can be decoded via `as_u64_lenient`. The FF strategies
-    /// (Gallop / Linear / Bitset-on-fast) consume this.
+enum ExplicitTyped {
     Numeric(Vec<u64>),
-    /// Ipv6Addr Terms. Present when at least one Term has an
-    /// `as_ip_addr` value. IP fields don't go through the planner — they
-    /// always land on `TermSetDocSet` over the ipv6 column.
     Ipv6(Vec<Ipv6Addr>),
-    /// Bytes-only (text / string / json). Dispatch is inverted-index
-    /// only: Bitset (low K) vs. Automaton (high K).
     Bytes,
 }
 
-/// `Weight` for `TermSetQuery` over a single field. Holds every
-/// representation needed by the strategy dispatcher; the per-segment
-/// scorer picks one and dispatches.
-#[derive(Clone, Debug)]
-pub struct TermSetWeight {
-    field: Field,
-    /// Pre-sorted, deduped serialized bytes of every Term in the input.
-    /// Built once at construction. Consumed by `BitsetFromPostings`
-    /// (passed straight to `bitset_from_postings_scorer`) and indirectly
-    /// by `Automaton` (via `terms_fst`).
-    terms_bytes: Vec<Vec<u8>>,
-    /// Pre-built FST set-membership map. Consumed by the `Automaton`
-    /// dispatch (`AutomatonWeight::new(field, SetDfaWrapper(map))`).
-    /// Built once at construction so per-segment dispatch is alloc-free.
-    /// `None` when the input is empty or when fast-field strategies handle
-    /// the field. Wrapped in `Arc` because `Map<Vec<u8>>` isn't `Clone` (and
-    /// the surrounding `TermSetWeight` needs to be — `BooleanWeight` requires
-    /// it).
-    terms_fst: Option<Arc<Map<Vec<u8>>>>,
-    /// Typed representation. Drives the per-segment dispatch path.
-    repr: TermRepr,
-    /// `true` iff `field_type.is_fast()` and the field's value type has
-    /// a column representation the planner can open as `Column<u64>` or
-    /// `Column<Ipv6Addr>`. When `false`, the planner never returns
-    /// `Gallop` / `LinearScan` (fast-field-bound); it routes to
-    /// `Automaton` instead.
-    fast_strategies_available: bool,
-    /// `true` iff `field_type.is_indexed()`. Required for
-    /// `BitsetFromPostings` (which reads posting lists from the inverted
-    /// index) and for `Automaton`. Without an inverted index neither can
-    /// build; the constructor rejects fields that are neither fast nor
-    /// indexed.
-    is_indexed: bool,
-    strategy_config: TermSetStrategyConfig,
-    bitmap_enabled: bool,
+#[derive(Debug)]
+struct ExplicitTerms {
+    terms_bytes: Arc<[Vec<u8>]>,
+    typed: ExplicitTyped,
+    terms_fst: OnceLock<Arc<Map<Vec<u8>>>>,
 }
 
-/// Returns whether `field_type` has a fast-field column representation the
-/// planner's FF strategies can open and use interchangeably with the inverted
-/// index. Keep this in sync with `dispatch_numeric_fast`'s `ColumnType` allow
-/// list (U64/I64/F64/DateTime) plus IPv6.
-///
-/// For `Date` fields that are also `INDEXED`, the inverted index always stores
-/// values truncated to `DATE_TIME_PRECISION_INDEXED`, so fast-field strategies
-/// and min/max range pruning are only sound when the fast-field storage
-/// precision matches `DATE_TIME_PRECISION_INDEXED`.
-fn type_supported_for_fast_field(field_type: &FieldType) -> bool {
-    match field_type {
-        FieldType::U64(_) | FieldType::I64(_) | FieldType::F64(_) | FieldType::IpAddr(_) => true,
-        FieldType::Date(opts) => {
-            !opts.is_indexed() || opts.get_precision() == DATE_TIME_PRECISION_INDEXED
+impl ExplicitTerms {
+    fn fst(&self) -> crate::Result<Arc<Map<Vec<u8>>>> {
+        if let Some(fst) = self.terms_fst.get() {
+            return Ok(Arc::clone(fst));
         }
-        _ => false,
+        let map = Map::from_iter(self.terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
+            .map_err(io::Error::other)?;
+        let arc = Arc::new(map);
+        let _ = self.terms_fst.set(Arc::clone(&arc));
+        Ok(arc)
     }
 }
 
+#[derive(Clone, Debug)]
+enum KeyFilter {
+    Terms(Arc<ExplicitTerms>),
+    Predicate {
+        predicate: Arc<dyn TermPredicate>,
+        bounds: BoundsRange<Term>,
+    },
+}
+
+impl KeyFilter {
+    fn is_definitely_empty(&self) -> bool {
+        match self {
+            KeyFilter::Terms(t) => t.terms_bytes.is_empty(),
+            KeyFilter::Predicate { predicate, .. } => {
+                predicate.estimated_distinct_keys() == Some(0)
+            }
+        }
+    }
+
+    fn known_key_count(&self) -> Option<u64> {
+        match self {
+            KeyFilter::Terms(t) => Some(t.terms_bytes.len() as u64),
+            KeyFilter::Predicate { predicate, .. } => predicate.estimated_distinct_keys(),
+        }
+    }
+
+    fn byte_bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
+        match self {
+            KeyFilter::Terms(t) => match (t.terms_bytes.first(), t.terms_bytes.last()) {
+                (Some(lo), Some(hi)) => (
+                    Bound::Included(lo.as_slice()),
+                    Bound::Included(hi.as_slice()),
+                ),
+                _ => (Bound::Unbounded, Bound::Unbounded),
+            },
+            KeyFilter::Predicate { bounds, .. } => (
+                term_bound_bytes(&bounds.lower_bound),
+                term_bound_bytes(&bounds.upper_bound),
+            ),
+        }
+    }
+}
+
+fn classify_substrates(
+    field_type: &FieldType,
+    requested_postings: ExactPostings,
+    exact_fast_field: ExactFastField,
+    for_explicit_terms: bool,
+) -> (FastSubstrate, ExactPostings) {
+    let fast_substrate = match field_type {
+        FieldType::IpAddr(opts) if opts.is_fast() && for_explicit_terms => FastSubstrate::Ipv6,
+        FieldType::U64(opts)
+        | FieldType::I64(opts)
+        | FieldType::F64(opts)
+        | FieldType::Bool(opts)
+            if opts.is_fast() =>
+        {
+            FastSubstrate::Numeric
+        }
+        FieldType::Date(opts)
+            if opts.is_fast()
+                && (!for_explicit_terms
+                    || !opts.is_indexed()
+                    || opts.get_precision() == DATE_TIME_PRECISION_INDEXED) =>
+        {
+            FastSubstrate::Numeric
+        }
+        FieldType::Bytes(opts) if opts.is_fast() => FastSubstrate::Dictionary,
+        #[allow(deprecated)]
+        FieldType::Str(opts)
+            if opts.is_fast()
+                && (exact_fast_field == ExactFastField::Available
+                    || opts.get_indexing_options().is_none()
+                    || opts.get_fast_field_tokenizer_name()
+                        == opts.get_indexing_options().map(|i| i.tokenizer())) =>
+        {
+            FastSubstrate::Dictionary
+        }
+        _ => FastSubstrate::None,
+    };
+
+    let postings_compatible = field_type.is_indexed()
+        && !matches!(
+            field_type,
+            FieldType::Date(opts)
+                if !for_explicit_terms && opts.get_precision() != DATE_TIME_PRECISION_INDEXED
+        );
+    let exact_postings = if requested_postings == ExactPostings::Available && postings_compatible {
+        ExactPostings::Available
+    } else {
+        ExactPostings::Unavailable
+    };
+
+    (fast_substrate, exact_postings)
+}
+
+/// Query-scoped per-segment dictionary resolution cache shared across clones of a
+/// [`TermSetWeight`], preventing repeated candidate-probing calls (such as vector shortlist
+/// chunks) from re-scanning or re-decompressing the same segment dictionary.
+#[derive(Clone, Default)]
+struct SegmentDictCache(Arc<RwLock<FxHashMap<SegmentId, Arc<Mutex<SegmentDictEntry>>>>>);
+
+impl fmt::Debug for SegmentDictCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentDictCache").finish_non_exhaustive()
+    }
+}
+
+/// Unified `Weight` for single-field set-membership queries (`TermSetQuery`,
+/// `FastFieldTermSetQuery`, and `TermPredicateQuery`).
+#[derive(Clone, Debug)]
+pub struct TermSetWeight {
+    field: Field,
+    filter: KeyFilter,
+    fast_substrate: FastSubstrate,
+    exact_postings: ExactPostings,
+    strategy_config: TermSetStrategyConfig,
+    bitmap_enabled: bool,
+    dict_cache: SegmentDictCache,
+}
+
 impl TermSetWeight {
-    /// Construct a `TermSetWeight` for one field's term subset.
-    ///
-    /// Side effects: sorts + dedupes the bytes representation, builds
-    /// the FST, decodes numeric/IP Terms if applicable. All O(K log K)
-    /// or smaller; runs once.
-    ///
-    /// Errors when the field is neither fast nor indexed (no dispatch
-    /// path can build), or when an IP-typed Term is mixed with a
-    /// non-IP-typed field.
-    pub fn new(
+    /// Construct a `TermSetWeight` from an explicit slice of `Term`s.
+    pub fn from_terms(
         field: Field,
         terms: &[Term],
         field_type: &FieldType,
+        exact_fast_field: ExactFastField,
         strategy_config: TermSetStrategyConfig,
     ) -> crate::Result<Self> {
-        let fast_strategies_available =
-            field_type.is_fast() && type_supported_for_fast_field(field_type);
-        let is_indexed = field_type.is_indexed();
-        if !fast_strategies_available && !is_indexed {
+        let (fast_substrate, exact_postings) =
+            classify_substrates(field_type, ExactPostings::Available, exact_fast_field, true);
+        if fast_substrate == FastSubstrate::None && exact_postings == ExactPostings::Unavailable {
             return Err(TantivyError::SchemaError(format!(
                 "Field {field:?} is neither fast nor indexed; TermSetQuery has no execution path"
             )));
         }
 
-        // Build the sorted, deduped bytes representation. This is the
-        // primary representation; the FST and (optional) numeric / IP
-        // representations are derived from the input Terms separately.
         let mut terms_bytes: Vec<Vec<u8>> = terms
             .iter()
             .map(|t| t.serialized_value_bytes().to_vec())
@@ -223,77 +227,106 @@ impl TermSetWeight {
         terms_bytes.sort_unstable();
         terms_bytes.dedup();
 
-        // Pick a typed representation based on the first Term's value
-        // type. Numeric / IP terms decode to typed arms that the
-        // fast-field dispatch path consumes; everything else (text /
-        // string / json) lands on `Bytes` and goes through the
-        // inverted-index dispatch path.
-        let repr = if let Some(first) = terms.first() {
+        let typed = if let Some(first) = terms.first() {
             let first_val = first.value();
             if first_val.as_ip_addr().is_some() {
+                if !field_type.is_ip_addr() && !field_type.is_json() {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "TermSet for field {field:?} contains IP addresses, but field type is \
+                         {field_type:?}"
+                    )));
+                }
                 let mut values = Vec::with_capacity(terms.len());
                 for term in terms {
-                    match term.value().as_ip_addr() {
-                        Some(v) => values.push(v),
-                        None => {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "Expected term with ip address, but got {term:?}",
-                            )))
-                        }
-                    }
+                    let Some(v) = term.value().as_ip_addr() else {
+                        return Err(TantivyError::InvalidArgument(format!(
+                            "Expected term with ip address, but got {term:?}"
+                        )));
+                    };
+                    values.push(v);
                 }
-                TermRepr::Ipv6(values)
-            } else if first_val.as_u64_lenient().is_some() {
+                ExplicitTyped::Ipv6(values)
+            } else if first_val.as_u64_lenient().is_some() && !field_type.is_json() {
+                if field_type.is_ip_addr() {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "TermSet for field {field:?} contains numeric values, but field type is \
+                         {field_type:?}"
+                    )));
+                }
                 let mut values = Vec::with_capacity(terms.len());
                 for term in terms {
-                    match term.value().as_u64_lenient() {
-                        Some(v) => values.push(v),
-                        None => {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "Expected term with u64, i64, f64, or date, but got {term:?}",
-                            )))
-                        }
-                    }
+                    let Some(v) = term.value().as_u64_lenient() else {
+                        return Err(TantivyError::InvalidArgument(format!(
+                            "Expected term with u64, i64, f64, bool, or date, but got {term:?}"
+                        )));
+                    };
+                    values.push(v);
                 }
-                // `as_u64_lenient` decodes the 8-byte big-endian payload, so
-                // sorting+deduping `values` produces an array in 1-to-1
-                // correspondence with `terms_bytes`.
                 values.sort_unstable();
                 values.dedup();
-                assert_eq!(values.len(), terms_bytes.len());
-                TermRepr::Numeric(values)
+                ExplicitTyped::Numeric(values)
             } else {
-                // Text / string / json — bytes-only dispatch.
-                TermRepr::Bytes
+                ExplicitTyped::Bytes
             }
         } else {
-            // Empty input — repr doesn't matter; scorer short-circuits.
-            TermRepr::Bytes
-        };
-
-        // Build the FST once when the `Automaton` path may be needed.
-        // `Map::from_iter` requires strictly ascending keys, which the
-        // sort+dedup above guarantees. Skip FST construction when there
-        // are no terms or when fast-field strategies handle the field.
-        let terms_fst = if terms_bytes.is_empty()
-            || (fast_strategies_available && !matches!(repr, TermRepr::Bytes))
-        {
-            None
-        } else {
-            let map = Map::from_iter(terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
-                .map_err(io::Error::other)?;
-            Some(Arc::new(map))
+            ExplicitTyped::Bytes
         };
 
         Ok(Self {
             field,
-            terms_bytes,
-            terms_fst,
-            repr,
-            fast_strategies_available,
-            is_indexed,
+            filter: KeyFilter::Terms(Arc::new(ExplicitTerms {
+                terms_bytes: terms_bytes.into(),
+                typed,
+                terms_fst: OnceLock::new(),
+            })),
+            fast_substrate,
+            exact_postings,
             strategy_config,
             bitmap_enabled: false,
+            dict_cache: SegmentDictCache::default(),
+        })
+    }
+
+    /// Construct a `TermSetWeight` from a vectorized [`TermPredicate`].
+    pub fn from_predicate(
+        field: Field,
+        field_type: &FieldType,
+        predicate: Arc<dyn TermPredicate>,
+        bounds: BoundsRange<Term>,
+        requested_postings: ExactPostings,
+        exact_fast_field: ExactFastField,
+        strategy_config: TermSetStrategyConfig,
+    ) -> crate::Result<Self> {
+        if matches!(
+            field_type,
+            FieldType::JsonObject(_) | FieldType::Facet(_) | FieldType::IpAddr(_)
+        ) {
+            return Err(TantivyError::SchemaError(format!(
+                "TermPredicateQuery does not support field {field:?} of type {field_type:?}"
+            )));
+        }
+        let (fast_substrate, exact_postings) =
+            classify_substrates(field_type, requested_postings, exact_fast_field, false);
+        if fast_substrate == FastSubstrate::None && exact_postings == ExactPostings::Unavailable {
+            let hint = if matches!(field_type, FieldType::Str(opts) if opts.is_fast()) {
+                " (fast-field and indexing tokenizers differ under ExactFastField::Infer; pass \
+                 ExactFastField::Available if the fast field stores exact predicate values)"
+            } else {
+                ""
+            };
+            return Err(TantivyError::SchemaError(format!(
+                "Field {field:?} has neither a supported fast-field column nor exact \
+                 postings{hint}"
+            )));
+        }
+        Ok(Self {
+            field,
+            filter: KeyFilter::Predicate { predicate, bounds },
+            fast_substrate,
+            exact_postings,
+            strategy_config,
+            bitmap_enabled: false,
+            dict_cache: SegmentDictCache::default(),
         })
     }
 
@@ -302,37 +335,22 @@ impl TermSetWeight {
         self
     }
 
-    /// Common epilogue: write the chosen tag to `strategy_sink` if one
-    /// is configured. Used by the non-planner dispatch paths
-    /// (Ipv6 / non-fast bytes); the planner-driven path writes the sink
-    /// inside `select_strategy`.
     fn record_strategy_tag(&self, tag: StrategyTag) {
         if let Some(sink) = self.strategy_config.strategy_sink.as_ref() {
             sink.store(tag as u8, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    /// Build the `Automaton` scorer: compose an `AutomatonWeight` over
-    /// the pre-built term FST and ask it for its scorer. The
-    /// `AutomatonWeight` impl handles per-segment FST traversal across
-    /// the dictionary streamer; we don't re-implement it here.
     fn automaton_scorer(
         &self,
         reader: &SegmentReader,
+        explicit: &ExplicitTerms,
         boost: Score,
     ) -> crate::Result<Box<dyn Scorer>> {
-        if self.terms_bytes.is_empty() {
+        if explicit.terms_bytes.is_empty() {
             return Ok(Box::new(EmptyScorer));
         }
-        let map_arc = match self.terms_fst.clone() {
-            Some(map) => map,
-            None => {
-                let map = Map::from_iter(self.terms_bytes.iter().map(|k| (k.as_slice(), 0u64)))
-                    .map_err(io::Error::other)?;
-                Arc::new(map)
-            }
-        };
-        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(map_arc))
+        let weight = AutomatonWeight::new(self.field, SetDfaWrapper(explicit.fst()?))
             .with_scoring_enabled(!self.bitmap_enabled)
             .with_bitmap_postings(self.bitmap_enabled);
         weight.scorer(reader, boost)
@@ -342,61 +360,585 @@ impl TermSetWeight {
         &self,
         reader: &SegmentReader,
         boost: Score,
-        candidate_size: Option<u32>,
+        candidate_hint: Option<CandidateHint>,
     ) -> crate::Result<Box<dyn Scorer>> {
-        if self.terms_bytes.is_empty() {
+        if reader.max_doc() == 0 || self.filter.is_definitely_empty() {
+            if matches!(self.filter, KeyFilter::Predicate { .. }) {
+                self.record_strategy_tag(StrategyTag::Empty);
+            }
             return Ok(Box::new(EmptyScorer));
         }
 
         let field_entry = reader.schema().get_field_entry(self.field);
-        let field_type = field_entry.field_type();
         let field_name = field_entry.name();
+        let field_type = field_entry.field_type();
 
-        match &self.repr {
-            TermRepr::Ipv6(values) => {
-                if !field_type.is_ip_addr() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "fast fields TermSet for field `{field_name}` contains IP addresses, but \
-                         the field type is {field_type:?}"
-                    )));
+        match self.fast_substrate {
+            FastSubstrate::Ipv6 => {
+                self.dispatch_ipv6_fast(reader, field_name, boost, candidate_hint)
+            }
+            FastSubstrate::Dictionary => {
+                self.dispatch_dictionary_fast(reader, field_name, field_type, boost, candidate_hint)
+            }
+            FastSubstrate::Numeric => {
+                self.dispatch_numeric_fast(reader, field_name, field_type, boost, candidate_hint)
+            }
+            FastSubstrate::None => self.dispatch_postings(reader, field_type, boost),
+        }
+    }
+
+    fn dispatch_ipv6_fast(
+        &self,
+        reader: &SegmentReader,
+        field_name: &str,
+        boost: Score,
+        candidate_hint: Option<CandidateHint>,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let KeyFilter::Terms(explicit) = &self.filter else {
+            return Ok(Box::new(EmptyScorer));
+        };
+        let ExplicitTyped::Ipv6(values) = &explicit.typed else {
+            return self.dispatch_postings(
+                reader,
+                reader.schema().get_field_entry(self.field).field_type(),
+                boost,
+            );
+        };
+        let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
+            reader.fast_fields().column_opt(field_name)?
+        else {
+            return Ok(Box::new(EmptyScorer));
+        };
+        self.record_strategy_tag(StrategyTag::Linear);
+        let term_set: FxHashSet<Ipv6Addr> = values.iter().copied().collect();
+        let docset = if candidate_hint.is_some() {
+            TermSetDocSet::new_unpositioned(ip_addr_column, term_set)
+        } else {
+            TermSetDocSet::new(ip_addr_column, term_set)
+        };
+        Ok(Box::new(ConstScorer::new(docset, boost)))
+    }
+
+    fn get_or_init_dict_entry(
+        &self,
+        segment_id: SegmentId,
+        bytes_col: &BytesColumn,
+    ) -> crate::Result<Arc<Mutex<SegmentDictEntry>>> {
+        if let Some(entry) = self.dict_cache.0.read().unwrap().get(&segment_id) {
+            return Ok(Arc::clone(entry));
+        }
+        let dict = bytes_col.dictionary();
+        let ords_col = bytes_col.ords();
+        let num_terms = bytes_col.num_terms();
+        let (lo_bytes, hi_bytes) = self.filter.byte_bounds();
+        let (lo_ord_bound, hi_ord_bound) = dict.term_bounds_to_ord(lo_bytes, hi_bytes)?;
+        let lo_ord = match lo_ord_bound {
+            Bound::Included(o) => o,
+            Bound::Excluded(o) => o.saturating_add(1),
+            Bound::Unbounded => 0,
+        }
+        .max(ords_col.min_value());
+        let hi_ord_excl = match hi_ord_bound {
+            Bound::Included(o) => o.saturating_add(1),
+            Bound::Excluded(o) => o,
+            Bound::Unbounded => num_terms as u64,
+        }
+        .min(ords_col.max_value().saturating_add(1))
+        .min(num_terms as u64);
+
+        let entry = if lo_ord >= hi_ord_excl {
+            SegmentDictEntry {
+                ord_range: 0..0,
+                block_ids: None,
+                state: SegmentDictState::FullyPopulated(Arc::new(BitSet::with_max_value(0))),
+            }
+        } else if let Some(block_ids) = dict.block_ids_for_ord_range(lo_ord..hi_ord_excl)? {
+            SegmentDictEntry {
+                ord_range: lo_ord..hi_ord_excl,
+                block_ids: Some(block_ids),
+                state: SegmentDictState::Unpopulated,
+            }
+        } else {
+            SegmentDictEntry {
+                ord_range: 0..0,
+                block_ids: None,
+                state: SegmentDictState::FullyPopulated(Arc::new(BitSet::with_max_value(0))),
+            }
+        };
+        let mut cache = self.dict_cache.0.write().unwrap();
+        Ok(Arc::clone(
+            cache
+                .entry(segment_id)
+                .or_insert_with(|| Arc::new(Mutex::new(entry))),
+        ))
+    }
+
+    fn dispatch_dictionary_fast(
+        &self,
+        reader: &SegmentReader,
+        field_name: &str,
+        field_type: &FieldType,
+        boost: Score,
+        candidate_hint: Option<CandidateHint>,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let bytes_col_opt: Option<BytesColumn> =
+            if let Some(str_col) = reader.fast_fields().str(field_name)? {
+                Some(BytesColumn::from(str_col))
+            } else {
+                reader.fast_fields().bytes(field_name)?
+            };
+        let Some(bytes_col) = bytes_col_opt else {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        };
+
+        let n = bytes_col.num_rows();
+        let num_terms = bytes_col.num_terms();
+        if n == 0 || num_terms == 0 {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+
+        let ords_col = bytes_col.ords();
+        let d = ((n as u64) / (num_terms as u64).max(1))
+            .max(1)
+            .min(u32::MAX as u64) as u32;
+        let candidate_size = candidate_hint.map(CandidateHint::upper_bound);
+        let planner_inputs = PlannerInputs {
+            field_name,
+            candidate_size,
+            avg_docs_per_term: Some(d),
+        };
+        let bitset_key_cap = if self.exact_postings == ExactPostings::Available {
+            max_admissible_bitset_keys(reader, ords_col, &planner_inputs, &self.strategy_config)
+        } else {
+            0
+        };
+
+        // Choose between the fast-field `BytesColumn` and `TermDictionary` postings.
+        let prefer_fast_column = if self.exact_postings == ExactPostings::Unavailable {
+            true
+        } else if try_gallop_order(reader, ords_col, &planner_inputs, &self.strategy_config)
+            .is_some()
+        {
+            true
+        } else if candidate_hint.is_some() {
+            self.filter
+                .known_key_count()
+                .is_none_or(|k| k > bitset_key_cap as u64)
+        } else {
+            self.filter.known_key_count().is_some_and(|k| {
+                k > bitset_key_cap as u64 && k.saturating_mul(2) >= num_terms as u64
+            })
+        };
+
+        if candidate_hint.is_none() && !prefer_fast_column {
+            return self.dispatch_postings(reader, field_type, boost);
+        }
+
+        let entry_arc = self.get_or_init_dict_entry(reader.segment_id(), &bytes_col)?;
+        let mut entry = entry_arc.lock().unwrap();
+        let num_sstable_blocks = entry.num_sstable_blocks();
+        let ord_range = entry.ord_range.clone();
+        let SegmentDictEntry {
+            block_ids, state, ..
+        } = &mut *entry;
+        let mut retained_keys: Option<Vec<Vec<u8>>> = None;
+        let ords_arc = match state {
+            SegmentDictState::FullyPopulated(arc) => Arc::clone(arc),
+            state => {
+                let probe_opt = if num_sstable_blocks > 2 {
+                    match (candidate_hint, &self.filter) {
+                        (
+                            Some(CandidateHint::Pruned { .. }),
+                            KeyFilter::Predicate { predicate, .. },
+                        ) => Some(DictKeyProbe::Predicate(Arc::clone(predicate))),
+                        (Some(CandidateHint::Pruned { .. }), KeyFilter::Terms(explicit))
+                            if (explicit.terms_bytes.len() as u64) > bitset_key_cap as u64 =>
+                        {
+                            Some(DictKeyProbe::SortedTerms(Arc::clone(&explicit.terms_bytes)))
+                        }
+                        (
+                            Some(CandidateHint::Estimated(c)),
+                            KeyFilter::Predicate { predicate, .. },
+                        ) if u64::from(c) < num_sstable_blocks => {
+                            Some(DictKeyProbe::Predicate(Arc::clone(predicate)))
+                        }
+                        (Some(CandidateHint::Estimated(c)), KeyFilter::Terms(explicit))
+                            if u64::from(c) < num_sstable_blocks
+                                && (u64::from(c) * 4) <= explicit.terms_bytes.len() as u64 =>
+                        {
+                            Some(DictKeyProbe::SortedTerms(Arc::clone(&explicit.terms_bytes)))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(probe) = probe_opt {
+                    if matches!(*state, SegmentDictState::Unpopulated) {
+                        *state = SegmentDictState::BlockCached {
+                            tested_ords: BitSet::with_max_value(num_terms as u32),
+                            matched_ords: BitSet::with_max_value(num_terms as u32),
+                            decoded_blocks: 0,
+                        };
+                    }
+                    drop(entry);
+                    self.record_strategy_tag(StrategyTag::Linear);
+                    let docset = CachedDictPredicateDocSet::new_unpositioned(
+                        bytes_col, ord_range, probe, entry_arc,
+                    );
+                    return Ok(Box::new(ConstScorer::new(docset, boost)));
                 }
-                let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
-                    reader.fast_fields().column_opt(field_name)?
-                else {
+
+                if !prefer_fast_column {
+                    drop(entry);
+                    return self.dispatch_postings(reader, field_type, boost);
+                }
+
+                let (matched_ords, keys) = match state {
+                    SegmentDictState::BlockCached {
+                        tested_ords,
+                        matched_ords,
+                        decoded_blocks,
+                    } => {
+                        let probe = match &self.filter {
+                            KeyFilter::Terms(explicit) => {
+                                DictKeyProbe::SortedTerms(Arc::clone(&explicit.terms_bytes))
+                            }
+                            KeyFilter::Predicate { predicate, .. } => {
+                                DictKeyProbe::Predicate(Arc::clone(predicate))
+                            }
+                        };
+                        let ords = if let Some(block_ids) = block_ids.as_ref() {
+                            let mut scratch = DictEvalScratch::default();
+                            resolve_remaining_into_cache(
+                                &bytes_col,
+                                &ord_range,
+                                block_ids,
+                                &probe,
+                                tested_ords,
+                                matched_ords,
+                                *decoded_blocks,
+                                &mut scratch,
+                            )?
+                        } else {
+                            std::mem::replace(matched_ords, BitSet::with_max_value(0))
+                        };
+                        (ords, None)
+                    }
+                    SegmentDictState::Unpopulated => match &self.filter {
+                        KeyFilter::Terms(explicit) => {
+                            let ords = resolve_explicit_dict_ordinals(
+                                &bytes_col,
+                                ord_range,
+                                &explicit.terms_bytes,
+                            )?;
+                            let keys = (self.exact_postings == ExactPostings::Available
+                                && ords.len() <= bitset_key_cap)
+                                .then(|| explicit.terms_bytes.to_vec());
+                            (ords, keys)
+                        }
+                        KeyFilter::Predicate { predicate, .. } => stream_predicate_dict_ordinals(
+                            &bytes_col,
+                            ord_range,
+                            predicate.as_ref(),
+                            bitset_key_cap,
+                        )?,
+                    },
+                    SegmentDictState::FullyPopulated(_) => unreachable!(),
+                };
+                retained_keys = keys;
+                let arc = Arc::new(matched_ords);
+                *state = SegmentDictState::FullyPopulated(Arc::clone(&arc));
+                arc
+            }
+        };
+        drop(entry);
+
+        if ords_arc.len() == 0 {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+
+        let retained_keys = if let Some(keys) = retained_keys {
+            Some(keys)
+        } else if self.exact_postings == ExactPostings::Available
+            && ords_arc.len() <= bitset_key_cap
+        {
+            match &self.filter {
+                KeyFilter::Terms(explicit) => Some(explicit.terms_bytes.to_vec()),
+                KeyFilter::Predicate { .. } => {
+                    let matched_u64s: Vec<u64> =
+                        matched_ords_iter(&ords_arc).map(u64::from).collect();
+                    let mut keys = Vec::with_capacity(matched_u64s.len());
+                    bytes_col
+                        .dictionary()
+                        .sorted_ords_to_term_cb(&matched_u64s, |k| keys.push(k.to_vec()))?;
+                    Some(keys)
+                }
+            }
+        } else {
+            None
+        };
+
+        let k_prime = ords_arc.len() as u32;
+        let sorted_ords = Arc::clone(&ords_arc);
+        let postings_cb = retained_keys.map(|keys| {
+            Box::new(move || {
+                bitset_from_postings_scorer(reader, self.field, &keys, boost, self.bitmap_enabled)
+            }) as Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>
+        });
+
+        dispatch_u64_column(
+            reader,
+            ords_col.clone(),
+            planner_inputs,
+            k_prime,
+            &self.strategy_config,
+            boost,
+            move || matched_ords_iter(&sorted_ords).map(u64::from).collect(),
+            move || ords_arc,
+            postings_cb,
+        )
+    }
+
+    fn dispatch_numeric_fast(
+        &self,
+        reader: &SegmentReader,
+        field_name: &str,
+        field_type: &FieldType,
+        boost: Score,
+        candidate_hint: Option<CandidateHint>,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let candidate_size = candidate_hint.map(CandidateHint::upper_bound);
+        let Some((column, col_type)) = reader.fast_fields().u64_lenient_for_type(
+            Some(&[
+                ColumnType::U64,
+                ColumnType::I64,
+                ColumnType::F64,
+                ColumnType::Bool,
+                ColumnType::DateTime,
+            ]),
+            field_name,
+        )?
+        else {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        };
+
+        let n = column.num_docs();
+        if n == 0 {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+
+        match &self.filter {
+            KeyFilter::Terms(explicit) => {
+                let ExplicitTyped::Numeric(values) = &explicit.typed else {
+                    return self.dispatch_postings(reader, field_type, boost);
+                };
+                let range = sorted_range_in_column(values, &column);
+                if range.is_empty() {
+                    self.record_strategy_tag(StrategyTag::Empty);
+                    return Ok(Box::new(EmptyScorer));
+                }
+                let pruned_values = &values[range.clone()];
+                let pruned_bytes = &explicit.terms_bytes[range];
+                let k_prime = pruned_values.len() as u32;
+
+                let bitset_could_admit = if let Some(c) = candidate_size {
+                    let c = c.clamp(1, n) as f64;
+                    (k_prime as f64) / c <= self.strategy_config.subsequent_bitset_max_density
+                } else {
+                    let loosest = self
+                        .strategy_config
+                        .bitset_max_density_unique
+                        .max(self.strategy_config.bitset_max_density_multi);
+                    (k_prime as f64) / (n as f64) <= loosest
+                };
+                let d = if bitset_could_admit && self.exact_postings == ExactPostings::Available {
+                    let dict_size = reader
+                        .inverted_index(self.field)?
+                        .terms()
+                        .num_terms()
+                        .max(1) as u64;
+                    ((u64::from(n) / dict_size).max(1)).min(u32::MAX as u64) as u32
+                } else {
+                    1
+                };
+
+                let planner_inputs = PlannerInputs {
+                    field_name,
+                    candidate_size,
+                    avg_docs_per_term: Some(d),
+                };
+                let postings_cb = (self.exact_postings == ExactPostings::Available).then(|| {
+                    Box::new(move || {
+                        bitset_from_postings_scorer(
+                            reader,
+                            self.field,
+                            pruned_bytes,
+                            boost,
+                            self.bitmap_enabled,
+                        )
+                    })
+                        as Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>
+                });
+
+                dispatch_u64_column(
+                    reader,
+                    column,
+                    planner_inputs,
+                    k_prime,
+                    &self.strategy_config,
+                    boost,
+                    || pruned_values.to_vec(),
+                    || pruned_values.iter().copied().collect::<FxHashSet<u64>>(),
+                    postings_cb,
+                )
+            }
+            KeyFilter::Predicate { predicate, bounds } => {
+                let Some(value_range) = intersect_u64_bounds(bounds, &column) else {
+                    self.record_strategy_tag(StrategyTag::Empty);
                     return Ok(Box::new(EmptyScorer));
                 };
-                // IPv6 always routes through TermSetDocSet — no Gallop /
-                // Bitset / Automaton dispatch for IP — so the HashSet is
-                // built unconditionally here. Sink gets `Linear`.
+
+                let doc_bounds = reader
+                    .sort_by_field()
+                    .filter(|sbf| sbf.field == field_name)
+                    .and_then(|sbf| sorted_doc_range_for_bounds(&column, &value_range, sbf.order))
+                    .unwrap_or(0..n);
+                if doc_bounds.is_empty() {
+                    self.record_strategy_tag(StrategyTag::Empty);
+                    return Ok(Box::new(EmptyScorer));
+                }
+
                 self.record_strategy_tag(StrategyTag::Linear);
-                let term_set: FxHashSet<Ipv6Addr> = values.iter().copied().collect();
                 let docset = if candidate_size.is_some() {
-                    TermSetDocSet::new_unpositioned(ip_addr_column, term_set)
+                    PredicateColumnDocSet::new_unpositioned(
+                        column,
+                        col_type,
+                        value_range,
+                        doc_bounds,
+                        Arc::clone(predicate),
+                    )
                 } else {
-                    TermSetDocSet::new(ip_addr_column, term_set)
+                    PredicateColumnDocSet::new(
+                        column,
+                        col_type,
+                        value_range,
+                        doc_bounds,
+                        Arc::clone(predicate),
+                    )
                 };
                 Ok(Box::new(ConstScorer::new(docset, boost)))
             }
+        }
+    }
 
-            TermRepr::Numeric(values) => {
-                if field_type.is_ip_addr() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "fast fields TermSet for field `{field_name}` contains numeric values, \
-                         but the field type is {field_type:?}"
-                    )));
+    fn dispatch_postings(
+        &self,
+        reader: &SegmentReader,
+        field_type: &FieldType,
+        boost: Score,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        let max_doc = reader.max_doc();
+        if max_doc == 0 || self.exact_postings == ExactPostings::Unavailable {
+            self.record_strategy_tag(StrategyTag::Empty);
+            return Ok(Box::new(EmptyScorer));
+        }
+
+        match &self.filter {
+            KeyFilter::Terms(explicit) => {
+                let k = explicit.terms_bytes.len() as u64;
+                if k == 0 {
+                    self.record_strategy_tag(StrategyTag::Empty);
+                    return Ok(Box::new(EmptyScorer));
                 }
-                if self.fast_strategies_available {
-                    self.dispatch_numeric_fast(reader, field_name, values, boost, candidate_size)
+                if (k as f64) / (max_doc as f64) <= self.strategy_config.bitset_max_density_multi {
+                    self.record_strategy_tag(StrategyTag::Bitset);
+                    bitset_from_postings_scorer(
+                        reader,
+                        self.field,
+                        &explicit.terms_bytes,
+                        boost,
+                        self.bitmap_enabled,
+                    )
                 } else {
-                    self.dispatch_non_fast(reader, boost)
+                    self.record_strategy_tag(StrategyTag::Automaton);
+                    self.automaton_scorer(reader, explicit, boost)
                 }
             }
+            KeyFilter::Predicate { predicate, bounds } => {
+                let inverted_index = reader.inverted_index(self.field)?;
+                let mut builder = inverted_index.terms().range().interruptible();
+                match &bounds.lower_bound {
+                    Bound::Included(t) => builder = builder.ge(t.serialized_value_bytes()),
+                    Bound::Excluded(t) => builder = builder.gt(t.serialized_value_bytes()),
+                    Bound::Unbounded => {}
+                }
+                match &bounds.upper_bound {
+                    Bound::Included(t) => builder = builder.le(t.serialized_value_bytes()),
+                    Bound::Excluded(t) => builder = builder.lt(t.serialized_value_bytes()),
+                    Bound::Unbounded => {}
+                }
+                let mut stream: TermStreamer<'_> = builder.into_stream()?;
+                let use_bmap = self.bitmap_enabled && reader.bitmap_postings_enabled;
+                let mut doc_bitset = BitSet::with_max_value(max_doc);
+                let mut matched_terms: u64 = 0;
 
-            TermRepr::Bytes => {
-                // Non-numeric, non-IP fields. Fast strategies don't
-                // apply (no `Column<u64>` decoding for arbitrary bytes);
-                // dispatch is purely between Bitset and Automaton.
-                self.dispatch_non_fast(reader, boost)
+                if let Some(col_type) = numeric_column_type_for_field(field_type) {
+                    let mut batcher = U64Batcher::new();
+                    let mut on_match = |info: &TermInfo, _val: u64| -> crate::Result<()> {
+                        matched_terms += 1;
+                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset, use_bmap)
+                    };
+                    while stream.advance() {
+                        if let Ok(bytes) = <[u8; 8]>::try_from(stream.key()) {
+                            batcher.push(
+                                stream.value().clone(),
+                                u64::from_be_bytes(bytes),
+                                col_type,
+                                predicate.as_ref(),
+                                &mut on_match,
+                            )?;
+                        }
+                    }
+                    batcher.finish(col_type, predicate.as_ref(), &mut on_match)?;
+                } else {
+                    let mut batcher = BytesBatcher::new();
+                    let mut on_match = |info: &TermInfo, _key: &[u8]| -> crate::Result<()> {
+                        matched_terms += 1;
+                        or_term_info_into_bitset(&inverted_index, info, &mut doc_bitset, use_bmap)
+                    };
+                    while stream.advance() {
+                        batcher.push(
+                            stream.value().clone(),
+                            stream.key(),
+                            predicate.as_ref(),
+                            &mut on_match,
+                        )?;
+                    }
+                    batcher.finish(predicate.as_ref(), &mut on_match)?;
+                }
+
+                if matched_terms == 0 {
+                    self.record_strategy_tag(StrategyTag::Empty);
+                    return Ok(Box::new(EmptyScorer));
+                }
+                let tag = if (matched_terms as f64) / (max_doc as f64)
+                    <= self.strategy_config.bitset_max_density_multi
+                {
+                    StrategyTag::Bitset
+                } else {
+                    StrategyTag::Automaton
+                };
+                self.record_strategy_tag(tag);
+                Ok(Box::new(ConstScorer::new(
+                    BitSetDocSet::from(doc_bitset),
+                    boost,
+                )))
             }
         }
     }
@@ -404,8 +946,7 @@ impl TermSetWeight {
 
 impl Weight for TermSetWeight {
     fn uses_fast_fields(&self) -> bool {
-        matches!(self.repr, TermRepr::Ipv6(_))
-            || (self.fast_strategies_available && matches!(self.repr, TermRepr::Numeric(_)))
+        self.fast_substrate != FastSubstrate::None && !self.filter.is_definitely_empty()
     }
 
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
@@ -416,11 +957,9 @@ impl Weight for TermSetWeight {
         &self,
         reader: &SegmentReader,
         boost: Score,
-        candidate_size: u32,
+        candidate_hint: CandidateHint,
     ) -> crate::Result<Box<dyn Scorer>> {
-        // `DocSet::size_hint()` is a heuristic estimate that can return `0` for non-empty
-        // docsets (such as `ExistsDocSet` or small-segment `RangeDocSet`), so clamp to `>= 1`.
-        self.scorer_with_candidates(reader, boost, Some(candidate_size.max(1)))
+        self.scorer_with_candidates(reader, boost, Some(candidate_hint))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -434,183 +973,108 @@ impl Weight for TermSetWeight {
     }
 }
 
-impl TermSetWeight {
-    /// Fast-numeric dispatch path: open the `Column<u64>`, prune terms to
-    /// `[column.min_value(), column.max_value()]`, estimate D, run the
-    /// planner, and dispatch on the returned variant.
-    fn dispatch_numeric_fast(
-        &self,
-        reader: &SegmentReader,
-        field_name: &str,
-        values: &[u64],
-        boost: Score,
-        candidate_size: Option<u32>,
-    ) -> crate::Result<Box<dyn Scorer>> {
-        let fast_field_reader = reader.fast_fields();
-        let Some((column, _col_type)) = fast_field_reader.u64_lenient_for_type(
-            Some(&[
-                ColumnType::U64,
-                ColumnType::I64,
-                ColumnType::F64,
-                ColumnType::DateTime,
-            ]),
-            field_name,
-        )?
-        else {
-            return Ok(Box::new(EmptyScorer));
-        };
-
-        let n = column.num_docs() as u64;
-        if n == 0 || values.is_empty() {
-            self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+#[allow(clippy::too_many_arguments)]
+fn dispatch_u64_column<M: ValueMembership<u64>>(
+    reader: &SegmentReader,
+    column: Column<u64>,
+    planner_inputs: PlannerInputs<'_>,
+    k_prime: u32,
+    cfg: &TermSetStrategyConfig,
+    boost: Score,
+    make_sorted_u64s: impl FnOnce() -> Vec<u64>,
+    make_membership: impl FnOnce() -> M,
+    try_make_postings_bitset: Option<Box<dyn FnOnce() -> crate::Result<Box<dyn Scorer>> + '_>>,
+) -> crate::Result<Box<dyn Scorer>> {
+    let candidate_size = planner_inputs.candidate_size;
+    match select_strategy(reader, &column, planner_inputs, k_prime, cfg) {
+        StrategyChoice::Empty => Ok(Box::new(EmptyScorer)),
+        StrategyChoice::Gallop(sort_order) => {
+            let cardinality = column.get_cardinality();
+            let docset =
+                TermSetGallopDocSet::new(column, sort_order, make_sorted_u64s(), cardinality);
+            Ok(Box::new(ConstScorer::new(docset, boost)))
         }
-
-        // `values` and `self.terms_bytes` are sorted and deduped in lockstep.
-        // Slice both to `[column.min_value(), column.max_value()]` in O(log K)
-        // before touching the inverted index or building a scorer.
-        let range = super::term_set_strategy::sorted_range_in_column(values, &column);
-        if range.is_empty() {
-            self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
+        StrategyChoice::BitsetFromPostings if try_make_postings_bitset.is_some() => {
+            (try_make_postings_bitset.expect("checked Some"))()
         }
-        let pruned_values = &values[range.clone()];
-        let pruned_terms_bytes = &self.terms_bytes[range];
-
-        // Estimate `D = N / dict_size`. Pre-gate by K'/N (or K'/C when
-        // `candidate_size` is provided) before opening the inverted index —
-        // when density already exceeds the loosest admissible bitset gate, no
-        // `D >= 1` value can admit `BitsetFromPostings`.
-        let k_prime = pruned_values.len() as u64;
-        let bitset_could_admit = if let Some(c) = candidate_size {
-            let c = (c as u64).clamp(1, n);
-            (k_prime as f64) / (c as f64) <= self.strategy_config.subsequent_bitset_max_density
-        } else {
-            let density = k_prime as f64 / n as f64;
-            let loosest_gate = self
-                .strategy_config
-                .bitset_max_density_unique
-                .max(self.strategy_config.bitset_max_density_multi);
-            density <= loosest_gate
-        };
-        let d = if bitset_could_admit && self.is_indexed {
-            let dict_size = reader
-                .inverted_index(self.field)?
-                .terms()
-                .num_terms()
-                .max(1) as u64;
-            ((n / dict_size).max(1)).min(u32::MAX as u64) as u32
-        } else {
-            1
-        };
-
-        let strategy = select_strategy(
-            reader,
-            &column,
-            PlannerInputs {
-                field_name,
-                candidate_size,
-                avg_docs_per_term: Some(d),
-                fast_available: true,
-            },
-            pruned_values,
-            &self.strategy_config,
-        );
-
-        match strategy {
-            TermSetStrategy::Empty => Ok(Box::new(EmptyScorer)),
-            TermSetStrategy::Gallop {
-                sort_order,
-                sorted_terms,
-            } => {
-                let cardinality = column.get_cardinality();
-                let docset =
-                    TermSetGallopDocSet::new(column, sort_order, sorted_terms, cardinality);
-                Ok(Box::new(ConstScorer::new(docset, boost)))
-            }
-            TermSetStrategy::BitsetFromPostings if self.is_indexed => {
-                // `pruned_terms_bytes` is already sorted, deduped, and restricted
-                // to `[column.min_value(), column.max_value()]`.
-                bitset_from_postings_scorer(
-                    reader,
-                    self.field,
-                    pruned_terms_bytes,
-                    boost,
-                    self.bitmap_enabled,
-                )
-            }
-            TermSetStrategy::LinearScan | TermSetStrategy::BitsetFromPostings => {
-                let term_set: FxHashSet<u64> = pruned_values.iter().copied().collect();
-                let docset = if candidate_size.is_some() {
-                    TermSetDocSet::new_unpositioned(column, term_set)
-                } else {
-                    TermSetDocSet::new(column, term_set)
-                };
-                Ok(Box::new(ConstScorer::new(docset, boost)))
-            }
-            TermSetStrategy::Automaton => {
-                // Planner shouldn't emit Automaton when fast_available=true.
-                // Belt-and-suspenders: route to AutomatonWeight as a
-                // graceful fallback rather than panicking, in case future
-                // planner changes loosen this invariant.
-                self.automaton_scorer(reader, boost)
-            }
+        StrategyChoice::LinearScan | StrategyChoice::BitsetFromPostings => {
+            let membership = make_membership();
+            let docset = if candidate_size.is_some() {
+                TermSetDocSet::new_unpositioned(column, membership)
+            } else {
+                TermSetDocSet::new(column, membership)
+            };
+            Ok(Box::new(ConstScorer::new(docset, boost)))
         }
     }
+}
 
-    /// Non-fast indexed dispatch path. Used for:
-    ///   - fields with FAST set but the value type isn't supported for FF (today: none — see
-    ///     `type_supported_for_fast_field`),
-    ///   - numeric fields without FAST,
-    ///   - text / string / json fields (always non-fast for FF purposes).
-    ///
-    /// Decision is a simple K/max_doc density gate against the
-    /// `bitset_max_density_multi` threshold. We don't have a
-    /// `Column<u64>` so we can't run `sorted_range_in_column` pruning —
-    /// `K' = K` here. `D` is approximated as ≥2 (typical for non-fast
-    /// text columns); the user can override via
-    /// `bitset_max_density_unique` if their column is unique-valued
-    /// indexed-only.
-    fn dispatch_non_fast(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-    ) -> crate::Result<Box<dyn Scorer>> {
-        let n = reader.max_doc() as u64;
-        if n == 0 {
-            self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
-        }
-        if !self.is_indexed {
-            // FAST-only field whose value type isn't supported by FF
-            // strategies and has no inverted index — neither Bitset nor
-            // Automaton can build. Return `EmptyScorer` silently rather
-            // than erroring, matching the rest of the dispatch surface
-            // which prefers to drop unscorable cells over surfacing a
-            // hard schema error mid-query.
-            self.record_strategy_tag(StrategyTag::Empty);
-            return Ok(Box::new(EmptyScorer));
-        }
-
-        let k = self.terms_bytes.len() as u64;
-        let density = (k as f64) / (n as f64);
-        // Non-fast indexed fields are overwhelmingly text/string in
-        // practice — the multi-value threshold applies. Numeric-non-fast
-        // (unusual) lands on the same threshold by default.
-        if density <= self.strategy_config.bitset_max_density_multi {
-            self.record_strategy_tag(StrategyTag::Bitset);
-            bitset_from_postings_scorer(
-                reader,
-                self.field,
-                &self.terms_bytes,
-                boost,
-                self.bitmap_enabled,
-            )
-        } else {
-            self.record_strategy_tag(StrategyTag::Automaton);
-            self.automaton_scorer(reader, boost)
-        }
+fn term_bound_bytes(bound: &Bound<Term>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(t) => Bound::Included(t.serialized_value_bytes()),
+        Bound::Excluded(t) => Bound::Excluded(t.serialized_value_bytes()),
+        Bound::Unbounded => Bound::Unbounded,
     }
+}
+
+fn numeric_column_type_for_field(field_type: &FieldType) -> Option<ColumnType> {
+    match field_type {
+        FieldType::U64(_) => Some(ColumnType::U64),
+        FieldType::I64(_) => Some(ColumnType::I64),
+        FieldType::F64(_) => Some(ColumnType::F64),
+        FieldType::Bool(_) => Some(ColumnType::Bool),
+        FieldType::Date(_) => Some(ColumnType::DateTime),
+        _ => None,
+    }
+}
+
+fn intersect_u64_bounds(
+    bounds: &BoundsRange<Term>,
+    column: &Column<u64>,
+) -> Option<RangeInclusive<u64>> {
+    let mut lo = column.min_value();
+    let mut hi = column.max_value();
+    if lo > hi {
+        return None;
+    }
+    match &bounds.lower_bound {
+        Bound::Included(t) => {
+            if let Some(v) = t.value().as_u64_lenient() {
+                lo = lo.max(v);
+            }
+        }
+        Bound::Excluded(t) => {
+            if let Some(v) = t.value().as_u64_lenient() {
+                lo = lo.max(v.checked_add(1)?);
+            }
+        }
+        Bound::Unbounded => {}
+    }
+    match &bounds.upper_bound {
+        Bound::Included(t) => {
+            if let Some(v) = t.value().as_u64_lenient() {
+                hi = hi.min(v);
+            }
+        }
+        Bound::Excluded(t) => {
+            if let Some(v) = t.value().as_u64_lenient() {
+                hi = hi.min(v.checked_sub(1)?);
+            }
+        }
+        Bound::Unbounded => {}
+    }
+    (lo <= hi).then_some(lo..=hi)
+}
+
+fn matched_ords_iter(bitset: &BitSet) -> impl Iterator<Item = u32> + '_ {
+    let num_buckets = bitset.max_value().div_ceil(64);
+    (0..num_buckets).flat_map(move |bucket| {
+        let base = bucket * 64;
+        bitset
+            .tinyset(bucket)
+            .into_iter()
+            .map(move |bit| base + bit)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -623,25 +1087,16 @@ impl Automaton for SetDfaWrapper {
     type State = Option<CompiledAddr>;
 
     fn start(&self) -> Option<CompiledAddr> {
-        // `self.0` is `Arc<Map<Vec<u8>>>`; `(*self.0).as_ref()` reaches
-        // the inner `Fst` via `Map::as_ref` (not `Arc::as_ref`, which
-        // would only yield `&Map`).
         Some((*self.0).as_ref().root().addr())
     }
 
     fn is_match(&self, state_opt: &Option<CompiledAddr>) -> bool {
-        if let Some(state) = state_opt {
-            (*self.0).as_ref().node(*state).is_final()
-        } else {
-            false
-        }
+        state_opt.is_some_and(|state| (*self.0).as_ref().node(state).is_final())
     }
 
     fn accept(&self, state_opt: &Option<CompiledAddr>, byte: u8) -> Option<CompiledAddr> {
-        let state = state_opt.as_ref()?;
-        let node = (*self.0).as_ref().node(*state);
-        let transition = node.find_input(byte)?;
-        Some(node.transition_addr(transition))
+        let node = (*self.0).as_ref().node((*state_opt)?);
+        Some(node.transition_addr(node.find_input(byte)?))
     }
 
     fn can_match(&self, state: &Self::State) -> bool {
@@ -651,22 +1106,53 @@ impl Automaton for SetDfaWrapper {
 
 // ---------------------------------------------------------------------------
 // TermSetDocSet — fast-field linear scan over a `Column<T>` filtered by an
-// in-memory `FxHashSet<T>` of accepted values
+// in-memory membership structure (`FxHashSet<T>` or ordinal `Arc<BitSet>`)
 // ---------------------------------------------------------------------------
 
+pub(crate) trait ValueMembership<T>: Clone + Send + Sync + 'static {
+    fn is_empty(&self) -> bool;
+    fn contains(&self, value: T) -> bool;
+}
+
+impl<T: Copy + Eq + std::hash::Hash + Send + Sync + 'static> ValueMembership<T> for FxHashSet<T> {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        FxHashSet::is_empty(self)
+    }
+
+    #[inline]
+    fn contains(&self, value: T) -> bool {
+        FxHashSet::contains(self, &value)
+    }
+}
+
+impl ValueMembership<u64> for Arc<BitSet> {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn contains(&self, value: u64) -> bool {
+        u32::try_from(value)
+            .ok()
+            .is_some_and(|ord| ord < self.max_value() && BitSet::contains(self, ord))
+    }
+}
+
 #[derive(Clone)]
-pub(crate) struct TermSetDocSet<T: Copy + Eq + std::hash::Hash> {
+pub(crate) struct TermSetDocSet<T: Copy, S: ValueMembership<T> = FxHashSet<T>> {
     column: Column<T>,
-    values: FxHashSet<T>,
+    values: S,
     doc_id: DocId,
     max_doc: DocId,
     positioned: bool,
 }
 
-impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static>
-    TermSetDocSet<T>
+impl<T: Copy + PartialOrd + std::fmt::Debug + Send + Sync + 'static, S: ValueMembership<T>>
+    TermSetDocSet<T, S>
 {
-    pub fn new(column: Column<T>, values: FxHashSet<T>) -> Self {
+    pub fn new(column: Column<T>, values: S) -> Self {
         let mut doc_set = Self::new_unpositioned(column, values);
         if doc_set.doc_id != TERMINATED {
             doc_set.seek(0);
@@ -674,9 +1160,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
         doc_set
     }
 
-    /// Creates a `TermSetDocSet` for candidate probing (`seek_danger` / `seek`)
-    /// without eagerly scanning the column from `doc_id = 0` to the first match.
-    pub fn new_unpositioned(column: Column<T>, values: FxHashSet<T>) -> Self {
+    pub fn new_unpositioned(column: Column<T>, values: S) -> Self {
         let max_doc = column.num_docs();
         let doc_id = if max_doc == 0 || values.is_empty() {
             TERMINATED
@@ -693,14 +1177,78 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     }
 }
 
+impl<T: Copy + PartialOrd + std::fmt::Debug + Send + Sync + 'static, S: ValueMembership<T>> DocSet
+    for TermSetDocSet<T, S>
+{
+    fn advance(&mut self) -> DocId {
+        debug_assert!(self.positioned);
+        if self.doc_id == TERMINATED {
+            return TERMINATED;
+        }
+        self.seek(self.doc_id + 1)
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        debug_assert!(target >= self.doc_id || self.doc_id == TERMINATED);
+        self.positioned = true;
+        if target >= self.max_doc {
+            self.doc_id = TERMINATED;
+            return TERMINATED;
+        }
+        for next_doc_id in target..self.max_doc {
+            if self
+                .column
+                .values_for_doc(next_doc_id)
+                .any(|v| self.values.contains(v))
+            {
+                self.doc_id = next_doc_id;
+                return next_doc_id;
+            }
+        }
+        self.doc_id = TERMINATED;
+        TERMINATED
+    }
+
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        if target >= self.max_doc {
+            self.doc_id = TERMINATED;
+            self.positioned = true;
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
+        }
+        self.positioned = self
+            .column
+            .values_for_doc(target)
+            .any(|value| self.values.contains(value));
+        if self.positioned {
+            self.doc_id = target;
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
+        }
+    }
+
+    fn doc(&self) -> DocId {
+        self.doc_id
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.max_doc.saturating_sub(self.doc_id.saturating_add(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
 
-    use super::FastFieldTermSetQuery;
+    use super::{StrategyTag, TermSetDocSet, TermSetStrategyConfig};
     use crate::collector::{Count, TopDocs};
-    use crate::query::QueryParser;
+    use crate::query::{
+        BooleanQuery, CandidateHint, ConstScoreQuery, EnableScoring, FastFieldTermSetQuery, Query,
+        QueryParser, TermSetQuery,
+    };
     use crate::schema::{IntoIpv6Addr, Schema, FAST, INDEXED, STRING, TEXT};
     use crate::{DocSet, Index, IndexWriter, Term, TERMINATED};
 
@@ -711,8 +1259,7 @@ mod tests {
         let u64_field_fast = schema_builder.add_u64_field("u64_fast", FAST | INDEXED);
         let ip_field_fast = schema_builder.add_ip_addr_field("ip_fast", FAST | INDEXED);
         let bool_field_fast = schema_builder.add_bool_field("bool_fast", FAST | INDEXED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
+        let index = Index::create_in_ram(schema_builder.build());
         {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.add_document(doc!(
@@ -742,199 +1289,140 @@ mod tests {
     }
 
     #[test]
-    pub fn test_term_set_query_fast_field_u64() -> crate::Result<()> {
+    pub fn test_term_set_query_fast_fields_and_parser() -> crate::Result<()> {
         let index = create_test_index()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
-        let u64_field_fast = index.schema().get_field("u64_fast").unwrap();
-        let query = FastFieldTermSetQuery::new(vec![
-            Term::from_field_u64(u64_field_fast, 1),
-            Term::from_field_u64(u64_field_fast, 3),
-        ]);
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        Ok(())
-    }
+        let schema = index.schema();
+        let u64_field = schema.get_field("u64_fast").unwrap();
+        let text_field = schema.get_field("text_fast").unwrap();
+        let ip_field = schema.get_field("ip_fast").unwrap();
 
-    /// String fields (STRING | FAST) dispatch through `TermSetWeight`'s
-    /// inverted-index path, which routes to `BitsetFromPostings` or
-    /// `Automaton` depending on K. Pins the contract that string-field
-    /// term sets are scorable.
-    #[test]
-    pub fn test_term_set_query_fast_field_string() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let text_field_fast = index.schema().get_field("text_fast").unwrap();
-        let query = FastFieldTermSetQuery::new(vec![
-            Term::from_field_text(text_field_fast, "doc1"),
-            Term::from_field_text(text_field_fast, "doc3"),
-        ]);
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        Ok(())
-    }
+        assert_eq!(
+            searcher.search(
+                &FastFieldTermSetQuery::new([
+                    Term::from_field_u64(u64_field, 1),
+                    Term::from_field_u64(u64_field, 3),
+                ]),
+                &Count
+            )?,
+            2
+        );
+        assert_eq!(
+            searcher.search(
+                &FastFieldTermSetQuery::new([
+                    Term::from_field_u64(u64_field, 4),
+                    Term::from_field_u64(u64_field, 5),
+                ]),
+                &Count
+            )?,
+            0
+        );
+        assert_eq!(
+            searcher.search(&FastFieldTermSetQuery::new(Vec::<Term>::new()), &Count)?,
+            0
+        );
+        assert_eq!(
+            searcher.search(
+                &FastFieldTermSetQuery::new([
+                    Term::from_field_text(text_field, "doc1"),
+                    Term::from_field_text(text_field, "doc3"),
+                ]),
+                &Count
+            )?,
+            2
+        );
+        assert_eq!(
+            searcher.search(
+                &FastFieldTermSetQuery::new([
+                    Term::from_field_ip_addr(
+                        ip_field,
+                        IpAddr::from_str("127.0.0.1").unwrap().into_ipv6_addr(),
+                    ),
+                    Term::from_field_ip_addr(
+                        ip_field,
+                        IpAddr::from_str("127.0.0.3").unwrap().into_ipv6_addr(),
+                    ),
+                ]),
+                &Count
+            )?,
+            2
+        );
 
-    #[test]
-    pub fn test_term_set_query_fast_field_ip() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let ip_field_fast = index.schema().get_field("ip_fast").unwrap();
-        let query = FastFieldTermSetQuery::new(vec![
-            Term::from_field_ip_addr(
-                ip_field_fast,
-                IpAddr::from_str("127.0.0.1").unwrap().into_ipv6_addr(),
-            ),
-            Term::from_field_ip_addr(
-                ip_field_fast,
-                IpAddr::from_str("127.0.0.3").unwrap().into_ipv6_addr(),
-            ),
-        ]);
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_term_set_query_fast_field_no_match() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let u64_field_fast = index.schema().get_field("u64_fast").unwrap();
-        let query = FastFieldTermSetQuery::new(vec![
-            Term::from_field_u64(u64_field_fast, 4),
-            Term::from_field_u64(u64_field_fast, 5),
-        ]);
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 0);
-        Ok(())
-    }
-
-    /// An `AND` over an empty `TermSetDocSet` used to underflow inside
-    /// `size_hint` because `intersect_scorers` sorts sub-scorers by
-    /// `cost()`, and the docset's `doc_id` had already been parked on
-    /// `TERMINATED` (`u32::MAX`) by `advance()`. IP fields always route
-    /// to `TermSetDocSet` (no Gallop/Bitset/Automaton dispatch), so an
-    /// IP intersection is the easiest deterministic trigger.
-    #[test]
-    pub fn test_term_set_query_size_hint_no_match_in_intersection() -> crate::Result<()> {
-        use crate::query::BooleanQuery;
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let ip_field_fast = index.schema().get_field("ip_fast").unwrap();
-        let no_match: Box<dyn crate::query::Query> =
-            Box::new(FastFieldTermSetQuery::new(vec![Term::from_field_ip_addr(
-                ip_field_fast,
+        // Empty IP `TermSetDocSet` inside `BooleanQuery::intersection` does not underflow
+        // `size_hint`.
+        let intersection = BooleanQuery::intersection(vec![
+            Box::new(FastFieldTermSetQuery::new([Term::from_field_ip_addr(
+                ip_field,
                 IpAddr::from_str("10.0.0.1").unwrap().into_ipv6_addr(),
-            )]));
-        let some_match: Box<dyn crate::query::Query> =
-            Box::new(FastFieldTermSetQuery::new(vec![Term::from_field_ip_addr(
-                ip_field_fast,
+            )])),
+            Box::new(FastFieldTermSetQuery::new([Term::from_field_ip_addr(
+                ip_field,
                 IpAddr::from_str("127.0.0.1").unwrap().into_ipv6_addr(),
-            )]));
-        let intersection = BooleanQuery::intersection(vec![no_match, some_match]);
-        let count = searcher.search(&intersection, &Count)?;
-        assert_eq!(count, 0);
-        Ok(())
-    }
+            )])),
+        ]);
+        assert_eq!(searcher.search(&intersection, &Count)?, 0);
 
-    #[test]
-    pub fn test_term_set_query_fast_field_empty() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let query = FastFieldTermSetQuery::new(Vec::<Term>::new());
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 0);
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_term_set_query_parser_fast_field() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let query_parser = QueryParser::for_index(&index, vec![]);
-        let query = query_parser.parse_query("u64_fast: IN [1 3]")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        let query = query_parser.parse_query("text_fast: IN [doc1 doc3]")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        let query = query_parser.parse_query("ip_fast: IN [127.0.0.1 127.0.0.3]")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        let query = query_parser.parse_query("bool_fast: IN [true]")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-        Ok(())
-    }
-
-    fn create_test_index_with_missing_values() -> crate::Result<Index> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let u64_field_fast = schema_builder.add_u64_field("u64_fast", FAST | INDEXED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(u64_field_fast => 1u64))?;
-            index_writer.add_document(doc!(text_field => "doc2"))?;
-            index_writer.add_document(doc!(u64_field_fast => 3u64))?;
-            index_writer.commit()?;
+        let qp = QueryParser::for_index(&index, vec![]);
+        for (q, expected) in [
+            ("u64_fast: IN [1 3]", 2),
+            ("text_fast: IN [doc1 doc3]", 2),
+            ("ip_fast: IN [127.0.0.1 127.0.0.3]", 2),
+            ("bool_fast: IN [true]", 2),
+        ] {
+            assert_eq!(searcher.search(&qp.parse_query(q)?, &Count)?, expected);
         }
-        Ok(index)
-    }
-
-    #[test]
-    pub fn test_term_set_query_fast_field_missing_value() -> crate::Result<()> {
-        let index = create_test_index_with_missing_values()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let u64_field_fast = index.schema().get_field("u64_fast").unwrap();
-        let query = FastFieldTermSetQuery::new(vec![Term::from_field_u64(u64_field_fast, 0)]);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
-        assert_eq!(top_docs.len(), 0);
-        let query = FastFieldTermSetQuery::new(vec![Term::from_field_u64(u64_field_fast, 1)]);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
-        assert_eq!(top_docs.len(), 1);
-        let (_, doc_address) = top_docs[0];
-        assert_eq!(doc_address.doc_id, 0);
         Ok(())
     }
 
     #[test]
-    pub fn test_term_set_doc_set_seek_danger() -> crate::Result<()> {
-        let index = create_test_index()?;
+    pub fn test_term_set_query_fast_field_missing_value_and_seek_danger() -> crate::Result<()> {
+        let mut sb = Schema::builder();
+        let text_field = sb.add_text_field("text", TEXT);
+        let u64_field = sb.add_u64_field("u64_fast", FAST | INDEXED);
+        let index = Index::create_in_ram(sb.build());
+        {
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(u64_field => 1u64))?;
+            writer.add_document(doc!(text_field => "doc2"))?;
+            writer.add_document(doc!(u64_field => 3u64))?;
+            writer.commit()?;
+        }
         let reader = index.reader()?;
         let searcher = reader.searcher();
-        let segment_reader = searcher.segment_reader(0);
-        let column: columnar::Column<u64> = segment_reader.fast_fields().u64("u64_fast")?;
+        assert!(searcher
+            .search(
+                &FastFieldTermSetQuery::new([Term::from_field_u64(u64_field, 0)]),
+                &TopDocs::with_limit(10).order_by_score()
+            )?
+            .is_empty());
+        let top_docs = searcher.search(
+            &FastFieldTermSetQuery::new([Term::from_field_u64(u64_field, 1)]),
+            &TopDocs::with_limit(10).order_by_score(),
+        )?;
+        assert_eq!(top_docs.len(), 1);
+        assert_eq!(top_docs[0].1.doc_id, 0);
 
-        // In create_test_index, docs have u64_fast values: doc 0 -> 1, doc 1 -> 2, doc 2 -> 3
+        let full_idx = create_test_index()?;
+        let full_reader = full_idx.reader()?;
+        let seg_reader = full_reader.searcher().segment_reader(0).clone();
+        let column: columnar::Column<u64> = seg_reader.fast_fields().u64("u64_fast")?;
         let mut values = rustc_hash::FxHashSet::default();
-        values.insert(2u64); // only matches doc 1
-        let mut docset = super::TermSetDocSet::new(column, values);
-
-        // doc 0 does not match: returns SeekLowerBound(1) without scanning
+        values.insert(2u64);
+        let mut docset = TermSetDocSet::new(column, values);
         assert_eq!(
             docset.seek_danger(0),
             crate::docset::SeekDangerResult::SeekLowerBound(1)
         );
-        // doc 1 matches: returns Found
         assert_eq!(
             docset.seek_danger(1),
             crate::docset::SeekDangerResult::Found
         );
         assert_eq!(docset.doc(), 1);
-        // doc 2 does not match: returns SeekLowerBound(3)
         assert_eq!(
             docset.seek_danger(2),
             crate::docset::SeekDangerResult::SeekLowerBound(3)
         );
-        // past max_doc (3 docs in segment): returns SeekLowerBound(TERMINATED)
         assert_eq!(
             docset.seek_danger(10),
             crate::docset::SeekDangerResult::SeekLowerBound(TERMINATED)
@@ -945,38 +1433,31 @@ mod tests {
 
     #[test]
     pub fn test_scorer_for_candidates_and_range_pruning() -> crate::Result<()> {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        use std::sync::Arc;
-
-        use super::{StrategyTag, TermSetStrategyConfig};
-        use crate::query::{ConstScoreQuery, EnableScoring, Query, TermSetQuery};
-
         let index = create_test_index()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let u64_field_fast = index.schema().get_field("u64_fast").unwrap();
 
-        // Segment has values 1, 2, 3. Query with out-of-range terms (0, 100) + in-range term (2).
         let sink = Arc::new(AtomicU8::new(0));
-        let cfg = TermSetStrategyConfig {
-            strategy_sink: Some(sink.clone()),
-            ..TermSetStrategyConfig::default()
-        };
         let query = ConstScoreQuery::new(
-            TermSetQuery::new(vec![
+            TermSetQuery::new([
                 Term::from_field_u64(u64_field_fast, 100),
                 Term::from_field_u64(u64_field_fast, 0),
                 Term::from_field_u64(u64_field_fast, 2),
             ])
-            .with_strategy_config(cfg),
+            .with_strategy_config(TermSetStrategyConfig {
+                strategy_sink: Some(sink.clone()),
+                ..Default::default()
+            }),
             0.0,
         );
         let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-
-        // With candidate_size = 1 (< n = 3), K' = 1 => K'*D/C = 1.0 > 1/2000 => LinearScan
-        // (unpositioned).
-        let mut scorer = weight.scorer_for_candidates_unpositioned(segment_reader, 1.0, 1)?;
+        let mut scorer = weight.scorer_for_candidates_unpositioned(
+            segment_reader,
+            1.0,
+            CandidateHint::Estimated(1),
+        )?;
         assert_eq!(sink.load(Ordering::Relaxed), StrategyTag::Linear as u8);
         assert_eq!(scorer.doc(), 0);
         assert_eq!(
@@ -992,85 +1473,23 @@ mod tests {
             crate::docset::SeekDangerResult::SeekLowerBound(3)
         );
 
-        // All terms outside [1, 3] should short-circuit to EmptyScorer.
         let empty_sink = Arc::new(AtomicU8::new(0));
-        let empty_cfg = TermSetStrategyConfig {
-            strategy_sink: Some(empty_sink.clone()),
-            ..TermSetStrategyConfig::default()
-        };
-        let empty_query = TermSetQuery::new(vec![
+        let empty_weight = TermSetQuery::new([
             Term::from_field_u64(u64_field_fast, 0),
             Term::from_field_u64(u64_field_fast, 10),
         ])
-        .with_strategy_config(empty_cfg);
-        let empty_weight = empty_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let empty_scorer =
-            empty_weight.scorer_for_candidates_unpositioned(segment_reader, 1.0, 1)?;
+        .with_strategy_config(TermSetStrategyConfig {
+            strategy_sink: Some(empty_sink.clone()),
+            ..Default::default()
+        })
+        .weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let empty_scorer = empty_weight.scorer_for_candidates_unpositioned(
+            segment_reader,
+            1.0,
+            CandidateHint::Estimated(1),
+        )?;
         assert_eq!(empty_sink.load(Ordering::Relaxed), StrategyTag::Empty as u8);
         assert_eq!(empty_scorer.doc(), TERMINATED);
         Ok(())
-    }
-}
-
-impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static> DocSet
-    for TermSetDocSet<T>
-{
-    fn advance(&mut self) -> DocId {
-        debug_assert!(self.positioned);
-        if self.doc_id == TERMINATED {
-            return TERMINATED;
-        }
-        self.seek(self.doc_id + 1)
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(target >= self.doc_id || self.doc_id == TERMINATED);
-        self.positioned = true;
-        if target >= self.max_doc {
-            self.doc_id = TERMINATED;
-            return TERMINATED;
-        }
-        let mut next_doc_id = target;
-        while next_doc_id < self.max_doc {
-            for value in self.column.values_for_doc(next_doc_id) {
-                if self.values.contains(&value) {
-                    self.doc_id = next_doc_id;
-                    return next_doc_id;
-                }
-            }
-            next_doc_id += 1;
-        }
-        self.doc_id = TERMINATED;
-        TERMINATED
-    }
-
-    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        if target >= self.max_doc {
-            self.doc_id = TERMINATED;
-            self.positioned = true;
-            return SeekDangerResult::SeekLowerBound(TERMINATED);
-        }
-        self.positioned = self
-            .column
-            .values_for_doc(target)
-            .any(|value| self.values.contains(&value));
-        if self.positioned {
-            self.doc_id = target;
-            SeekDangerResult::Found
-        } else {
-            SeekDangerResult::SeekLowerBound(target + 1)
-        }
-    }
-
-    fn doc(&self) -> DocId {
-        self.doc_id
-    }
-
-    fn size_hint(&self) -> u32 {
-        // `advance()` parks `doc_id` on `TERMINATED` (`u32::MAX`) once it
-        // exhausts the column. The plain subtraction here used to underflow
-        // because `TERMINATED.saturating_add(1)` is still `u32::MAX`, and
-        // `cost()` reaches for this hint while sorting `intersect_scorers`.
-        self.max_doc.saturating_sub(self.doc_id.saturating_add(1))
     }
 }

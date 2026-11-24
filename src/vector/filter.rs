@@ -7,7 +7,9 @@ use itertools::Either;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
-use crate::query::{for_each_docset_buffered, AllScorer, ExcludedDocSet, ExclusionSet, Weight};
+use crate::query::{
+    for_each_docset_buffered, AllScorer, CandidateHint, ExcludedDocSet, ExclusionSet, Weight,
+};
 use crate::schema::Field;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
@@ -243,7 +245,7 @@ impl VectorFilterStrategy {
         let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
             segment,
             1.0,
-            candidates.len() as u32,
+            CandidateHint::Estimated(candidates.len() as u32),
         )?);
         candidates.retain(|&(doc, _)| scorer.contains(doc));
         Ok(())
@@ -280,7 +282,11 @@ impl VectorFilterStrategy {
         ) && matches!(filter, DocFilter::Shortlist)
         {
             Some(ExcludedDocSet::new(
-                weight.scorer_for_candidates_unpositioned(segment, 1.0, segment.max_doc())?,
+                weight.scorer_for_candidates_unpositioned(
+                    segment,
+                    1.0,
+                    CandidateHint::Estimated(segment.max_doc()),
+                )?,
             ))
         } else {
             None
@@ -369,7 +375,7 @@ impl VectorFilterStrategy {
             let mut scorer = ExcludedDocSet::new(weight.scorer_for_candidates_unpositioned(
                 segment,
                 1.0,
-                candidate_count as u32,
+                CandidateHint::Estimated(candidate_count as u32),
             )?);
             let mut bucket = docs.first_non_empty_bucket(0);
             while let Some(current_bucket) = bucket {
@@ -571,8 +577,11 @@ mod tests {
             &self,
             _: &SegmentReader,
             boost: Score,
-            candidate_size: u32,
+            candidate_hint: CandidateHint,
         ) -> Result<Box<dyn Scorer>> {
+            let CandidateHint::Estimated(candidate_size) = candidate_hint else {
+                panic!("vector filter must pass CandidateHint::Estimated");
+            };
             self.sizes.lock().unwrap().push(candidate_size);
             Ok(Box::new(ConstScorer::new(
                 ProbeDocs {

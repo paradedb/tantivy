@@ -16,14 +16,14 @@ use crate::query::synonym_query::SynonymScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer,
+    intersect_scorers as intersect_scored_scorers, AllScorer, BufferedUnionScorer, CandidateHint,
     DisjunctionPruning, EmptyScorer, Exclude, ExcludedDocSet, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
 fn intersect_scorers(
-    scorers: Vec<Box<dyn Scorer>>,
+    mut scorers: Vec<Box<dyn Scorer>>,
     num_docs: u32,
     scoring_enabled: bool,
     bitmap_enabled: bool,
@@ -44,6 +44,11 @@ fn intersect_scorers(
                 })
         })
     {
+        for scorer in &mut scorers {
+            if scorer.doc() == 0 && scorer.seek(0) == TERMINATED {
+                return Box::new(EmptyScorer);
+            }
+        }
         Box::new(BitmapCombination::new(
             scorers,
             BitmapOperation::Intersection,
@@ -177,15 +182,25 @@ where
     )))
 }
 
+fn is_freq_term_scorer(scorer: &dyn Scorer) -> bool {
+    scorer
+        .downcast_ref::<TermScorer>()
+        .is_some_and(|scorer| scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
+}
+
+fn is_block_max_scorer(scorer: &dyn Scorer) -> bool {
+    is_freq_term_scorer(scorer)
+        || scorer
+            .downcast_ref::<SynonymScorer>()
+            .is_some_and(|scorer| scorer.reads_freqs())
+}
+
 /// Block-WAND needs a term or synonym scorer that reads frequencies. `Err` returns any other
 /// scorer unchanged.
 fn try_into_block_max_scorer(
     scorer: Box<dyn Scorer>,
 ) -> Result<Box<dyn BlockMaxScorer>, Box<dyn Scorer>> {
-    if scorer
-        .downcast_ref::<TermScorer>()
-        .is_some_and(|scorer| scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
-    {
+    if is_freq_term_scorer(scorer.as_ref()) {
         let scorer = scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap();
         return Ok(scorer as Box<dyn BlockMaxScorer>);
     }
@@ -359,6 +374,12 @@ fn effective_should_scorer_for_union<TScoreCombiner: ScoreCombiner>(
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ExecutionMode {
+    Exhaustive,
+    Pruning,
+}
+
 enum ShouldScorersCombinationMethod {
     // Should scorers are irrelevant.
     Ignored,
@@ -432,19 +453,179 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         }
     }
 
+    /// Returns true when the non-deferred clauses will enter a filtered Block-WAND /
+    /// Block-MaxScore scorer (`FilteredTermUnion`, `FilteredBlockMaxUnion`, or
+    /// `FilteredTermIntersection`) under `ExecutionMode::Pruning`, so deferred fast-field
+    /// `Occur::Must` clauses should be constructed lazily with `CandidateHint::Pruned`.
+    ///
+    /// Queries without frequency-bearing WAND drivers (for example `AllQuery AND
+    /// TermPredicateQuery`), with active `Occur::MustNot` exclusions, or with non-constant-score
+    /// auxiliary filters return `false` so exhaustive postings/bitset strategies are preserved.
+    fn can_wand_prune_deferred_musts(
+        &self,
+        per_occur_scorers: &HashMap<Occur, Vec<Box<dyn Scorer>>>,
+        execution_mode: ExecutionMode,
+    ) -> bool {
+        if execution_mode != ExecutionMode::Pruning || !self.scoring_enabled {
+            return false;
+        }
+        let has_active_exclude = per_occur_scorers
+            .get(&Occur::MustNot)
+            .is_some_and(|scorers| scorers.iter().any(|s| !s.is::<EmptyScorer>()));
+        if has_active_exclude {
+            return false;
+        }
+        let musts: &[Box<dyn Scorer>] = per_occur_scorers
+            .get(&Occur::Must)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let non_empty_shoulds: Vec<&Box<dyn Scorer>> = per_occur_scorers
+            .get(&Occur::Should)
+            .map(|scorers| scorers.iter().filter(|s| !s.is::<EmptyScorer>()).collect())
+            .unwrap_or_default();
+
+        if self.minimum_number_should_match == 1 && !non_empty_shoulds.is_empty() {
+            TScoreCombiner::SUPPORTS_BLOCK_WAND
+                && non_empty_shoulds
+                    .iter()
+                    .all(|s| is_block_max_scorer(s.as_ref()))
+                && musts.iter().all(|s| s.constant_score().is_some())
+        } else if non_empty_shoulds.is_empty()
+            || (self.minimum_number_should_match >= 1
+                && self.minimum_number_should_match == non_empty_shoulds.len())
+        {
+            let mut freq_term_count = 0usize;
+            for s in musts.iter().chain(non_empty_shoulds.iter().copied()) {
+                if is_freq_term_scorer(s.as_ref()) {
+                    freq_term_count += 1;
+                } else if s.constant_score().is_none() {
+                    return false;
+                }
+            }
+            freq_term_count >= 2 || (freq_term_count == 1 && TScoreCombiner::SUPPORTS_BLOCK_WAND)
+        } else {
+            false
+        }
+    }
+
     fn per_occur_scorers(
         &self,
         reader: &SegmentReader,
         boost: Score,
+        execution_mode: ExecutionMode,
     ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
         let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
+        let mut deferred_fast_musts: Vec<&dyn Weight> = Vec::new();
+
         for (occur, subweight) in &self.weights {
+            if *occur == Occur::Must && subweight.uses_fast_fields() {
+                deferred_fast_musts.push(subweight.as_ref());
+                continue;
+            }
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
+            if *occur == Occur::Must && sub_scorer.is::<EmptyScorer>() {
+                per_occur_scorers
+                    .entry(Occur::Must)
+                    .or_default()
+                    .push(sub_scorer);
+                return Ok(per_occur_scorers);
+            }
             per_occur_scorers
                 .entry(*occur)
                 .or_default()
                 .push(sub_scorer);
         }
+
+        if !deferred_fast_musts.is_empty() {
+            let num_docs = reader.num_docs();
+            let max_doc = reader.max_doc();
+            let max_driver_cost = (f64::from(max_doc) * 0.8) as u64;
+
+            let mut candidate_bound: Option<u32> = None;
+            let mut min_driver_cost: Option<u64> = None;
+
+            if let Some(musts) = per_occur_scorers.get(&Occur::Must) {
+                let mut hints = Vec::with_capacity(musts.len());
+                for s in musts {
+                    if !self.scoring_enabled && s.is::<AllScorer>() {
+                        continue;
+                    }
+                    hints.push(s.size_hint());
+                    let c = s.cost();
+                    min_driver_cost = Some(min_driver_cost.map_or(c, |prev| prev.min(c)));
+                }
+                if !hints.is_empty() {
+                    candidate_bound = Some(crate::query::size_hint::estimate_intersection(
+                        hints.into_iter(),
+                        num_docs,
+                    ));
+                }
+            }
+
+            if self.minimum_number_should_match >= 1 {
+                if let Some(shoulds) = per_occur_scorers.get(&Occur::Should) {
+                    let has_removed_all =
+                        !self.scoring_enabled && shoulds.iter().any(|s| s.is::<AllScorer>());
+                    if !has_removed_all {
+                        let non_empty: Vec<&Box<dyn Scorer>> =
+                            shoulds.iter().filter(|s| !s.is::<EmptyScorer>()).collect();
+                        if non_empty.len() < self.minimum_number_should_match {
+                            // Required SHOULD cannot be satisfied; complex_scorer will
+                            // short-circuit.
+                            return Ok(per_occur_scorers);
+                        }
+                        let union_hint = non_empty
+                            .iter()
+                            .map(|s| u64::from(s.size_hint()))
+                            .sum::<u64>()
+                            .min(u64::from(max_doc))
+                            as u32;
+                        let union_cost: u64 = non_empty
+                            .iter()
+                            .map(|s| s.cost())
+                            .fold(0u64, u64::saturating_add);
+                        candidate_bound =
+                            Some(candidate_bound.map_or(union_hint, |prev| prev.min(union_hint)));
+                        min_driver_cost =
+                            Some(min_driver_cost.map_or(union_cost, |prev| prev.min(union_cost)));
+                    }
+                } else {
+                    return Ok(per_occur_scorers);
+                }
+            }
+
+            let candidate_hint =
+                if self.can_wand_prune_deferred_musts(&per_occur_scorers, execution_mode) {
+                    Some(CandidateHint::Pruned {
+                        upper_bound: candidate_bound.unwrap_or(num_docs).max(1),
+                    })
+                } else {
+                    match (candidate_bound, min_driver_cost) {
+                        (Some(c), Some(cost))
+                            if c.saturating_mul(32) < num_docs && cost < max_driver_cost =>
+                        {
+                            Some(CandidateHint::Estimated(c.max(1)))
+                        }
+                        _ => None,
+                    }
+                };
+
+            let must_entry = per_occur_scorers.entry(Occur::Must).or_default();
+            for subweight in deferred_fast_musts {
+                let sub_scorer = match candidate_hint {
+                    Some(hint) => {
+                        subweight.scorer_for_candidates_unpositioned(reader, boost, hint)?
+                    }
+                    None => subweight.scorer(reader, boost)?,
+                };
+                let is_empty = sub_scorer.is::<EmptyScorer>();
+                must_entry.push(sub_scorer);
+                if is_empty {
+                    return Ok(per_occur_scorers);
+                }
+            }
+        }
+
         Ok(per_occur_scorers)
     }
 
@@ -453,9 +634,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         reader: &SegmentReader,
         boost: Score,
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
+        execution_mode: ExecutionMode,
     ) -> crate::Result<SpecializedScorer> {
         let num_docs = reader.num_docs();
-        let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
+        let mut per_occur_scorers = self.per_occur_scorers(reader, boost, execution_mode)?;
 
         // Indicate how should clauses are combined with must clauses.
         let mut must_scorers: Vec<Box<dyn Scorer>> =
@@ -817,25 +999,35 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 weight.scorer(reader, boost)
             }
         } else if self.scoring_enabled {
-            self.complex_scorer(reader, boost, &self.score_combiner_fn)
-                .map(|specialized_scorer| {
-                    into_box_scorer(
-                        specialized_scorer,
-                        &self.score_combiner_fn,
-                        num_docs,
-                        self.bitmap_enabled && reader.bitmap_postings_enabled,
-                    )
-                })
+            self.complex_scorer(
+                reader,
+                boost,
+                &self.score_combiner_fn,
+                ExecutionMode::Exhaustive,
+            )
+            .map(|specialized_scorer| {
+                into_box_scorer(
+                    specialized_scorer,
+                    &self.score_combiner_fn,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                )
+            })
         } else {
-            self.complex_scorer(reader, boost, DoNothingCombiner::default)
-                .map(|specialized_scorer| {
-                    into_box_scorer(
-                        specialized_scorer,
-                        DoNothingCombiner::default,
-                        num_docs,
-                        self.bitmap_enabled && reader.bitmap_postings_enabled,
-                    )
-                })
+            self.complex_scorer(
+                reader,
+                boost,
+                DoNothingCombiner::default,
+                ExecutionMode::Exhaustive,
+            )
+            .map(|specialized_scorer| {
+                into_box_scorer(
+                    specialized_scorer,
+                    DoNothingCombiner::default,
+                    num_docs,
+                    self.bitmap_enabled && reader.bitmap_postings_enabled,
+                )
+            })
         }
     }
 
@@ -843,12 +1035,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         &self,
         reader: &SegmentReader,
         boost: Score,
-        candidate_size: u32,
+        candidate_hint: CandidateHint,
     ) -> crate::Result<Box<dyn Scorer>> {
         if self.weights.len() == 1 {
             let &(occur, ref weight) = &self.weights[0];
             if occur != Occur::MustNot {
-                return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_size);
+                return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_hint);
             }
         }
         if !self.scoring_enabled
@@ -870,7 +1062,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 return candidate_weight.scorer_for_candidates_unpositioned(
                     reader,
                     boost,
-                    candidate_size,
+                    candidate_hint,
                 );
             }
         }
@@ -883,7 +1075,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         boost: Score,
         init_threshold: Score,
     ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
-        let scorer = self.complex_scorer(reader, boost, &self.score_combiner_fn)?;
+        let scorer = self.complex_scorer(
+            reader,
+            boost,
+            &self.score_combiner_fn,
+            ExecutionMode::Pruning,
+        )?;
         match scorer {
             // Block-WAND scores by summing the matching terms, so it may only
             // drive a combiner that sums. Anything else (dis_max) still needs
@@ -1069,7 +1266,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let scorer = self.complex_scorer(
+            reader,
+            1.0,
+            &self.score_combiner_fn,
+            ExecutionMode::Exhaustive,
+        )?;
         let num_docs = reader.num_docs();
         match scorer {
             SpecializedScorer::TermUnion(mut term_scorers) => {
@@ -1136,7 +1338,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let scorer =
+            self.complex_scorer(reader, 1.0, &self.score_combiner_fn, ExecutionMode::Pruning)?;
         match scorer {
             // Block-WAND scores by summing the matching terms, so it may only
             // drive a combiner that sums. Anything else (dis_max) still needs
@@ -1337,7 +1540,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, DoNothingCombiner::default)?;
+        let scorer = self.complex_scorer(
+            reader,
+            1.0,
+            DoNothingCombiner::default,
+            ExecutionMode::Exhaustive,
+        )?;
         let num_docs = reader.num_docs();
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
 
@@ -1389,7 +1597,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(crate::DocSetBatch<'_>),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, DoNothingCombiner::default)?;
+        let scorer = self.complex_scorer(
+            reader,
+            1.0,
+            DoNothingCombiner::default,
+            ExecutionMode::Exhaustive,
+        )?;
         let num_docs = reader.num_docs();
 
         match scorer {
@@ -1446,96 +1659,363 @@ fn is_include_occur(occur: Occur) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
-    use super::BooleanWeight;
+    use columnar::ColumnType;
+    use common::TinySet;
+    use proptest::prelude::*;
+
+    use super::{BooleanWeight, ExecutionMode};
+    use crate::query::bitmap_combination::BitmapCombination;
     use crate::query::{
-        AllQuery, Bm25Weight, BooleanQuery, DisjunctionPruning, EnableScoring, ExcludedDocSet,
-        ExclusionSet, Occur, Query, RangeQuery, SumCombiner, TermQuery, TermScorer,
+        AllQuery, Bm25Weight, BooleanQuery, CandidateHint, DisjunctionPruning, EnableScoring,
+        ExactPostings, ExcludedDocSet, ExclusionSet, FastFieldTermSetQuery, Occur, Query,
+        RangeQuery, SumCombiner, TermPredicate, TermPredicateQuery, TermQuery, TermScorer,
     };
-    use crate::schema::{IndexRecordOption, Schema, FAST, TEXT};
-    use crate::{Bm25Params, Index, Term, TERMINATED};
+    use crate::schema::{IndexRecordOption, Schema, TextOptions, FAST, TEXT};
+    use crate::{Bm25Params, DocId, Index, Score, Term, TERMINATED};
+
+    #[derive(Debug)]
+    struct ModPredicate {
+        modulus: u32,
+        rem: u32,
+    }
+
+    impl ModPredicate {
+        fn matches_doc(&self, doc: DocId) -> bool {
+            self.rem < self.modulus && doc % self.modulus == self.rem
+        }
+    }
+
+    impl TermPredicate for ModPredicate {
+        fn filter_bytes(
+            &self,
+            data: &[u8],
+            offsets: &[u32],
+            out: &mut [TinySet],
+        ) -> crate::Result<()> {
+            for i in 0..offsets.len().saturating_sub(1) {
+                let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
+                if let Some(num) = std::str::from_utf8(slice)
+                    .ok()
+                    .and_then(|s| s.strip_prefix("k-"))
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    if self.matches_doc(num) {
+                        out[i / 64].insert_mut((i % 64) as u32);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn filter_monotonic_u64s(
+            &self,
+            _col_type: ColumnType,
+            values: &[u64],
+            out: &mut [TinySet],
+        ) -> crate::Result<()> {
+            for (i, &v) in values.iter().enumerate() {
+                if let Ok(doc) = u32::try_from(v) {
+                    if self.matches_doc(doc) {
+                        out[i / 64].insert_mut((i % 64) as u32);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TermKind {
+        Half,
+        Div7,
+        Div8,
+        Div9,
+        Rare,
+    }
+
+    impl TermKind {
+        fn token(self) -> &'static str {
+            match self {
+                TermKind::Half => "half",
+                TermKind::Div7 => "d7",
+                TermKind::Div8 => "d8",
+                TermKind::Div9 => "d9",
+                TermKind::Rare => "rare",
+            }
+        }
+
+        fn matches(self, doc: DocId) -> bool {
+            match self {
+                TermKind::Half => doc % 2 == 0,
+                TermKind::Div7 => doc % 7 == 0,
+                TermKind::Div8 => doc % 8 == 0,
+                TermKind::Div9 => doc % 9 == 0,
+                TermKind::Rare => doc % 64 == 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ClauseLeaf {
+        All,
+        Term(TermKind),
+        Range { lo: u32, hi: u32 },
+        NumTermSet { start: u32, step: u32, count: u32 },
+        NumPredicate { modulus: u32, rem: u32 },
+        DictPredicate { modulus: u32, rem: u32 },
+    }
+
+    impl ClauseLeaf {
+        fn is_fast_field(&self) -> bool {
+            !matches!(self, ClauseLeaf::All | ClauseLeaf::Term(_))
+        }
+
+        fn matches(&self, doc: DocId) -> bool {
+            match *self {
+                ClauseLeaf::All => true,
+                ClauseLeaf::Term(kind) => kind.matches(doc),
+                ClauseLeaf::Range { lo, hi } => doc >= lo && doc < hi,
+                ClauseLeaf::NumTermSet { start, step, count } => {
+                    doc >= start && (doc - start) % step == 0 && (doc - start) / step < count
+                }
+                ClauseLeaf::NumPredicate { modulus, rem }
+                | ClauseLeaf::DictPredicate { modulus, rem } => {
+                    rem < modulus && doc % modulus == rem
+                }
+            }
+        }
+
+        fn to_query(
+            &self,
+            text: crate::schema::Field,
+            value: crate::schema::Field,
+            tag: crate::schema::Field,
+        ) -> Box<dyn Query> {
+            match *self {
+                ClauseLeaf::All => Box::new(AllQuery),
+                ClauseLeaf::Term(kind) => Box::new(TermQuery::new(
+                    Term::from_field_text(text, kind.token()),
+                    IndexRecordOption::WithFreqs,
+                )),
+                ClauseLeaf::Range { lo, hi } => Box::new(RangeQuery::new(
+                    Bound::Included(Term::from_field_u64(value, u64::from(lo))),
+                    Bound::Excluded(Term::from_field_u64(value, u64::from(hi))),
+                )),
+                ClauseLeaf::NumTermSet { start, step, count } => {
+                    let terms = (0..count)
+                        .map(|i| Term::from_field_u64(value, u64::from(start + i * step)));
+                    Box::new(FastFieldTermSetQuery::new(terms))
+                }
+                ClauseLeaf::NumPredicate { modulus, rem } => Box::new(
+                    TermPredicateQuery::new(value, Arc::new(ModPredicate { modulus, rem }))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                ),
+                ClauseLeaf::DictPredicate { modulus, rem } => Box::new(
+                    TermPredicateQuery::new(tag, Arc::new(ModPredicate { modulus, rem }))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                ),
+            }
+        }
+    }
+
+    fn arb_clause(num_docs: u32) -> impl Strategy<Value = (Occur, ClauseLeaf)> {
+        let occur = prop_oneof![
+            5 => Just(Occur::Must),
+            2 => Just(Occur::Should),
+            1 => Just(Occur::MustNot),
+        ];
+        let term = prop_oneof![
+            Just(TermKind::Half),
+            Just(TermKind::Div7),
+            Just(TermKind::Div8),
+            Just(TermKind::Div9),
+            Just(TermKind::Rare),
+        ];
+        let leaf = prop_oneof![
+            1 => Just(ClauseLeaf::All),
+            5 => term.prop_map(ClauseLeaf::Term),
+            2 => (0..=num_docs, 0..=num_docs).prop_map(|(a, b)| ClauseLeaf::Range {
+                lo: a.min(b),
+                hi: a.max(b),
+            }),
+            2 => (0u32..16, 1u32..16, 0u32..40).prop_map(|(start, step, count)| {
+                ClauseLeaf::NumTermSet { start, step, count }
+            }),
+            2 => (2u32..12).prop_flat_map(|modulus| {
+                (0..=modulus).prop_map(move |rem| ClauseLeaf::NumPredicate { modulus, rem })
+            }),
+            2 => (2u32..12).prop_flat_map(|modulus| {
+                (0..=modulus).prop_map(move |rem| ClauseLeaf::DictPredicate { modulus, rem })
+            }),
+        ];
+        (occur, leaf)
+    }
+
+    fn expected_boolean_matches(
+        clauses: &[(Occur, ClauseLeaf)],
+        min_should: usize,
+        num_docs: u32,
+    ) -> Vec<DocId> {
+        let has_must = clauses.iter().any(|(o, _)| *o == Occur::Must);
+        let should_count = clauses.iter().filter(|(o, _)| *o == Occur::Should).count();
+        let required_should = if min_should == 0 && !has_must && should_count > 0 {
+            1
+        } else {
+            min_should
+        };
+        if !has_must && should_count == 0 {
+            return Vec::new();
+        }
+        (0..num_docs)
+            .filter(|&doc| {
+                let mut matched_should = 0usize;
+                for (occur, leaf) in clauses {
+                    let hit = leaf.matches(doc);
+                    match occur {
+                        Occur::Must if !hit => return false,
+                        Occur::MustNot if hit => return false,
+                        Occur::Should if hit => matched_should += 1,
+                        _ => {}
+                    }
+                }
+                matched_should >= required_should
+            })
+            .collect()
+    }
 
     #[test]
     fn candidate_scorer_preserves_boolean_matches_and_scores() -> crate::Result<()> {
-        const DOCUMENTS: u64 = 16;
+        const DOCUMENTS: u32 = 1200;
         let mut schema = Schema::builder();
         let value = schema.add_u64_field("value", FAST);
-        let text = schema.add_text_field("text", TEXT);
+        let tag = schema.add_text_field("tag", TextOptions::default().set_fast("raw"));
+        let text = schema.add_text_field(
+            "text",
+            TEXT.set_indexing_options(
+                TEXT.get_indexing_options()
+                    .unwrap()
+                    .clone()
+                    .set_bitmap_postings(true),
+            ),
+        );
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer_for_tests()?;
         for doc in 0..DOCUMENTS {
-            writer.add_document(
-                doc!(value => doc, text => if doc % 2 == 0 { "even" } else { "odd" }),
-            )?;
+            let mut tokens = Vec::new();
+            for kind in [
+                TermKind::Half,
+                TermKind::Div7,
+                TermKind::Div8,
+                TermKind::Div9,
+                TermKind::Rare,
+            ] {
+                if kind.matches(doc) {
+                    tokens.push(kind.token());
+                }
+            }
+            writer.add_document(doc!(
+                value => u64::from(doc),
+                tag => format!("k-{doc:04}"),
+                text => tokens.join(" "),
+            ))?;
         }
         writer.commit()?;
         let searcher = index.reader()?.searcher();
         let reader = searcher.segment_reader(0);
-        let range = || -> Box<dyn Query> {
-            Box::new(RangeQuery::new(
-                Bound::Included(Term::from_field_u64(value, 4)),
-                Bound::Excluded(Term::from_field_u64(value, 12)),
-            ))
-        };
-        let term = || -> Box<dyn Query> {
-            Box::new(TermQuery::new(
-                Term::from_field_text(text, "even"),
-                IndexRecordOption::Basic,
-            ))
-        };
-        let queries = [
-            BooleanQuery::new(vec![
-                (Occur::Must, Box::new(AllQuery)),
-                (Occur::Must, range()),
-            ]),
-            BooleanQuery::new(vec![
-                (Occur::Must, range()),
-                (Occur::Must, Box::new(AllQuery)),
-            ]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, term())]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::Must, range())]),
-            BooleanQuery::new(vec![(Occur::Must, range()), (Occur::MustNot, term())]),
-            BooleanQuery::new(vec![
-                (Occur::Should, range()),
-                (Occur::Should, Box::new(AllQuery)),
-            ]),
-            BooleanQuery::with_minimum_required_clauses(
-                vec![(Occur::Must, range()), (Occur::Should, term())],
-                1,
-            ),
-            BooleanQuery::with_minimum_required_clauses(
-                vec![(Occur::Must, range()), (Occur::Must, Box::new(AllQuery))],
-                1,
-            ),
-        ];
-        for scoring in [
-            EnableScoring::disabled_from_searcher(&searcher),
-            EnableScoring::enabled_from_searcher(&searcher),
-        ] {
-            for query in &queries {
-                let weight = query.weight(scoring)?;
-                let mut ordinary = weight.scorer(reader, 1.0)?;
-                let mut expected = Vec::new();
+        let hit_bitmap_with_deferred_fast_must = AtomicBool::new(false);
+
+        proptest!(ProptestConfig::with_cases(128), |(
+            clauses in prop::collection::vec(arb_clause(DOCUMENTS), 2..=5),
+            min_should in 0usize..=2,
+        )| {
+            let query = BooleanQuery::with_minimum_required_clauses(
+                clauses
+                    .iter()
+                    .map(|(occur, leaf)| (*occur, leaf.to_query(text, value, tag)))
+                    .collect(),
+                min_should,
+            );
+            let expected_docs = expected_boolean_matches(&clauses, min_should, DOCUMENTS);
+            let has_fast_must = clauses
+                .iter()
+                .any(|(o, leaf)| *o == Occur::Must && leaf.is_fast_field());
+
+            for scoring in [
+                EnableScoring::disabled_from_searcher(&searcher),
+                EnableScoring::disabled_from_searcher(&searcher).with_bitmap_postings(true),
+                EnableScoring::enabled_from_searcher(&searcher),
+            ] {
+                let weight = query.weight(scoring).unwrap();
+                let mut ordinary = weight.scorer(reader, 1.0).unwrap();
+                if !scoring.is_scoring_enabled()
+                    && scoring.bitmap_postings_enabled()
+                    && has_fast_must
+                    && ordinary.is::<BitmapCombination>()
+                {
+                    hit_bitmap_with_deferred_fast_must.store(true, Ordering::Relaxed);
+                }
+                let mut ordinary_results = Vec::new();
                 while ordinary.doc() != TERMINATED {
-                    expected.push((ordinary.doc(), ordinary.score()));
+                    ordinary_results.push((ordinary.doc(), ordinary.score()));
                     ordinary.advance();
                 }
+                let ordinary_docs: Vec<_> = ordinary_results.iter().map(|&(doc, _)| doc).collect();
+                prop_assert_eq!(&ordinary_docs, &expected_docs);
+
+                if !scoring.is_scoring_enabled() {
+                    let mut batch_docs = Vec::new();
+                    weight
+                        .for_each_no_score_batch(reader, &mut |batch| {
+                            batch.for_each_doc_block(|docs| batch_docs.extend_from_slice(docs));
+                        })
+                        .unwrap();
+                    prop_assert_eq!(&batch_docs, &expected_docs);
+                } else {
+                    let mut pruned_results = Vec::new();
+                    weight
+                        .for_each_pruning(Score::MIN, reader, &mut |doc, score| {
+                            pruned_results.push((doc, score));
+                            Score::MIN
+                        })
+                        .unwrap();
+                    prop_assert_eq!(pruned_results, ordinary_results.clone());
+                }
+
                 let mut candidates = ExcludedDocSet::new(
-                    weight.scorer_for_candidates_unpositioned(reader, 1.0, reader.max_doc())?,
+                    weight
+                        .scorer_for_candidates_unpositioned(
+                            reader,
+                            1.0,
+                            CandidateHint::Estimated(reader.max_doc()),
+                        )
+                        .unwrap(),
                 );
                 let actual_docs: Vec<_> = (0..reader.max_doc())
                     .filter(|&doc| candidates.contains(doc))
                     .collect();
-                let expected_docs: Vec<_> = expected.iter().map(|&(doc, _)| doc).collect();
-                assert_eq!(actual_docs, expected_docs, "query={query:?}");
-                let mut candidate =
-                    weight.scorer_for_candidates_unpositioned(reader, 1.0, reader.max_doc())?;
-                for (doc, score) in expected {
-                    assert_eq!(candidate.seek(doc), doc, "query={query:?}");
-                    assert_eq!(candidate.score(), score, "query={query:?}");
+                prop_assert_eq!(&actual_docs, &expected_docs);
+
+                let mut candidate = weight
+                    .scorer_for_candidates_unpositioned(
+                        reader,
+                        1.0,
+                        CandidateHint::Estimated(reader.max_doc()),
+                    )
+                    .unwrap();
+                for (doc, score) in ordinary_results {
+                    prop_assert_eq!(candidate.seek(doc), doc);
+                    prop_assert_eq!(candidate.score(), score);
                 }
             }
-        }
+        });
+
+        assert!(
+            hit_bitmap_with_deferred_fast_must.load(Ordering::Relaxed),
+            "proptest should cover BitmapCombination with deferred fast-field Must clauses"
+        );
         Ok(())
     }
 
@@ -1944,8 +2424,12 @@ mod tests {
             true,
             Box::new(SumCombiner::default),
         );
-        let specialized =
-            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        let specialized = bool_weight.complex_scorer(
+            reader,
+            1.0,
+            &bool_weight.score_combiner_fn,
+            ExecutionMode::Exhaustive,
+        )?;
         match specialized {
             SpecializedScorer::FilteredTermUnion { terms, filter } => {
                 assert_eq!(terms.len(), 2);
@@ -1977,8 +2461,12 @@ mod tests {
             true,
             Box::new(SumCombiner::default),
         );
-        let specialized =
-            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        let specialized = bool_weight.complex_scorer(
+            reader,
+            1.0,
+            &bool_weight.score_combiner_fn,
+            ExecutionMode::Exhaustive,
+        )?;
         match specialized {
             SpecializedScorer::TermIntersection(terms) => {
                 assert_eq!(terms.len(), 3);
@@ -2004,8 +2492,12 @@ mod tests {
             true,
             Box::new(SumCombiner::default),
         );
-        let specialized =
-            bool_weight.complex_scorer(reader, 1.0, &bool_weight.score_combiner_fn)?;
+        let specialized = bool_weight.complex_scorer(
+            reader,
+            1.0,
+            &bool_weight.score_combiner_fn,
+            ExecutionMode::Exhaustive,
+        )?;
         match specialized {
             SpecializedScorer::FilteredTermIntersection { terms, filter } => {
                 assert_eq!(terms.len(), 2);

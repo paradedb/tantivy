@@ -13,10 +13,11 @@ use common::bounds::{BoundsRange, TransformBound};
 
 use super::contiguous_doc_set::ContiguousDocSet;
 use super::fast_field_range_doc_set::RangeDocSet;
-use super::sorted_internals::{binary_search_null_boundary, binary_search_sorted};
+use super::sorted_internals::sorted_doc_range_for_bounds;
 use crate::index::SegmentReader;
 use crate::query::{
-    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
+    AllScorer, CandidateHint, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer,
+    Weight,
 };
 use crate::schema::{Type, ValueBytes};
 use crate::{DocId, DocSet, Order, Result, Score, TantivyError, Term};
@@ -67,7 +68,7 @@ impl Weight for FastFieldRangeWeight {
         &self,
         reader: &SegmentReader,
         boost: Score,
-        _candidate_size: u32,
+        _candidate_hint: CandidateHint,
     ) -> Result<Box<dyn Scorer>> {
         Self {
             candidate_mode: true,
@@ -521,15 +522,12 @@ fn search_on_u64_ff(
     // Sorted index optimization: when the index is sorted by this field,
     // binary search for the matching DocId range instead of scanning.
     if let Some(order) = sort_order {
-        let cardinality = column.index.get_cardinality();
-        if matches!(cardinality, Cardinality::Full | Cardinality::Optional) {
-            return Ok(sorted_range_scorer(
-                &column,
-                boost,
-                &value_range,
-                order,
-                cardinality,
-            ));
+        if let Some(doc_range) = sorted_doc_range_for_bounds(&column, &value_range, order) {
+            if doc_range.is_empty() {
+                return Ok(Box::new(EmptyScorer));
+            }
+            let docset = ContiguousDocSet::new(doc_range.start, doc_range.end);
+            return Ok(Box::new(ConstScorer::new(docset, boost)));
         }
     }
 
@@ -539,93 +537,6 @@ fn search_on_u64_ff(
         RangeDocSet::new(value_range, column)
     };
     Ok(Box::new(ConstScorer::new(docset, boost)))
-}
-
-/// Builds a scorer by binary-searching the matching DocId range in a sorted column.
-///
-/// # Design
-///
-/// When an index is sorted by a field, documents with adjacent values have adjacent DocIds.
-/// This means the set of matching DocIds for a range query is always contiguous — if DocId 5
-/// matches and DocId 9 matches, then 6, 7, 8 must also match. This lets us replace O(n)
-/// column scanning with O(log n) binary search to find the boundaries.
-///
-/// The algorithm has three phases:
-///
-/// 1. **NULL boundary**: NULLs cluster at one end of the segment (start for ASC, end for DESC). We
-///    binary search using `column.first(doc).is_some()` to find where real values begin, because
-///    NULL docs have no value to compare against — only presence can be tested.
-///
-/// 2. **Value boundary**: Within the non-NULL range, two binary searches find the first and last
-///    matching DocIds. The result is a half-open range `[start, end)` where `start` is the first
-///    match and `end` is one past the last match.
-///
-/// 3. **ContiguousDocSet**: Wraps the `[start, end)` range as a `DocSet`.
-///
-/// Only `Full` and `Optional` cardinalities are supported. `Multivalued` columns
-/// have multiple values per doc and cannot be binary-searched.
-fn sorted_range_scorer(
-    column: &Column<u64>,
-    boost: Score,
-    value_range: &RangeInclusive<u64>,
-    order: Order,
-    cardinality: Cardinality,
-) -> Box<dyn Scorer> {
-    let num_docs = column.num_docs();
-    if num_docs == 0 {
-        return Box::new(EmptyScorer);
-    }
-
-    let lower = *value_range.start();
-    let upper = *value_range.end();
-
-    // Determine the non-NULL range within the segment.
-    // - ASC: NULLs at start (low DocIds), values ascending after.
-    // - DESC: values descending first, NULLs at end (high DocIds).
-    let (non_null_start, non_null_end) = match cardinality {
-        Cardinality::Full => (0u32, num_docs),
-        Cardinality::Optional => match order {
-            Order::Asc => {
-                // Binary search for first DocId with a value (NULLs at start).
-                let start = binary_search_null_boundary(column, 0, num_docs, Order::Asc);
-                (start, num_docs)
-            }
-            Order::Desc => {
-                // Binary search for first NULL DocId (NULLs at end).
-                let end = binary_search_null_boundary(column, 0, num_docs, Order::Desc);
-                (0, end)
-            }
-        },
-        _ => unreachable!("caller filters out unsupported cardinality"),
-    };
-
-    if non_null_start >= non_null_end {
-        return Box::new(EmptyScorer);
-    }
-
-    let (start_target, end_target) = match order {
-        Order::Asc => (lower, upper),
-        Order::Desc => (upper, lower),
-    };
-    let start_doc = binary_search_sorted(
-        column,
-        non_null_start,
-        non_null_end,
-        start_target,
-        order,
-        false, // inclusive: find first match
-    );
-    let end_doc = binary_search_sorted(
-        column,
-        non_null_start,
-        non_null_end,
-        end_target,
-        order,
-        true, // exclusive: find one past last match
-    );
-
-    let docset = ContiguousDocSet::new(start_doc, end_doc);
-    Box::new(ConstScorer::new(docset, boost))
 }
 
 /// Returns true if the type maps to a u64 fast field
@@ -1898,7 +1809,7 @@ mod sorted_range_tests {
     use crate::collector::Count;
     use crate::index::{Index, IndexSettings, IndexSortByField};
     use crate::query::range_query::range_query_fastfield::FastFieldRangeWeight;
-    use crate::query::{ExcludedDocSet, ExclusionSet, RangeQuery, Scorer, Weight};
+    use crate::query::{CandidateHint, ExcludedDocSet, ExclusionSet, RangeQuery, Scorer, Weight};
     use crate::schema::{BytesOptions, NumericOptions, SchemaBuilder, FAST};
     use crate::{IndexWriter, Order, TantivyDocument, Term, TERMINATED};
 
@@ -2070,7 +1981,11 @@ mod sorted_range_tests {
             for docs in [&[8, 9][..], &[0, 1, 4, 5][..], &[0, 1, 8, 9][..]] {
                 let mut scorer = ExcludedDocSet::new(
                     weight
-                        .scorer_for_candidates_unpositioned(reader, 1.0, docs.len() as u32)
+                        .scorer_for_candidates_unpositioned(
+                            reader,
+                            1.0,
+                            CandidateHint::Estimated(docs.len() as u32),
+                        )
                         .unwrap(),
                 );
                 assert_eq!(
