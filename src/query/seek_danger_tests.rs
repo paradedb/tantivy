@@ -543,6 +543,11 @@ fn seek_danger_implementation_inventory() {
     *covered
         .entry("query/intersection.rs".to_string())
         .or_insert(0) += 2;
+    covered.insert(
+        "query/boolean_query/block_wand_intersection.rs".to_string(),
+        1,
+    );
+    covered.insert("query/boolean_query/block_wand_union.rs".to_string(), 1);
     assert_eq!(
         found, covered,
         "Register new seek_danger implementations in seek_danger_tests.rs and add their \
@@ -579,6 +584,8 @@ fn seek_danger_batch_implementation_inventory() {
     visit(&root, &root, &pattern, &mut found);
     let expected: BTreeMap<String, usize> = [
         ("docset.rs", 3),
+        // Test-only spy (`CostedFilter`) in `block_wand_union.rs`.
+        ("query/boolean_query/block_wand_union.rs", 1),
         ("query/boost_query.rs", 1),
         ("query/const_score_query.rs", 1),
         ("query/exclude.rs", 2),

@@ -1455,17 +1455,15 @@ mod tests {
 
         let sink = Arc::new(AtomicU8::new(0));
         let query = ConstScoreQuery::new(
-            Box::new(
-                TermSetQuery::new([
-                    Term::from_field_u64(u64_field_fast, 100),
-                    Term::from_field_u64(u64_field_fast, 0),
-                    Term::from_field_u64(u64_field_fast, 2),
-                ])
-                .with_strategy_config(TermSetStrategyConfig {
-                    strategy_sink: Some(sink.clone()),
-                    ..Default::default()
-                }),
-            ),
+            TermSetQuery::new([
+                Term::from_field_u64(u64_field_fast, 100),
+                Term::from_field_u64(u64_field_fast, 0),
+                Term::from_field_u64(u64_field_fast, 2),
+            ])
+            .with_strategy_config(TermSetStrategyConfig {
+                strategy_sink: Some(sink.clone()),
+                ..Default::default()
+            }),
             0.0,
         );
         let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;

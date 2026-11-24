@@ -2114,12 +2114,17 @@ mod tests {
                 (Occur::Must, Box::new(inner)),
                 (
                     Occur::Must,
-                    Box::new(ConstScoreQuery::new(Box::new(range_q.clone()), 0.0)),
+                    Box::new(ConstScoreQuery::new(range_q.clone(), 0.0)),
                 ),
             ])
         };
         let nested_pred =
             make_nested_scored(Box::new(TermPredicateQuery::new(owner, wpred.clone())));
+        let (_, flat_min_should) = nested_pred.flattened_clauses();
+        assert_eq!(
+            flat_min_should, 1,
+            "nested range-constrained disjunction should flatten"
+        );
 
         let explicit_terms: Vec<Term> = keys
             .iter()
@@ -2465,7 +2470,7 @@ mod tests {
                 (
                     Occur::Must,
                     Box::new(ConstScoreQuery::new(
-                        Box::new(TermPredicateQuery::new(full_col, pred.clone())),
+                        TermPredicateQuery::new(full_col, pred.clone()),
                         0.0,
                     )),
                 ),
@@ -2475,7 +2480,7 @@ mod tests {
                 (
                     Occur::Must,
                     Box::new(ConstScoreQuery::new(
-                        Box::new(TermSetQuery::new(full_ref_terms.clone())),
+                        TermSetQuery::new(full_ref_terms.clone()),
                         0.0,
                     )),
                 ),
@@ -2487,6 +2492,94 @@ mod tests {
             assert!(
                 calls <= 64,
                 "WAND {name} should batch filter probes, got {calls} calls"
+            );
+        }
+
+        // 4b. `BlockWandUnionScorer` via `Weight::pruning_scorer` (streaming full-scan path used
+        //     by ParadeDB `Scanner`): verify both direct `PredicateColumnDocSet` and combined
+        //     `BatchFilteredScorer(RangeDocSet, PredicateColumnDocSet)` evaluate only exact
+        //     surviving candidates (zero speculative contiguous window probes) in ramped batches.
+        let enable = crate::query::EnableScoring::enabled_from_searcher(&searcher);
+        let seg_reader = searcher.segment_reader(0);
+        let expected_union_all = (0..8_192i64).filter(|i| i % 5 == 0 || i % 7 == 0).count();
+        let expected_union_range = (2_000..4_000i64)
+            .filter(|i| i % 5 == 0 || i % 7 == 0)
+            .count();
+        for (name, range_filter, expected_items, max_calls) in [
+            ("union_direct", None, expected_union_all, 6usize),
+            (
+                "union_with_range_batch_filtered",
+                Some(crate::query::RangeQuery::new(
+                    Bound::Included(Term::from_field_i64(full_col, 2_000)),
+                    Bound::Excluded(Term::from_field_i64(full_col, 4_000)),
+                )),
+                expected_union_range,
+                6usize,
+            ),
+        ] {
+            reset(&pred);
+            let mut pred_clauses: Vec<(Occur, Box<dyn crate::query::Query>)> = vec![
+                (Occur::Should, term_q("hit2")),
+                (Occur::Should, term_q("hit3")),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(full_col, pred.clone()),
+                        0.0,
+                    )),
+                ),
+            ];
+            let mut ref_clauses: Vec<(Occur, Box<dyn crate::query::Query>)> = vec![
+                (Occur::Should, term_q("hit2")),
+                (Occur::Should, term_q("hit3")),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermSetQuery::new(full_ref_terms.clone()),
+                        0.0,
+                    )),
+                ),
+            ];
+            if let Some(rq) = range_filter {
+                pred_clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(rq.clone(), 0.0))));
+                ref_clauses.push((Occur::Must, Box::new(ConstScoreQuery::new(rq, 0.0))));
+            }
+            let mut pred_q = BooleanQuery::new(pred_clauses);
+            pred_q.set_minimum_number_should_match(1);
+            let mut ref_q = BooleanQuery::new(ref_clauses);
+            ref_q.set_minimum_number_should_match(1);
+
+            let mut pred_scorer =
+                pred_q
+                    .weight(enable)?
+                    .pruning_scorer(seg_reader, 1.0, crate::Score::MIN)?;
+            let mut got_docs = Vec::new();
+            while pred_scorer.doc() != TERMINATED {
+                got_docs.push((pred_scorer.doc(), pred_scorer.score()));
+                pred_scorer.advance();
+            }
+            let mut ref_scorer =
+                ref_q
+                    .weight(enable)?
+                    .pruning_scorer(seg_reader, 1.0, crate::Score::MIN)?;
+            let mut exp_docs = Vec::new();
+            while ref_scorer.doc() != TERMINATED {
+                exp_docs.push((ref_scorer.doc(), ref_scorer.score()));
+                ref_scorer.advance();
+            }
+            assert_eq!(got_docs, exp_docs, "pruning_scorer mismatch for {name}");
+            let calls = pred.u64_telemetry.calls.load(Ordering::Relaxed);
+            let items = pred.u64_telemetry.items.load(Ordering::Relaxed);
+            // Under `CandidateHint::Pruned`, `PredicateColumnDocSet::new_unpositioned` does zero
+            // eager positioning scan; every probe goes through `seek_danger_batch` on exact
+            // surviving candidates (zero speculative windows).
+            assert!(
+                calls > 0 && calls <= max_calls,
+                "{name}: expected <= {max_calls} batched calls, got {calls}",
+            );
+            assert_eq!(
+                items, expected_items,
+                "{name}: should evaluate only exact surviving candidates"
             );
         }
 
@@ -2792,7 +2885,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     struct DictCacheFixture {
         ram_dir: RamDirectory,
         _index: Index,
@@ -3191,26 +3283,20 @@ mod tests {
     }
 
     #[test]
-    fn single_page_reads_and_pruned_candidate_hint() -> crate::Result<()> {
+    fn wand_pruning_uses_lazy_dict_cache_and_single_page_reads() -> crate::Result<()> {
         let f = dict_cache_fixture();
 
         // 1. Verify single-page coalescing and zero cross-page coalescing on 8 KB paged storage.
-        let mut dict_buf = Vec::new();
-        let mut dict_builder = <columnar::Dictionary>::builder(&mut dict_buf)?;
-        for term in &f.sorted_terms {
-            dict_builder.insert(term.as_bytes(), &())?;
-        }
-        dict_builder.finish()?;
-        let fast_reads = Arc::new(Mutex::new(Vec::new()));
-        let paged_handle: Arc<dyn FileHandle> = Arc::new(PagedFastFile {
-            inner: Arc::new(OwnedBytes::new(dict_buf)),
-            block_len: TEST_STORAGE_PAGE_LEN,
-            reads: Some(fast_reads.clone()),
-        });
-        let tracked_dict =
-            <columnar::Dictionary>::open(common::file_slice::FileSlice::new(paged_handle))?;
+        let tracked_dir = PagedFastDirectory::new(f.ram_dir.clone(), TEST_STORAGE_PAGE_LEN, true);
+        let tracked_index = Index::open(tracked_dir.clone())?;
+        let tracked_reader = tracked_index.reader()?;
+        let tracked_searcher = tracked_reader.searcher();
+        let tracked_seg = tracked_searcher.segment_reader(0);
+        let tracked_col =
+            columnar::BytesColumn::from(tracked_seg.fast_fields().str("dict_key")?.unwrap());
+        let tracked_dict = tracked_col.dictionary();
         let block_ids = tracked_dict
-            .block_ids_for_ord_range(0..tracked_dict.num_terms() as u64)?
+            .block_ids_for_ord_range(0..tracked_col.num_terms() as u64)?
             .unwrap();
         let num_blocks = block_ids.end().saturating_sub(*block_ids.start()) + 1;
         let mut all_blocks = Vec::with_capacity(num_blocks as usize);
@@ -3229,14 +3315,26 @@ mod tests {
             .map(|addr| addr.byte_range.clone())
             .collect();
 
-        fast_reads.lock().unwrap().clear();
+        tracked_dir
+            .fast_reads
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clear();
         let mut visited_terms = 0usize;
         tracked_dict.visit_blocks_coalesced(&all_blocks, |_ord, _key| -> io::Result<()> {
             visited_terms += 1;
             Ok(())
         })?;
-        assert_eq!(visited_terms, tracked_dict.num_terms());
-        let recorded_reads = fast_reads.lock().unwrap().clone();
+        assert_eq!(visited_terms, tracked_col.num_terms());
+        let recorded_reads = tracked_dir
+            .fast_reads
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
         assert!(
             recorded_reads.len() < all_blocks.len(),
             "expected single-page coalescing to issue fewer reads ({}) than SSTable blocks ({})",
@@ -3247,6 +3345,9 @@ mod tests {
             let start_page = range.start / TEST_STORAGE_PAGE_LEN;
             let end_page = (range.end - 1) / TEST_STORAGE_PAGE_LEN;
             if start_page != end_page {
+                // Any read crossing an 8 KB boundary must be a single straddling SSTable block
+                // (offset by the FileSlice base offset inside the `.fast` file), never two blocks
+                // coalesced across a page boundary.
                 let sstable_rel_matches_single_block =
                     straddling_ranges.iter().any(|b| b.len() == range.len());
                 assert!(
@@ -3257,84 +3358,215 @@ mod tests {
             }
         }
 
-        // 2. Under `CandidateHint::Pruned`, large `TermSetQuery` and `TermPredicateQuery` over
-        // high-cardinality `STRING | FAST` choose lazy `CachedDictPredicateDocSet` (`Linear`) and
-        // do zero dictionary I/O when never probed, while non-prunable `AllQuery AND
-        // TermPredicateQuery` stays on `dispatch_postings`.
-        let searcher = f.reader.searcher();
-        let segment = searcher.segment_reader(0);
-        let enable = EnableScoring::disabled_from_searcher(&searcher);
+        // 2. WAND / Block-MaxScore pruning (`for_each_pruning` and `pruning_scorer`) over a ~10%
+        // BM25 disjunction on high-cardinality `STRING | FAST` must use `CachedDictPredicateDocSet`
+        // (`StrategyTag::Linear`) and evaluate only a small fraction of the dictionary, while
+        // non-prunable `AllQuery AND TermPredicateQuery` stays on `dispatch_postings`.
+        let make_disjunction = || {
+            BooleanQuery::union(
+                ["how", "using", "get", "create"]
+                    .into_iter()
+                    .map(|t| {
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(f.title_field, t),
+                            IndexRecordOption::WithFreqs,
+                        )) as Box<dyn Query>
+                    })
+                    .collect(),
+            )
+        };
 
-        let termset_sink = Arc::new(AtomicU8::new(0));
-        let termset_w = TermSetQuery::new(f.matching_terms.clone())
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(termset_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _ts_unpos = termset_w.scorer_for_candidates_unpositioned(
-            segment,
-            1.0,
-            CandidateHint::Pruned { upper_bound: 2_000 },
-        )?;
-        assert_eq!(
-            termset_sink.load(Ordering::Relaxed),
-            StrategyTag::Linear as u8,
-            "large TermSetQuery under CandidateHint::Pruned should use lazy Linear block cache"
-        );
+        for (label, reader) in [("ram", &f.reader), ("paged", &f.paged_reader)] {
+            let searcher = reader.searcher();
+            let segment = searcher.segment_reader(0);
+            let num_terms = f.sorted_terms.len();
 
-        let pred_warm = Arc::new(SetPredicate::from_strings(
-            f.matching_strings.iter().map(String::as_str),
-        ));
-        let warm_sink = Arc::new(AtomicU8::new(0));
-        let pred_w = TermPredicateQuery::new(f.field, pred_warm.clone())
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(warm_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _pred_unpos = pred_w.scorer_for_candidates_unpositioned(
-            segment,
-            1.0,
-            CandidateHint::Pruned { upper_bound: 2_000 },
-        )?;
-        assert_eq!(
-            warm_sink.load(Ordering::Relaxed),
-            StrategyTag::Linear as u8,
-            "TermPredicateQuery under CandidateHint::Pruned must choose lazy Linear cache"
-        );
-        assert_eq!(
-            pred_warm.bytes_telemetry.items.load(Ordering::Relaxed),
-            0,
-            "unprobed CachedDictPredicateDocSet should decode 0 dictionary terms"
-        );
-
-        let all_pred = Arc::new(SetPredicate::from_strings(
-            f.matching_strings.iter().map(String::as_str),
-        ));
-        let all_sink = Arc::new(AtomicU8::new(0));
-        let all_q = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(AllQuery)),
-            (
-                Occur::Must,
-                Box::new(ConstScoreQuery::new(
-                    Box::new(TermPredicateQuery::new(f.field, all_pred).with_strategy_config(
-                        TermSetStrategyConfig {
-                            strategy_sink: Some(all_sink.clone()),
-                            ..Default::default()
-                        },
+            // Reference: TermSetQuery (explicit 9,000 keys) with WAND TopDocs(10).
+            let termset_sink = Arc::new(AtomicU8::new(0));
+            let termset_q = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(make_disjunction())),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermSetQuery::new(f.matching_terms.clone()).with_strategy_config(
+                            TermSetStrategyConfig {
+                                strategy_sink: Some(termset_sink.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                        0.0,
                     )),
-                    0.0,
-                )),
-            ),
-        ]);
-        let all_docs = searcher.search(&all_q, &DocSetCollector)?;
-        assert_eq!(all_docs.len(), f.doc_matched.iter().filter(|&&m| m).count());
-        let all_tag = all_sink.load(Ordering::Relaxed);
-        assert!(
-            all_tag == StrategyTag::Automaton as u8 || all_tag == StrategyTag::Bitset as u8,
-            "AllQuery AND TermPredicateQuery should stay on dispatch_postings, got tag={all_tag}"
-        );
+                ),
+            ]);
+            let expected_top =
+                searcher.search(&termset_q, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(expected_top.len(), 10);
+            assert_eq!(
+                termset_sink.load(Ordering::Relaxed),
+                StrategyTag::Linear as u8,
+                "{label}: large TermSetQuery under WAND should use lazy Linear block cache"
+            );
+
+            // TermPredicateQuery under TopDocs(10) (`for_each_pruning`).
+            let pred_top = Arc::new(SetPredicate::from_strings(
+                f.matching_strings.iter().map(String::as_str),
+            ));
+            let pred_sink = Arc::new(AtomicU8::new(0));
+            let pred_q = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(make_disjunction())),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(f.field, pred_top.clone()).with_strategy_config(
+                            TermSetStrategyConfig {
+                                strategy_sink: Some(pred_sink.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let got_top = searcher.search(&pred_q, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(got_top, expected_top, "{label}: for_each_pruning parity");
+            assert_eq!(
+                pred_sink.load(Ordering::Relaxed),
+                StrategyTag::Linear as u8,
+                "{label}: WAND for_each_pruning must choose lazy Linear cache"
+            );
+            let evaluated_top = pred_top.bytes_telemetry.items.load(Ordering::Relaxed);
+            assert!(
+                evaluated_top < num_terms,
+                "{label}: cold-segment WAND for_each_pruning should stay block-cached and decode \
+                 fewer than all {num_terms} terms, got {evaluated_top}"
+            );
+
+            // Pruned-segment `for_each_pruning` (simulating segments 1..N whose max score cannot
+            // beat the rolling Top-10 threshold from earlier segments): decodes ZERO dictionary
+            // terms because `CachedDictPredicateDocSet::new_unpositioned` does no upfront dict I/O.
+            let pred_warm = Arc::new(SetPredicate::from_strings(
+                f.matching_strings.iter().map(String::as_str),
+            ));
+            let warm_sink = Arc::new(AtomicU8::new(0));
+            let warm_q = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(make_disjunction())),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(f.field, pred_warm.clone()).with_strategy_config(
+                            TermSetStrategyConfig {
+                                strategy_sink: Some(warm_sink.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let warm_weight = warm_q.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let warm_threshold = expected_top[0].0 + 1.0;
+            let mut warm_hits = 0usize;
+            warm_weight.for_each_pruning(warm_threshold, segment, &mut |_doc, _score| {
+                warm_hits += 1;
+                warm_threshold
+            })?;
+            assert_eq!(warm_hits, 0);
+            assert_eq!(
+                warm_sink.load(Ordering::Relaxed),
+                StrategyTag::Linear as u8,
+                "{label}: pruned-segment for_each_pruning must choose lazy Linear cache"
+            );
+            assert_eq!(
+                pred_warm.bytes_telemetry.items.load(Ordering::Relaxed),
+                0,
+                "{label}: pruned-segment WAND for_each_pruning should decode 0 dictionary terms"
+            );
+
+            // TermPredicateQuery under `pruning_scorer` with rolling Top-10 threshold.
+            let pred_ps = Arc::new(SetPredicate::from_strings(
+                f.matching_strings.iter().map(String::as_str),
+            ));
+            let ps_sink = Arc::new(AtomicU8::new(0));
+            let ps_q = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(make_disjunction())),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(f.field, pred_ps.clone()).with_strategy_config(
+                            TermSetStrategyConfig {
+                                strategy_sink: Some(ps_sink.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let ps_weight = ps_q.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let mut ps_scorer = ps_weight.pruning_scorer(segment, 1.0, 0.0)?;
+            assert_eq!(
+                ps_sink.load(Ordering::Relaxed),
+                StrategyTag::Linear as u8,
+                "{label}: WAND pruning_scorer must choose lazy Linear cache"
+            );
+            let mut top_scores: Vec<(f32, u32)> = Vec::new();
+            while ps_scorer.doc() != TERMINATED {
+                let doc = ps_scorer.doc();
+                let score = ps_scorer.score();
+                top_scores.push((score, doc));
+                top_scores.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                if top_scores.len() > 10 {
+                    top_scores.truncate(10);
+                }
+                if top_scores.len() == 10 {
+                    ps_scorer.set_threshold(top_scores[9].0);
+                }
+                ps_scorer.advance();
+            }
+            let ps_top: Vec<(f32, u32)> = expected_top
+                .iter()
+                .map(|&(score, addr)| (score, addr.doc_id))
+                .collect();
+            assert_eq!(top_scores, ps_top, "{label}: pruning_scorer parity");
+            let evaluated_ps = pred_ps.bytes_telemetry.items.load(Ordering::Relaxed);
+            assert!(
+                evaluated_ps < num_terms / 2,
+                "{label}: WAND pruning_scorer should decode a fraction of {num_terms} terms, got \
+                 {evaluated_ps}"
+            );
+
+            // Non-prunable `AllQuery AND TermPredicateQuery` must stay on `dispatch_postings`
+            // (`Bitset` / `Automaton`), even when executed through `TopDocs` (`for_each_pruning`).
+            let all_pred = Arc::new(SetPredicate::from_strings(
+                f.matching_strings.iter().map(String::as_str),
+            ));
+            let all_sink = Arc::new(AtomicU8::new(0));
+            let all_q = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(AllQuery)),
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(
+                        TermPredicateQuery::new(f.field, all_pred).with_strategy_config(
+                            TermSetStrategyConfig {
+                                strategy_sink: Some(all_sink.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                        0.0,
+                    )),
+                ),
+            ]);
+            let all_top = searcher.search(&all_q, &TopDocs::with_limit(10).order_by_score())?;
+            assert_eq!(all_top.len(), 10);
+            let all_tag = all_sink.load(Ordering::Relaxed);
+            assert!(
+                all_tag == StrategyTag::Automaton as u8 || all_tag == StrategyTag::Bitset as u8,
+                "{label}: AllQuery AND TermPredicateQuery should stay on dispatch_postings, got \
+                 tag={all_tag}"
+            );
+            let all_docs = searcher.search(&all_q, &DocSetCollector)?;
+            assert_eq!(all_docs.len(), f.doc_matched.iter().filter(|&&m| m).count());
+        }
         Ok(())
     }
 
@@ -3389,6 +3621,19 @@ mod tests {
             writer.commit()?;
         }
         let searcher = index.reader()?.searcher();
+        let make_disjunction = || {
+            BooleanQuery::union(
+                ["how", "using", "get", "create"]
+                    .into_iter()
+                    .map(|t| {
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(title_field, t),
+                            IndexRecordOption::WithFreqs,
+                        )) as Box<dyn Query>
+                    })
+                    .collect(),
+            )
+        };
         let large_strings: Vec<String> = unique_keys
             .iter()
             .enumerate()
@@ -3403,63 +3648,100 @@ mod tests {
             large_strings.iter().map(String::as_str),
         ));
 
-        let segment = searcher.segment_reader(0);
-        let enable = EnableScoring::disabled_from_searcher(&searcher);
-        let hint = CandidateHint::Pruned { upper_bound: 400 };
-
         // Default `ExactFastField::Infer` locks aliased `"keyword"`/`"raw"` out of the fast field.
         let infer_sink = Arc::new(AtomicU8::new(0));
-        let infer_w = TermSetQuery::new(large_terms.clone())
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(infer_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _ = infer_w.scorer_for_candidates_unpositioned(segment, 1.0, hint)?;
+        let infer_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermSetQuery::new(large_terms.clone()).with_strategy_config(
+                        TermSetStrategyConfig {
+                            strategy_sink: Some(infer_sink.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                    0.0,
+                )),
+            ),
+        ]);
+        let expected_top = searcher.search(&infer_q, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(expected_top.len(), 10);
         assert_eq!(
             infer_sink.load(Ordering::Relaxed),
             StrategyTag::Automaton as u8
         );
 
         let pred_infer_sink = Arc::new(AtomicU8::new(0));
-        let pred_infer_w = TermPredicateQuery::new(kw_field, large_pred.clone())
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(pred_infer_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _ = pred_infer_w.scorer_for_candidates_unpositioned(segment, 1.0, hint)?;
+        let pred_infer_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermPredicateQuery::new(kw_field, large_pred.clone()).with_strategy_config(
+                        TermSetStrategyConfig {
+                            strategy_sink: Some(pred_infer_sink.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                    0.0,
+                )),
+            ),
+        ]);
+        assert_eq!(
+            searcher.search(&pred_infer_q, &TopDocs::with_limit(10).order_by_score())?,
+            expected_top
+        );
         assert_eq!(
             pred_infer_sink.load(Ordering::Relaxed),
             StrategyTag::Automaton as u8
         );
 
         // `ExactFastField::Available` unlocks `CachedDictPredicateDocSet` (`Linear`) for large K
-        // under pruned candidate probing, while keeping `ExactPostings::Available` (`Bitset`) for
-        // small K.
+        // under WAND pruning, while keeping `ExactPostings::Available` (`Bitset`) for small K.
         let avail_sink = Arc::new(AtomicU8::new(0));
-        let avail_w = TermSetQuery::new(large_terms)
-            .with_exact_fast_field(ExactFastField::Available)
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(avail_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _ = avail_w.scorer_for_candidates_unpositioned(segment, 1.0, hint)?;
+        let avail_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermSetQuery::new(large_terms)
+                        .with_exact_fast_field(ExactFastField::Available)
+                        .with_strategy_config(TermSetStrategyConfig {
+                            strategy_sink: Some(avail_sink.clone()),
+                            ..Default::default()
+                        }),
+                    0.0,
+                )),
+            ),
+        ]);
+        let avail_top = searcher.search(&avail_q, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(avail_top, expected_top);
         assert_eq!(
             avail_sink.load(Ordering::Relaxed),
             StrategyTag::Linear as u8
         );
 
         let pred_avail_sink = Arc::new(AtomicU8::new(0));
-        let pred_avail_w = TermPredicateQuery::new(kw_field, large_pred)
-            .with_exact_fast_field(ExactFastField::Available)
-            .with_strategy_config(TermSetStrategyConfig {
-                strategy_sink: Some(pred_avail_sink.clone()),
-                ..Default::default()
-            })
-            .weight(enable)?;
-        let _ = pred_avail_w.scorer_for_candidates_unpositioned(segment, 1.0, hint)?;
+        let pred_avail_q = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(make_disjunction())),
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(
+                    TermPredicateQuery::new(kw_field, large_pred)
+                        .with_exact_fast_field(ExactFastField::Available)
+                        .with_strategy_config(TermSetStrategyConfig {
+                            strategy_sink: Some(pred_avail_sink.clone()),
+                            ..Default::default()
+                        }),
+                    0.0,
+                )),
+            ),
+        ]);
+        assert_eq!(
+            searcher.search(&pred_avail_q, &TopDocs::with_limit(10).order_by_score())?,
+            expected_top
+        );
         assert_eq!(
             pred_avail_sink.load(Ordering::Relaxed),
             StrategyTag::Linear as u8

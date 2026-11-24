@@ -188,7 +188,6 @@ impl UnpositionedScorer {
     }
 
     /// Returns a reference to the underlying concrete scorer when already positioned.
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn downcast_ref_positioned<T: Scorer>(&self) -> Option<&T> {
         self.positioned
@@ -213,14 +212,7 @@ pub trait PruningScorer: Scorer {
 
 impl_downcast!(PruningScorer);
 
-impl Scorer for Box<dyn PruningScorer> {
-    #[inline]
-    fn score(&mut self) -> Score {
-        self.deref_mut().score()
-    }
-}
-
-impl PruningScorer for Box<dyn PruningScorer> {
+impl<TScorer: PruningScorer + ?Sized> PruningScorer for Box<TScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.deref_mut().set_threshold(score);
@@ -247,6 +239,11 @@ impl Scorer for BasicPruningScorer {
     #[inline]
     fn score(&mut self) -> Score {
         self.current.1
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.scorer.constant_score()
     }
 }
 impl PruningScorer for BasicPruningScorer {
