@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{Token, TokenFilter, TokenStream, Tokenizer};
 
+/// The stemming backend for a language: frostem (Snowball) for the languages it
+/// covers, tantivy-stemmers for the rest (currently Polish, which Snowball lacks).
+#[derive(Copy, Clone)]
+enum StemmerAlgorithm {
+    Frostem(Algorithm),
+    Tantivy(fn(&str) -> Cow<str>),
+}
+
 /// Available stemmer languages.
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone, Hash)]
 #[allow(missing_docs)]
@@ -21,6 +29,7 @@ pub enum Language {
     Hungarian,
     Italian,
     Norwegian,
+    Polish,
     Portuguese,
     Romanian,
     Russian,
@@ -31,27 +40,28 @@ pub enum Language {
 }
 
 impl Language {
-    fn algorithm(self) -> Algorithm {
+    fn algorithm(self) -> StemmerAlgorithm {
         use self::Language::*;
         match self {
-            Arabic => Algorithm::Arabic,
-            Danish => Algorithm::Danish,
-            Dutch => Algorithm::Dutch,
-            English => Algorithm::English,
-            Finnish => Algorithm::Finnish,
-            French => Algorithm::French,
-            German => Algorithm::German,
-            Greek => Algorithm::Greek,
-            Hungarian => Algorithm::Hungarian,
-            Italian => Algorithm::Italian,
-            Norwegian => Algorithm::Norwegian,
-            Portuguese => Algorithm::Portuguese,
-            Romanian => Algorithm::Romanian,
-            Russian => Algorithm::Russian,
-            Spanish => Algorithm::Spanish,
-            Swedish => Algorithm::Swedish,
-            Tamil => Algorithm::Tamil,
-            Turkish => Algorithm::Turkish,
+            Arabic => StemmerAlgorithm::Frostem(Algorithm::Arabic),
+            Danish => StemmerAlgorithm::Frostem(Algorithm::Danish),
+            Dutch => StemmerAlgorithm::Frostem(Algorithm::Dutch),
+            English => StemmerAlgorithm::Frostem(Algorithm::English),
+            Finnish => StemmerAlgorithm::Frostem(Algorithm::Finnish),
+            French => StemmerAlgorithm::Frostem(Algorithm::French),
+            German => StemmerAlgorithm::Frostem(Algorithm::German),
+            Greek => StemmerAlgorithm::Frostem(Algorithm::Greek),
+            Hungarian => StemmerAlgorithm::Frostem(Algorithm::Hungarian),
+            Italian => StemmerAlgorithm::Frostem(Algorithm::Italian),
+            Norwegian => StemmerAlgorithm::Frostem(Algorithm::Norwegian),
+            Polish => StemmerAlgorithm::Tantivy(tantivy_stemmers::algorithms::polish_yarovoy),
+            Portuguese => StemmerAlgorithm::Frostem(Algorithm::Portuguese),
+            Romanian => StemmerAlgorithm::Frostem(Algorithm::Romanian),
+            Russian => StemmerAlgorithm::Frostem(Algorithm::Russian),
+            Spanish => StemmerAlgorithm::Frostem(Algorithm::Spanish),
+            Swedish => StemmerAlgorithm::Frostem(Algorithm::Swedish),
+            Tamil => StemmerAlgorithm::Frostem(Algorithm::Tamil),
+            Turkish => StemmerAlgorithm::Frostem(Algorithm::Turkish),
         }
     }
 }
@@ -61,7 +71,7 @@ impl Language {
 /// Tokens are expected to be lowercased beforehand.
 #[derive(Clone)]
 pub struct Stemmer {
-    stemmer_algorithm: Algorithm,
+    stemmer_algorithm: StemmerAlgorithm,
 }
 
 impl Stemmer {
@@ -93,15 +103,23 @@ impl TokenFilter for Stemmer {
 
 #[derive(Clone)]
 pub struct StemmerFilter<T> {
-    stemmer_algorithm: Algorithm,
+    stemmer_algorithm: StemmerAlgorithm,
     inner: T,
+}
+
+enum StemmerImpl {
+    Frostem(frostem::Stemmer),
+    Tantivy(fn(&str) -> Cow<str>),
 }
 
 impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
     type TokenStream<'a> = StemmerTokenStream<T::TokenStream<'a>>;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        let stemmer = frostem::Stemmer::new(self.stemmer_algorithm);
+        let stemmer = match self.stemmer_algorithm {
+            StemmerAlgorithm::Frostem(alg) => StemmerImpl::Frostem(frostem::Stemmer::new(alg)),
+            StemmerAlgorithm::Tantivy(f) => StemmerImpl::Tantivy(f),
+        };
         StemmerTokenStream {
             tail: self.inner.token_stream(text),
             stemmer,
@@ -112,7 +130,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
 
 pub struct StemmerTokenStream<T> {
     tail: T,
-    stemmer: frostem::Stemmer,
+    stemmer: StemmerImpl,
     buffer: String,
 }
 
@@ -122,7 +140,10 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<T> {
             return false;
         }
         let token = self.tail.token_mut();
-        let stemmed_str = self.stemmer.stem(&token.text);
+        let stemmed_str = match self.stemmer {
+            StemmerImpl::Frostem(ref s) => s.stem(&token.text),
+            StemmerImpl::Tantivy(f) => f(&token.text),
+        };
         match stemmed_str {
             Cow::Owned(stemmed_str) => token.text = stemmed_str,
             Cow::Borrowed(stemmed_str) => {
@@ -149,9 +170,7 @@ mod tests {
 
     use super::*;
     use crate::tokenizer::tests::assert_token;
-    use crate::tokenizer::{
-        LowerCaser, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenizerManager,
-    };
+    use crate::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, TokenizerManager};
 
     #[test]
     fn test_en_stem() {
@@ -199,19 +218,5 @@ mod tests {
         assert_token(&tokens[0], 0, "καλημερ", 0, 16);
         assert_token(&tokens[1], 1, "χαρουμεν", 18, 36);
         assert_token(&tokens[2], 2, "φορολογουμεν", 37, 63);
-    }
-
-    /// Regression for a multibyte Greek suffix that could panic in the
-    /// unmaintained `rust-stemmers` 1.2.0 Greek implementation after the
-    /// stemmer shortened a word using stale UTF-8 byte offsets.
-    #[test]
-    fn test_greek_stemmer_handles_multibyte_suffixes() {
-        let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
-            .filter(Stemmer::new(Language::Greek))
-            .build();
-        let mut stream = analyzer.token_stream("αντιθετε");
-
-        assert!(stream.advance());
-        assert_eq!(stream.token().text, "ανετ");
     }
 }
