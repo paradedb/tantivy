@@ -1,5 +1,7 @@
 mod bitpacked;
 mod blockwise_linear;
+#[cfg(feature = "paradedb")]
+mod blockwise_linear_v2;
 mod line;
 mod linear;
 mod stats_collector;
@@ -16,6 +18,8 @@ use crate::column_values::monotonic_mapping::{
 };
 pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
 pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
+#[cfg(feature = "paradedb")]
+pub(crate) use crate::column_values::u64_based::blockwise_linear_v2::BlockwiseLinearV2Codec;
 pub use crate::column_values::u64_based::linear::LinearCodec;
 pub use crate::column_values::u64_based::stats_collector::StatsCollector;
 use crate::column_values::{ColumnStats, monotonic_map_column};
@@ -75,7 +79,9 @@ pub trait ColumnCodec<T: PartialOrd = u64> {
 }
 
 /// Available codecs to use to encode the u64 (via [`MonotonicallyMappableToU64`]) converted data.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+#[derive(
+    PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum CodecType {
     /// Bitpack all values in the value range. The number of bits is defined by the amplitude
@@ -87,9 +93,22 @@ pub enum CodecType {
     Linear = 1u8,
     /// Same as [`CodecType::Linear`], but encodes in blocks of 512 elements.
     BlockwiseLinear = 2u8,
+    /// Same as [`CodecType::BlockwiseLinear`], but with a fixed-size footer for O(1) block access.
+    #[cfg(feature = "paradedb")]
+    BlockwiseLinearV2 = 3u8,
 }
 
 /// List of all available u64-base codecs.
+#[cfg(feature = "paradedb")]
+pub const ALL_U64_CODEC_TYPES: [CodecType; 4] = [
+    CodecType::Bitpacked,
+    CodecType::Linear,
+    CodecType::BlockwiseLinear,
+    CodecType::BlockwiseLinearV2,
+];
+
+/// List of all available u64-base codecs.
+#[cfg(not(feature = "paradedb"))]
 pub const ALL_U64_CODEC_TYPES: [CodecType; 3] = [
     CodecType::Bitpacked,
     CodecType::Linear,
@@ -97,15 +116,19 @@ pub const ALL_U64_CODEC_TYPES: [CodecType; 3] = [
 ];
 
 impl CodecType {
-    fn to_code(self) -> u8 {
+    /// Returns the u8 code for this codec type.
+    pub fn to_code(self) -> u8 {
         self as u8
     }
 
-    fn try_from_code(code: u8) -> Option<CodecType> {
+    /// Attempts to convert a u8 code to a `CodecType`. Returns `None` for unknown codes.
+    pub fn try_from_code(code: u8) -> Option<CodecType> {
         match code {
             0u8 => Some(CodecType::Bitpacked),
             1u8 => Some(CodecType::Linear),
             2u8 => Some(CodecType::BlockwiseLinear),
+            #[cfg(feature = "paradedb")]
+            3u8 => Some(CodecType::BlockwiseLinearV2),
             _ => None,
         }
     }
@@ -119,6 +142,10 @@ impl CodecType {
             CodecType::Linear => load_specific_codec::<LinearCodec, T>(file_slice),
             CodecType::BlockwiseLinear => {
                 load_specific_codec::<BlockwiseLinearCodec, T>(file_slice)
+            }
+            #[cfg(feature = "paradedb")]
+            CodecType::BlockwiseLinearV2 => {
+                load_specific_codec::<BlockwiseLinearV2Codec, T>(file_slice)
             }
         }
     }
@@ -142,6 +169,8 @@ impl CodecType {
             CodecType::Bitpacked => BitpackedCodec::boxed_estimator(),
             CodecType::Linear => LinearCodec::boxed_estimator(),
             CodecType::BlockwiseLinear => BlockwiseLinearCodec::boxed_estimator(),
+            #[cfg(feature = "paradedb")]
+            CodecType::BlockwiseLinearV2 => BlockwiseLinearV2Codec::boxed_estimator(),
         }
     }
 }
