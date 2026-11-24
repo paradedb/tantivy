@@ -51,6 +51,7 @@ pub mod value;
 mod index;
 pub use batch::{BatchedTermInfoIter, SortedTermSlice, sort_and_dedupe_terms};
 pub use index::{BlockAddr, SSTableIndex, SSTableIndexBuilder};
+
 pub(crate) mod vint;
 pub use dictionary::{Dictionary, TermOrdHit};
 pub use streamer::{Streamer, StreamerBuilder};
