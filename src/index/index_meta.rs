@@ -10,6 +10,8 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
+use crate::vector::quantization::validate_quantization_configs;
+use crate::vector::VectorQuantizationConfig;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +314,21 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
+    /// Doc-count boundary for choosing the vector-storage format on merge.
+    ///
+    /// A merge whose target segment has strictly fewer than this many
+    /// docs writes `.flatvec`; at or above this many docs writes
+    /// `.ivfvec` (clustered). Exactly one format is written per merge —
+    /// `FlatVecPlugin` and `IvfVecPlugin` short-circuit symmetrically
+    /// off this threshold.
+    #[serde(default = "default_vector_clustering_threshold")]
+    #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
+    pub vector_clustering_threshold: usize,
+    /// Per-vector-field quantization configuration. The empty default keeps
+    /// existing and flat-only indexes on the exact path.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vector_quantization: Vec<VectorQuantizationConfig>,
     /// Eligibility and storage limits for fields with bitmap postings enabled.
     #[serde(default, skip_serializing_if = "BitmapPostingsConfig::is_default")]
     pub bitmap_postings: BitmapPostingsConfig,
@@ -330,6 +347,14 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
     types == columnar::DEFAULT_CODEC_TYPES
 }
 
+fn default_vector_clustering_threshold() -> usize {
+    10_000
+}
+
+fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
+    *threshold == default_vector_clustering_threshold()
+}
+
 impl Default for IndexSettings {
     fn default() -> Self {
         Self {
@@ -339,6 +364,8 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
+            vector_clustering_threshold: default_vector_clustering_threshold(),
+            vector_quantization: Vec::new(),
             bitmap_postings: BitmapPostingsConfig::default(),
         }
     }
@@ -348,6 +375,17 @@ impl IndexSettings {
     /// Returns the codec types to use for u64-based column serialization.
     pub fn columnar_codec_types(&self) -> &[columnar::CodecType] {
         &self.codec_types
+    }
+
+    /// Returns the doc-count boundary at which merges switch from flat
+    /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
+    pub fn vector_clustering_threshold(&self) -> usize {
+        self.vector_clustering_threshold
+    }
+
+    /// Validate field-keyed quantization metadata before an index is built.
+    pub fn validate_vector_quantization(&self, schema: &Schema) -> crate::Result<()> {
+        validate_quantization_configs(&self.vector_quantization, schema)
     }
 }
 
@@ -623,6 +661,8 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
+                vector_clustering_threshold: 10_000,
+                vector_quantization: Vec::new(),
                 bitmap_postings: super::BitmapPostingsConfig::default(),
             }
         );

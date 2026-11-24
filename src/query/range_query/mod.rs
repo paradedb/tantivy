@@ -25,5 +25,6 @@ pub(crate) fn is_type_valid_for_fastfield_range_query(typ: Type) -> bool {
         | Type::Bytes => true,
         Type::Facet => false,
         Type::Custom => false,
+        Type::Facet | Type::Vector => false,
     }
 }

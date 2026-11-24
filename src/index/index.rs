@@ -30,6 +30,9 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
+use crate::vector::clustering::{IvfClusterer, SuperKMeansClusterer};
+use crate::vector::write::VectorPlugin;
+use crate::vector::{RouterKind, VectorQuantizationConfig};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -64,11 +67,20 @@ fn load_metas(
 
 /// The built-in plugins, in write order.
 pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-    vec![
+    let mut plugins: Vec<Arc<dyn SegmentPlugin>> = vec![
         Arc::new(InvertedIndexPlugin),
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
-    ]
+    ];
+    plugins.extend(erased_builtin_plugins());
+    plugins
+}
+
+/// The built-in plugins whose writers are driven entirely through the type-erased
+/// [`PluginWriter`](crate::plugin::PluginWriter) interface, unlike the first three
+/// built-ins, whose concrete writer types the `SegmentWriter` constructs directly.
+pub(crate) fn erased_builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+    vec![Arc::new(VectorPlugin)]
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in
@@ -169,6 +181,9 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
+    ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
+    ivf_router: Option<RouterKind>,
+    quantize: Vec<(Field, Vec<u8>)>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -184,6 +199,9 @@ impl IndexBuilder {
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
+            ivf_clusterer: None,
+            ivf_router: None,
+            quantize: Vec::new(),
         }
     }
 
@@ -216,6 +234,31 @@ impl IndexBuilder {
     #[must_use]
     pub fn register_plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
         self.custom_plugins.push(plugin);
+        self
+    }
+
+    /// Sets the clusterer vector merges use once they cross the IVF threshold, in place of the
+    /// built-in [`SuperKMeansClusterer`].
+    #[must_use]
+    pub fn ivf_clusterer(mut self, clusterer: Arc<dyn IvfClusterer>) -> Self {
+        self.ivf_clusterer = Some(clusterer);
+        self
+    }
+
+    /// Sets the router new IVF segments build, in place of the default [`RouterKind`]. Existing
+    /// segments open under the router persisted with them.
+    #[must_use]
+    pub fn ivf_router(mut self, router: RouterKind) -> Self {
+        self.ivf_router = Some(router);
+        self
+    }
+
+    /// Quantizes `field` with one layer per entry of `bits`, in scoring order, each with a fresh
+    /// rotation seed. Applies when the index is created, like [`Self::settings`]; opening an
+    /// existing index keeps its stored configuration.
+    #[must_use]
+    pub fn quantize(mut self, field: Field, bits: impl Into<Vec<u8>>) -> Self {
+        self.quantize.push((field, bits.into()));
         self
     }
 
@@ -285,7 +328,8 @@ impl IndexBuilder {
     }
 
     /// Opens or creates a new index in the provided directory
-    pub fn open_or_create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub fn open_or_create<T: Into<Box<dyn Directory>>>(mut self, dir: T) -> crate::Result<Index> {
+        self.validate()?;
         let dir: Box<dyn Directory> = dir.into();
         if !Index::exists(&*dir)? {
             return self.create(dir);
@@ -293,6 +337,7 @@ impl IndexBuilder {
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
+            self.apply_ivf_overrides(&mut index);
             index.custom_plugins.extend(self.custom_plugins);
             Ok(index)
         } else {
@@ -300,6 +345,41 @@ impl IndexBuilder {
                 "An index exists but the schema does not match.".to_string(),
             ))
         }
+    }
+
+    /// Installs the configured clusterer and router overrides on `index`.
+    fn apply_ivf_overrides(&mut self, index: &mut Index) {
+        if let Some(clusterer) = self.ivf_clusterer.take() {
+            index.set_ivf_clusterer(clusterer);
+        }
+        if let Some(router) = self.ivf_router {
+            index.set_ivf_router(router);
+        }
+    }
+
+    /// Turns each `quantize` request into a configuration in the settings.
+    fn materialize_quantization(&mut self) -> crate::Result<()> {
+        if self.quantize.is_empty() {
+            return Ok(());
+        }
+        let schema = self.get_expect_schema()?;
+        for (field, bits) in std::mem::take(&mut self.quantize) {
+            let entry = schema.get_field_entry(field);
+            let FieldType::Vector(options) = entry.field_type() else {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "field {:?} is not a vector field and cannot be quantized",
+                    entry.name()
+                )));
+            };
+            self.index_settings.vector_quantization.push(
+                VectorQuantizationConfig::with_random_seeds(
+                    entry.name().to_string(),
+                    options,
+                    &bits,
+                )?,
+            );
+        }
+        Ok(())
     }
 
     fn validate(&self) -> crate::Result<()> {
@@ -316,6 +396,7 @@ impl IndexBuilder {
                     }
                 }
             }
+            self.index_settings.validate_vector_quantization(schema)?;
             if !(1..=100).contains(&self.index_settings.bitmap_postings.min_density_percent) {
                 return Err(crate::TantivyError::InvalidArgument(
                     "bitmap posting density must be between 1 and 100 percent".into(),
@@ -371,7 +452,8 @@ impl IndexBuilder {
     /// Creates a new index given an implementation of the trait `Directory`.
     ///
     /// If a directory previously existed, it will be erased.
-    pub(crate) fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub(crate) fn create<T: Into<Box<dyn Directory>>>(mut self, dir: T) -> crate::Result<Index> {
+        self.materialize_quantization()?;
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
@@ -382,8 +464,9 @@ impl IndexBuilder {
             &directory,
         )?;
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
-        metas.index_settings = self.index_settings;
+        metas.index_settings = std::mem::take(&mut self.index_settings);
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
+        self.apply_ivf_overrides(&mut index);
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
@@ -402,6 +485,8 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
+    ivf_clusterer: Arc<dyn IvfClusterer>,
+    ivf_router: RouterKind,
 }
 
 impl Index {
@@ -522,6 +607,8 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
+            ivf_clusterer: Arc::new(SuperKMeansClusterer::new()),
+            ivf_router: RouterKind::default(),
         }
     }
 
@@ -592,7 +679,7 @@ impl Index {
 
     /// Create a default [`IndexReader`] for the given index.
     ///
-    /// See [`Index.reader_builder()`].
+    /// See [`Index::reader_builder`].
     pub fn reader(&self) -> crate::Result<IndexReader> {
         self.reader_builder().try_into()
     }
@@ -773,6 +860,17 @@ impl Index {
         &self.custom_plugins
     }
 
+    /// The plugins whose writers are driven through the type-erased
+    /// [`PluginWriter`](crate::plugin::PluginWriter) interface, in write order: the
+    /// erased built-ins (currently the vector plugin) followed by the registered
+    /// custom plugins.
+    pub(crate) fn erased_plugins(&self) -> Vec<Arc<dyn SegmentPlugin>> {
+        erased_builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
+            .collect()
+    }
+
     /// The sorted set of extensions claimed by the registered custom (non-built-in) plugins.
     pub(crate) fn custom_extensions(&self) -> BTreeSet<&str> {
         self.custom_plugins
@@ -855,6 +953,31 @@ impl Index {
     /// Accessor to the index settings
     pub fn settings_mut(&mut self) -> &mut IndexSettings {
         &mut self.settings
+    }
+
+    /// Replaces the clusterer vector merges use once they cross the IVF threshold.
+    ///
+    /// Not persisted: set it again after every open.
+    pub fn set_ivf_clusterer(&mut self, clusterer: Arc<dyn IvfClusterer>) {
+        self.ivf_clusterer = clusterer;
+    }
+
+    /// Replaces the router new IVF segments build. Existing segments open under the router
+    /// persisted with them.
+    ///
+    /// Not persisted: set it again after every open.
+    pub fn set_ivf_router(&mut self, router: RouterKind) {
+        self.ivf_router = router;
+    }
+
+    /// The clusterer vector merges use once they cross the IVF threshold.
+    pub(crate) fn ivf_clusterer(&self) -> &dyn IvfClusterer {
+        self.ivf_clusterer.as_ref()
+    }
+
+    /// The router new IVF segments build.
+    pub(crate) fn ivf_router(&self) -> RouterKind {
+        self.ivf_router
     }
 
     /// Accessor to the index schema

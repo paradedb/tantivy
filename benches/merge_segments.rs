@@ -295,6 +295,7 @@ fn bench_merge(runner: &mut BenchRunner, group_name: String, scenario: MergeScen
     group.run();
 }
 
+// TODO: Add benchmark for merging ivf clustered segments (ie vector segments)
 fn main() {
     let scenarios = vec![
         build_index(8, 50_000, 12, 8),

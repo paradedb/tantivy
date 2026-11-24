@@ -1,0 +1,32 @@
+[package]
+name = "tantivy-quant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+half.workspace = true
+
+[[bench]]
+name = "rotation"
+harness = false
+
+[[bench]]
+name = "sign_score"
+harness = false
+
+[[bench]]
+name = "grid_kernels"
+harness = false
+
+[[bench]]
+name = "baselines"
+harness = false
+
+[[bench]]
+name = "cascade"
+harness = false

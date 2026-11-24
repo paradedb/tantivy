@@ -20,6 +20,10 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+#[cfg(test)]
+use crate::vector::storage::metadata::VectorColMetadata;
+use crate::vector::storage::reader::VectorFieldReader;
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -40,6 +44,7 @@ pub struct SegmentReader {
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
+    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorFieldReader>>>>,
     delete_opstamp: Option<Opstamp>,
 
     max_doc: DocId,
@@ -175,6 +180,56 @@ impl SegmentReader {
         StoreReader::open(self.store_file().clone(), cache_num_blocks)
     }
 
+    /// Accessor to the [`VectorIndexReader`] for a vector `field` — the
+    /// vector analogue of [`Self::inverted_index`]: opened once per segment
+    /// per field, cached, and shared across queries as an `Arc`. The reader
+    /// pins the field's small routing state (cluster offsets, RNG adjacency,
+    /// centroids) and defers the row payload behind ranged reads.
+    ///
+    /// A segment with no vector data for the field yields an empty reader
+    /// (zero vectors, no index) rather than an error, so callers never branch
+    /// on presence. Requesting a non-vector field is an error.
+    pub fn vector_index(&self, field: Field) -> crate::Result<Arc<VectorIndexReader>> {
+        self.vector_field(field)?.search_reader()
+    }
+
+    /// Returns stored field metadata without reading IdMap, routing payloads or block geometry.
+    /// A segment without vector data returns `None`.
+    #[cfg(test)]
+    pub(crate) fn vector_metadata(
+        &self,
+        field: Field,
+    ) -> crate::Result<Option<Arc<VectorColMetadata>>> {
+        Ok(self.vector_field(field)?.metadata())
+    }
+
+    fn vector_field(&self, field: Field) -> crate::Result<Arc<VectorFieldReader>> {
+        if let Some(reader) = self
+            .vector_reader_cache
+            .read()
+            .expect("Lock poisoned")
+            .get(&field)
+        {
+            return Ok(Arc::clone(reader));
+        }
+        let mut cache = self.vector_reader_cache.write().expect("Lock poisoned");
+        if let Some(reader) = cache.get(&field) {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(VectorFieldReader::open(self, field)?);
+        cache.insert(field, Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    /// Checks the vector format header and each vector field's IVF router kind, without opening
+    /// vector readers. Segments without vector files are accepted.
+    pub fn validate_vector_format(&self) -> crate::Result<()> {
+        crate::vector::storage::header::check_vector_format(
+            |component| self.open_read(component),
+            self.schema(),
+        )
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)
@@ -192,6 +247,7 @@ impl SegmentReader {
             custom_alive_bitset: custom_bitset,
 
             inv_idx_reader_cache: Default::default(),
+            vector_reader_cache: Default::default(),
             delete_opstamp: segment.meta().delete_opstamp(),
 
             max_doc: segment.meta().max_doc(),

@@ -13,6 +13,8 @@ use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::FastValue;
+use crate::schema::Field;
+use crate::vector::{TopDocsByVectorSimilarity, VectorElement};
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
 /// The `TopDocs` collector keeps track of the top `K` documents
@@ -329,6 +331,39 @@ impl TopDocs {
         TopBySortKeyCollector::new(sort_key_computer, self.doc_range())
     }
 
+    /// Ranks documents by similarity to a query vector against a
+    /// [`FieldType::Vector`](crate::schema::FieldType::Vector) field.
+    ///
+    /// The metric is read from the field's
+    /// [`VectorOptions`](crate::schema::VectorOptions) at query time —
+    /// callers don't pick a metric here. All metrics are presented in
+    /// "higher is better" form (L2 is internally negated), so this is
+    /// always a descending sort: the closest docs come first.
+    ///
+    /// Only documents that have a vector for `field` are returned —
+    /// filter-matching docs without a vector are dropped. This differs
+    /// from `order_by_fast_field`'s `None`-trailing convention; the
+    /// constraint comes from IVF, which can't see vectorless docs.
+    ///
+    /// Generic over `T: VectorElement` — `T` is typically `f32` and is
+    /// inferred from the `query` argument; it must match the schema's
+    /// declared dtype.
+    ///
+    /// The driving query (passed to `searcher.search`) decides which docs
+    /// are candidates. For brute-force scan over every doc, pair this with
+    /// [`AllQuery`](crate::query::AllQuery); pair with a filter query to
+    /// restrict candidates.
+    pub fn order_by_similarity<T>(
+        self,
+        field: Field,
+        query: Vec<T>,
+    ) -> TopDocsByVectorSimilarity<T>
+    where
+        T: VectorElement,
+    {
+        TopDocsByVectorSimilarity::new(field, query, self.limit).and_offset(self.offset)
+    }
+
     /// Helper function to tweak the similarity score of documents using a function.
     /// (usually a closure).
     ///
@@ -610,7 +645,7 @@ where
 }
 
 #[inline(always)]
-fn compare_for_top_k<TSortKey, D: Ord, C: Comparator<TSortKey>>(
+pub(crate) fn compare_for_top_k<TSortKey, D: Ord, C: Comparator<TSortKey>>(
     c: &C,
     lhs: &ComparableDoc<TSortKey, D>,
     rhs: &ComparableDoc<TSortKey, D>,
@@ -665,6 +700,26 @@ where
                 // purely local tie. Since we iterate docs in ascending order within
                 // a segment, our doc has a higher `DocId` and must lose the local
                 // tie-breaker.
+                return;
+            }
+        }
+        self.append_doc(doc, sort_key);
+    }
+
+    /// Like [`push`](Self::push), but doesn't require pushes to arrive
+    /// in ascending `DocId`/`DocAddress` order.
+    ///
+    /// The default `push` short-circuits below-threshold candidates with
+    /// a strict `> threshold` test. That's only safe under ascending-D
+    /// pushes — equal-sort-key future pushes are guaranteed to have a
+    /// larger D and thus lose the tie-break, so they can be skipped.
+    /// Out-of-order callers (eg a vector IVF format which visits cluster
+    /// by cluster) can't make that guarantee, so this path relaxes the
+    /// skip to strictly less than the threshold.
+    #[inline]
+    pub fn push_unordered(&mut self, sort_key: TSortKey, doc: D) {
+        if let Some((last_median, _thresh_ord)) = &self.threshold {
+            if self.comparator.compare(&sort_key, last_median) == std::cmp::Ordering::Less {
                 return;
             }
         }
@@ -751,6 +806,38 @@ where
         }
         self.buffer
     }
+
+    /// The exact current n-th best sort key, or `None` while the buffer
+    /// holds fewer than `top_n` entries — with no externally-set threshold
+    /// that is exactly "fewer than `top_n` entries ever collected": nothing
+    /// is dropped before the first truncation, and truncation never shrinks
+    /// the buffer below `top_n`. Also `None` for `top_n == 0`, where "n-th
+    /// best" is undefined.
+    ///
+    /// * Returns (`Option<TSortKey>`): the n-th best key under this computer's comparator, cloned
+    ///   out of the buffer.
+    ///
+    /// Side effect: a buffer holding more than `top_n` entries is
+    /// force-truncated to exactly `top_n` through the same machinery the
+    /// capacity overflow uses, which also updates `threshold` — so
+    /// subsequent [`push`](Self::push) / [`push_unordered`](Self::push_unordered)
+    /// early-drops kick in sooner than they would have without this call.
+    /// Each call is O(buffer); intended for coarse boundaries (e.g. once
+    /// per probed IVF cluster), not per push.
+    pub fn kth_best(&mut self) -> Option<TSortKey> {
+        if self.top_n == 0 || self.buffer.len() < self.top_n {
+            return None;
+        }
+        if self.buffer.len() > self.top_n {
+            self.truncate_top_n();
+        }
+        // The buffer now holds exactly the top_n best, unordered; the n-th
+        // best is its minimum under the comparator.
+        self.buffer
+            .iter()
+            .min_by(|a, b| self.comparator.compare(&a.sort_key, &b.sort_key))
+            .map(|entry| entry.sort_key.clone())
+    }
 }
 
 // Push an element provided there is enough capacity to do so.
@@ -819,6 +906,99 @@ mod tests {
     }
 
     #[test]
+    fn test_kth_best_none_below_capacity() {
+        // Fewer than top_n entries collected: no n-th best exists yet.
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(3, NaturalComparator);
+        assert_eq!(computer.kth_best(), None);
+        computer.push(10u32, 1u32);
+        computer.push(20u32, 2u32);
+        assert_eq!(computer.kth_best(), None);
+
+        // top_n == 0 has no "n-th best" no matter how much is pushed.
+        let mut zero: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(0, NaturalComparator);
+        zero.push(1u32, 1u32);
+        assert_eq!(zero.kth_best(), None);
+    }
+
+    #[test]
+    fn test_kth_best_exact_at_capacity() {
+        // Exactly top_n entries: the n-th best is the worst of them.
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(3, NaturalComparator);
+        computer.push(30u32, 1u32);
+        computer.push(10u32, 2u32);
+        computer.push(20u32, 3u32);
+        assert_eq!(computer.kth_best(), Some(10u32));
+    }
+
+    #[test]
+    fn test_kth_best_tracks_improvement() {
+        // As better entries displace the tail, the n-th best rises — and
+        // it is exact at every boundary, not lagging like `threshold`.
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(2, NaturalComparator);
+        computer.push(10u32, 1u32);
+        computer.push(20u32, 2u32);
+        assert_eq!(computer.kth_best(), Some(10u32));
+        computer.push(30u32, 3u32);
+        assert_eq!(computer.kth_best(), Some(20u32));
+        computer.push(40u32, 4u32);
+        assert_eq!(computer.kth_best(), Some(30u32));
+        // A push below the current n-th best must not lower it.
+        computer.push(5u32, 5u32);
+        assert_eq!(computer.kth_best(), Some(30u32));
+    }
+
+    #[test]
+    fn test_kth_best_after_natural_truncation() {
+        // Overflow the 2*top_n buffer so `truncate_top_n` has already
+        // fired naturally; `kth_best` must still be the exact n-th best of
+        // everything pushed.
+        let top_n = 4usize;
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(top_n, NaturalComparator);
+        for doc in 0..20u32 {
+            computer.push(doc, doc); // scores 0..20, ascending
+        }
+        // Top 4 scores are 19, 18, 17, 16 — the 4th best is 16.
+        assert_eq!(computer.kth_best(), Some(16u32));
+        // The forced truncation set a threshold as a side effect.
+        assert!(computer.threshold.is_some());
+        // The final results are unaffected by the interleaved queries.
+        let docs: Vec<u32> = computer.into_sorted_vec().iter().map(|d| d.doc).collect();
+        assert_eq!(docs, vec![19, 18, 17, 16]);
+    }
+
+    #[test]
+    fn test_kth_best_with_push_unordered_natural_comparator() {
+        // The vector-backend shape: f32 scores, NaturalComparator (higher
+        // is better), out-of-order pushes. Interleave queries with pushes
+        // and confirm both the boundary values and the final top-K.
+        let mut computer: TopNComputer<Score, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(2, NaturalComparator);
+        computer.push_unordered(0.5f32, 10u32);
+        assert_eq!(computer.kth_best(), None);
+        computer.push_unordered(0.9f32, 3u32);
+        assert_eq!(computer.kth_best(), Some(0.5f32));
+        computer.push_unordered(0.7f32, 7u32);
+        assert_eq!(computer.kth_best(), Some(0.7f32));
+        // Below the n-th best: dropped by the truncation threshold, and
+        // the n-th best is unchanged.
+        computer.push_unordered(0.1f32, 1u32);
+        assert_eq!(computer.kth_best(), Some(0.7f32));
+        computer.push_unordered(1.5f32, 99u32);
+        assert_eq!(computer.kth_best(), Some(0.9f32));
+        let result: Vec<(Score, u32)> = computer
+            .into_sorted_vec()
+            .into_iter()
+            .map(|d| (d.sort_key, d.doc))
+            .collect();
+        assert_eq!(result, vec![(1.5f32, 99u32), (0.9f32, 3u32)]);
+    }
+
+    #[test]
     fn test_topn_computer() {
         let mut computer: TopNComputer<u32, u32, NaturalComparator> =
             TopNComputer::new_with_comparator(2, NaturalComparator);
@@ -865,6 +1045,62 @@ mod tests {
                 ComparableDoc {
                     sort_key: 1u32,
                     doc: 2u32,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_topn_computer_push_unordered() {
+        // Same inputs as test_topn_computer, but pushed in a non-ascending
+        // DocId order — push_unordered should still produce the right top-K
+        // and (where ties exist) the smallest-DocId tie-break.
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(2, NaturalComparator);
+
+        computer.push_unordered(3u32, 3u32);
+        computer.push_unordered(1u32, 5u32);
+        computer.push_unordered(2u32, 2u32);
+        computer.push_unordered(2u32, 4u32);
+        computer.push_unordered(1u32, 1u32);
+        assert_eq!(
+            computer.into_sorted_vec(),
+            &[
+                ComparableDoc {
+                    sort_key: 3u32,
+                    doc: 3u32,
+                },
+                ComparableDoc {
+                    sort_key: 2u32,
+                    doc: 2u32,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_topn_computer_push_unordered_tiebreak_on_equal_sort_key() {
+        // Tied sort keys must still resolve to the smallest DocId, even when
+        // doc ids arrive out of order (and even when the smaller-DocId
+        // candidate arrives *after* the larger-DocId one).
+        let mut computer: TopNComputer<u32, u32, NaturalComparator> =
+            TopNComputer::new_with_comparator(2, NaturalComparator);
+
+        computer.push_unordered(1u32, 100u32);
+        computer.push_unordered(1u32, 50u32);
+        computer.push_unordered(1u32, 200u32);
+        computer.push_unordered(1u32, 25u32);
+        computer.push_unordered(1u32, 175u32);
+        assert_eq!(
+            computer.into_sorted_vec(),
+            &[
+                ComparableDoc {
+                    sort_key: 1u32,
+                    doc: 25u32,
+                },
+                ComparableDoc {
+                    sort_key: 1u32,
+                    doc: 50u32,
                 }
             ]
         );

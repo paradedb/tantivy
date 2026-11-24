@@ -81,6 +81,15 @@ impl Segment {
         self.index.directory().open_read(&path)
     }
 
+    /// Checks the vector format header and each vector field's IVF router kind, without opening
+    /// vector readers. Segments without vector files are accepted.
+    pub fn validate_vector_format(&self) -> crate::Result<()> {
+        crate::vector::storage::header::check_vector_format(
+            |component| self.open_read(component),
+            &self.schema(),
+        )
+    }
+
     /// Open one of the component file for *regular* write.
     pub fn open_write(&self, component: SegmentComponent) -> Result<WritePtr, OpenWriteError> {
         let path = self.relative_path(component);

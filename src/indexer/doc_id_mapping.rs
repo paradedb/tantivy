@@ -50,6 +50,10 @@ impl SegmentDocIdMapping {
         self.new_doc_id_to_old_doc_addr.iter().copied()
     }
 
+    pub(crate) fn iter_source_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
+        self.iter_old_doc_addrs()
+    }
+
     /// This flags means the segments are simply stacked in the order of their ordinal.
     /// e.g. [(0, 1), .. (n, 1), (0, 2)..., (m, 2)]
     ///
@@ -128,6 +132,10 @@ impl DocIdMapping {
     /// Iiterate over old doc_ids in order of the new doc_ids
     pub(crate) fn iter_old_doc_ids(&self) -> impl Iterator<Item = DocId> + Clone + '_ {
         self.new_doc_id_to_old.iter().copied()
+    }
+
+    pub(crate) fn iter_source_doc_ids(&self) -> impl Iterator<Item = DocId> + Clone + '_ {
+        self.iter_old_doc_ids()
     }
 
     /// Returns the new doc_ids in order of the old doc_ids
