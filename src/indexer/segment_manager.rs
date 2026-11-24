@@ -114,6 +114,7 @@ impl SegmentManager {
     }
 
     /// Deletes all empty segments
+    #[allow(dead_code)]
     fn remove_empty_segments(&self) {
         let mut registers_lock = self.write();
         registers_lock
@@ -215,7 +216,13 @@ impl SegmentManager {
     }
 
     pub fn committed_segment_metas(&self) -> Vec<SegmentMeta> {
-        self.remove_empty_segments();
+        // When a SegmentMeta's DeleteMeta shows max_doc = num_docs_deleted, then all documents in
+        // this segment have been deleted and Tantivy simply removes this segment from the
+        // meta.json file. We don't want to do this -- we want to actually write the
+        // DeletaMeta to the meta.json file because our visibility rules are different for
+        // "segments that have been deleted" vs. "segments with a DeleteMeta"
+
+        // self.remove_empty_segments();
         let registers_lock = self.read();
         registers_lock.committed.segment_metas()
     }
