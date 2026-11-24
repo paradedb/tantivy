@@ -1,5 +1,6 @@
 use columnar::StrColumn;
 
+use crate::collector::sort_key::shared_threshold::SharedThresholdArcOpt;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::termdict::TermOrdinal;
@@ -32,6 +33,18 @@ impl SortKeyComputer for SortByString {
     type SortKey = Option<String>;
     type Child = ByStringColumnSegmentSortKeyComputer;
     type Comparator = NaturalComparator;
+
+    fn shared_threshold(
+        &self,
+    ) -> SharedThresholdArcOpt<
+        <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+    > {
+        // NB: Sharing a threshold for a String or Bytes column is harder than it looks!
+        // `TermOrdinals` are not comparable across segments, and so must be resolved via their
+        // `TermDictionary` into a string (an expensive process!) before publishing or consumption
+        // in the SharedThreshold.
+        None
+    }
 
     fn segment_sort_key_computer(
         &self,
@@ -68,5 +81,17 @@ impl SegmentSortKeyComputer for ByStringColumnSegmentSortKeyComputer {
             .ord_to_term(term_ord, &mut bytes)
             .ok()?;
         String::try_from(bytes).ok()
+    }
+
+    fn supports_bm25_pruning(&self) -> bool {
+        false
+    }
+    fn bm25_pruning_threshold(
+        &self,
+        _threshold: &Self::SegmentSortKey,
+        _segment_ord: crate::SegmentOrdinal,
+        _threshold_ord: crate::SegmentOrdinal,
+    ) -> Option<crate::Score> {
+        None
     }
 }

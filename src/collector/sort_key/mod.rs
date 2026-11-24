@@ -1,4 +1,5 @@
 mod order;
+pub mod shared_threshold;
 mod sort_by_bytes;
 mod sort_by_erased_type;
 mod sort_by_score;
@@ -7,6 +8,9 @@ mod sort_by_string;
 mod sort_key_computer;
 
 pub use order::*;
+pub use shared_threshold::{
+    AtomicSharedThreshold, SharedThreshold, SharedThresholdArc, SharedThresholdArcOpt,
+};
 pub use sort_by_bytes::SortByBytes;
 pub use sort_by_erased_type::SortByErasedType;
 pub use sort_by_score::SortBySimilarityScore;
@@ -276,7 +280,8 @@ pub(crate) mod tests {
             let searcher = index.reader()?.searcher();
             let ids = id_mapping(&searcher);
 
-            let top_collector = TopDocs::with_limit(4).order_by((SortBySimilarityScore, order));
+            let top_collector =
+                TopDocs::with_limit(4).order_by((SortBySimilarityScore::new(), order));
             let field = index.schema().get_field("catchphrase").unwrap();
             let query_parser = QueryParser::for_index(index, vec![field]);
             let text_query = query_parser.parse_query("glow")?;
@@ -316,7 +321,7 @@ pub(crate) mod tests {
             let ids = id_mapping(&searcher);
 
             let top_collector = TopDocs::with_limit(4).order_by((
-                (SortBySimilarityScore, score_order),
+                (SortBySimilarityScore::new(), score_order),
                 (SortByString::for_field("city"), city_order),
             ));
             let results: Vec<((Score, Option<String>), DocAddress)> =
@@ -361,7 +366,7 @@ pub(crate) mod tests {
             let ids = id_mapping(&searcher);
 
             let top_collector = TopDocs::with_limit(4).order_by::<(Score, OwnedValue)>((
-                (SortBySimilarityScore, score_order),
+                (SortBySimilarityScore::new(), score_order),
                 (SortByErasedType::for_field("city"), city_order),
             ));
             let results: Vec<((Score, OwnedValue), DocAddress)> =
@@ -451,6 +456,62 @@ pub(crate) mod tests {
                 expected_docs,
                 top_n_results
             );
+        }
+
+        #[test]
+        fn test_order_by_score_then_fast_field_prop(
+            limit in 1..64_usize,
+            offset in 0..64_usize,
+            segments_docs in
+              proptest::collection::vec(
+                  proptest::collection::vec(
+                      // (doc_terms, fast_field_val)
+                      (proptest::collection::vec(0..5_u8, 1..10_usize), 0..100_u64),
+                      1..32_usize
+                  ),
+                  0..8_usize,
+              )
+        ) {
+            use crate::query::TermQuery;
+            use crate::schema::IndexRecordOption;
+            use crate::Term;
+
+            let mut schema_builder = Schema::builder();
+            let text = schema_builder.add_text_field("text", TEXT);
+            let value = schema_builder.add_u64_field("value", FAST);
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+            let mut index_writer = index.writer_for_tests().unwrap();
+
+            for segment_docs in segments_docs.into_iter() {
+                for (term_ids, val) in segment_docs.into_iter() {
+                    let term_str = term_ids.into_iter().map(|id| format!("term{id}")).collect::<Vec<_>>().join(" ");
+                    index_writer.add_document(doc!(
+                        text => term_str,
+                        value => val,
+                    )).unwrap();
+                }
+                index_writer.commit().unwrap();
+            }
+
+            let searcher = index.reader().unwrap().searcher();
+            let query = TermQuery::new(Term::from_field_text(text, "term0"), IndexRecordOption::WithFreqs);
+
+            // 1. TopDocs with BMW (Score, u64)
+            let top_collector = TopDocs::with_limit(limit).and_offset(offset).order_by::<(Score, Option<u64>)>((
+                (SortBySimilarityScore::new(), Order::Desc),
+                (SortByStaticFastValue::for_field("value"), Order::Desc),
+            ));
+            let top_n_results: Vec<((Score, Option<u64>), DocAddress)> = searcher.search(&query, &top_collector).unwrap();
+
+            // 2. Golden baseline: collect all with scoring
+            let all_collector = TopDocs::with_limit(1000).order_by::<(Score, Option<u64>)>((
+                (SortBySimilarityScore::new(), Order::Desc),
+                (SortByStaticFastValue::for_field("value"), Order::Desc),
+            ));
+            let expected_docs = searcher.search(&query, &all_collector).unwrap().into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+            prop_assert_eq!(expected_docs, top_n_results);
         }
     }
 }

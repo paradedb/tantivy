@@ -1,10 +1,43 @@
-use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
-use crate::{DocAddress, DocId, Score};
+use std::sync::Arc;
 
-/// Sort by similarity score.
-#[derive(Clone, Debug, Copy)]
-pub struct SortBySimilarityScore;
+use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArcOpt};
+use crate::collector::sort_key::NaturalComparator;
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::{DocId, Score, SegmentOrdinal};
+
+#[derive(Clone)]
+pub struct SortBySimilarityScore {
+    shared_threshold: SharedThresholdArcOpt<Score>,
+}
+
+impl std::fmt::Debug for SortBySimilarityScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortBySimilarityScore")
+            .field(
+                "threshold",
+                &self.shared_threshold.as_ref().and_then(|s| s.load()),
+            )
+            .finish()
+    }
+}
+
+impl Default for SortBySimilarityScore {
+    fn default() -> Self {
+        Self {
+            shared_threshold: Some(Arc::new(AtomicSharedThreshold::default())),
+        }
+    }
+}
+
+impl SortBySimilarityScore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_shared_threshold(shared_threshold: SharedThresholdArcOpt<Score>) -> Self {
+        Self { shared_threshold }
+    }
+}
 
 impl SortKeyComputer for SortBySimilarityScore {
     type SortKey = Score;
@@ -17,47 +50,19 @@ impl SortKeyComputer for SortBySimilarityScore {
         true
     }
 
+    fn shared_threshold(
+        &self,
+    ) -> SharedThresholdArcOpt<
+        <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+    > {
+        self.shared_threshold.clone()
+    }
+
     fn segment_sort_key_computer(
         &self,
         _segment_reader: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
-        Ok(SortBySimilarityScore)
-    }
-
-    // Sorting by score is special in that it allows for the Block-Wand optimization.
-    fn collect_segment_top_k(
-        &self,
-        k: usize,
-        weight: &dyn crate::query::Weight,
-        reader: &crate::SegmentReader,
-        segment_ord: u32,
-    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
-        let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
-            TopNComputer::new_with_comparator(k, self.comparator());
-
-        if let Some(alive_bitset) = reader.alive_bitset() {
-            let mut threshold = Score::MIN;
-            top_n.threshold = Some(threshold);
-            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
-                if alive_bitset.is_deleted(doc) {
-                    return threshold;
-                }
-                top_n.push(score, doc);
-                threshold = top_n.threshold.unwrap_or(Score::MIN);
-                threshold
-            })?;
-        } else {
-            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
-                top_n.push(score, doc);
-                top_n.threshold.unwrap_or(Score::MIN)
-            })?;
-        }
-
-        Ok(top_n
-            .into_vec()
-            .into_iter()
-            .map(|cid| (cid.sort_key, DocAddress::new(segment_ord, cid.doc)))
-            .collect())
+        Ok(self.clone())
     }
 }
 
@@ -73,5 +78,22 @@ impl SegmentSortKeyComputer for SortBySimilarityScore {
 
     fn convert_segment_sort_key(&self, score: Score) -> Score {
         score
+    }
+
+    fn supports_bm25_pruning(&self) -> bool {
+        true
+    }
+
+    fn bm25_pruning_threshold(
+        &self,
+        threshold: &Score,
+        segment_ord: SegmentOrdinal,
+        threshold_ord: SegmentOrdinal,
+    ) -> Option<Score> {
+        if segment_ord < threshold_ord {
+            Some(threshold.next_down())
+        } else {
+            Some(*threshold)
+        }
     }
 }
