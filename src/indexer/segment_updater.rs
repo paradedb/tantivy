@@ -36,18 +36,29 @@ const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 /// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
-pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
+pub(crate) fn save_metas(
+    metas: &IndexMeta,
+    previous_metas: &IndexMeta,
+    directory: &dyn Directory,
+) -> crate::Result<()> {
     debug!("save metas");
-    let mut buffer = serde_json::to_vec_pretty(metas)?;
-    // Just adding a new line at the end of the buffer.
-    writeln!(&mut buffer)?;
-    crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
-        std::io::Error::other(msg.unwrap_or_else(|| "Undefined".to_string()))
-    )));
-    directory.sync_directory()?;
-    directory.atomic_write(&META_FILEPATH, &buffer[..])?;
-    debug!("Saved metas {:?}", serde_json::to_string_pretty(&metas));
-    Ok(())
+
+    match directory.save_metas(metas, previous_metas, &mut ()) {
+        Ok(_) => Ok(()),
+        Err(crate::TantivyError::InternalError(_)) => {
+            let mut buffer = serde_json::to_vec_pretty(metas)?;
+            // Just adding a new line at the end of the buffer.
+            writeln!(&mut buffer)?;
+            crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
+                std::io::Error::other(msg.unwrap_or_else(|| "Undefined".to_string()))
+            )));
+            directory.sync_directory()?;
+            directory.atomic_write(&META_FILEPATH, &buffer[..])?;
+            debug!("Saved metas {:?}", serde_json::to_string_pretty(&metas));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // The segment update runner is in charge of processing all
@@ -258,16 +269,28 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     );
 
     let index_meta = IndexMeta {
-        index_settings: target_settings, // index_settings of all segments should be the same
-        persisted_custom_extensions,
+        index_settings: target_settings.clone(), // index_settings of all segments should be the same
+        persisted_custom_extensions: persisted_custom_extensions.clone(),
         segments: vec![segment_meta],
-        schema: target_schema,
+        schema: target_schema.clone(),
         opstamp: 0u64,
         payload: Some(stats),
     };
 
     // save the meta.json
-    save_metas(&index_meta, merged_index.directory_mut())?;
+    let segment_metas = segments
+        .iter()
+        .map(|segment| segment.meta().clone())
+        .collect();
+    let previous_meta = IndexMeta {
+        index_settings: target_settings,
+        persisted_custom_extensions,
+        segments: segment_metas,
+        schema: target_schema,
+        opstamp: 0u64,
+        payload: None,
+    };
+    save_metas(&index_meta, &previous_meta, merged_index.directory_mut())?;
 
     Ok(merged_index)
 }
@@ -406,6 +429,7 @@ impl SegmentUpdater {
         &self,
         opstamp: Opstamp,
         commit_message: Option<String>,
+        previous_metas: &IndexMeta,
     ) -> crate::Result<()> {
         if self.is_alive() {
             let index = &self.index;
@@ -437,7 +461,11 @@ impl SegmentUpdater {
                 payload: commit_message,
             };
             // TODO add context to the error.
-            save_metas(&index_meta, directory.box_clone().borrow_mut())?;
+            save_metas(
+                &index_meta,
+                &previous_metas,
+                directory.box_clone().borrow_mut(),
+            )?;
             self.store_meta(&index_meta);
         }
         Ok(())
@@ -472,8 +500,9 @@ impl SegmentUpdater {
         let segment_updater: SegmentUpdater = self.clone();
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            let previous_metas = segment_updater.load_meta();
             segment_updater.segment_manager.commit(segment_entries);
-            segment_updater.save_metas(opstamp, payload)?;
+            segment_updater.save_metas(opstamp, payload, &previous_metas)?;
             let _ = garbage_collect_files(segment_updater.clone());
             segment_updater.consider_merge_options();
             Ok(opstamp)
@@ -687,8 +716,11 @@ impl SegmentUpdater {
                     .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
 
                 if segments_status == SegmentsStatus::Committed {
-                    segment_updater
-                        .save_metas(previous_metas.opstamp, previous_metas.payload.clone())?;
+                    segment_updater.save_metas(
+                        previous_metas.opstamp,
+                        previous_metas.payload.clone(),
+                        &previous_metas,
+                    )?;
                 }
 
                 segment_updater.consider_merge_options();
