@@ -601,9 +601,18 @@ impl<'a> QuantizedState<'a> {
         }
         let kth = bound.shared_threshold();
         let segment_ord = self.segment_ord;
+        let counted = |row| kth.is_some_and(|kth| bound.counts(segment_ord, row, kth));
         self.candidates.band(
             kth.map(|score| Threshold(crate::vector::search::interval::LowerEndpoint(score))),
-            |row| kth.is_some_and(|kth| bound.counts(segment_ord, row, kth)),
+            |row| {
+                // At layer 0 the bound holds each row at the lower endpoint of the interval
+                // tested here, so a counted row always reaches the threshold.
+                debug_assert!(
+                    layer > 0 || !counted(row),
+                    "layer 0 dropped counted {row:?}"
+                );
+                layer > 0 && counted(row)
+            },
         );
         report.layers[layer].survivors = self.candidates.len();
         #[cfg(test)]
