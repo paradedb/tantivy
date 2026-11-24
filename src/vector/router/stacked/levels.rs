@@ -7,16 +7,13 @@
 //! [`StackedIvf::build`] creates one level. [`StackedIvf::add_level`]
 //! hangs a parent on this level and reorders this level's centroids and
 //! offset ranges so parent member `i` is list `i`. Member rows stay put;
-//! a later parent only shuffles this level's metadata. [`StackedIvfBuilder`]
-//! walks up, calling `add_level` until the top has at most
-//! `branching_factor` lists. L0 granularity is `max_leaf_size`
-//! (`nlist ≈ n / max_leaf_size`); `branching_factor` is the tree fan-out.
+//! a later parent only shuffles this level's metadata. Each level's `nlist`
+//! is `ceil(√n)`; [`StackedIvfBuilder`] hangs a parent while the current
+//! top has at least [`MIN_NLIST_FOR_PARENT`] lists.
 //!
-//! Search works on any [`VectorArena`]. Build and payload serialization require
-//! owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
+//! Search uses the same hierarchy with full-precision or quantized scoring sources.
+//! Build requires owned [`InMemoryStore`]s. [`StackedIvf::open`] is search-only.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::{fmt, mem};
@@ -28,10 +25,14 @@ use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::distance::Similarity;
 use crate::vector::router::arena::{FileSliceArena, VectorArena};
+#[cfg(any(test, feature = "unstable"))]
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::aps;
-use crate::vector::router::stacked::aps::RecallEstimator;
+#[cfg(any(test, feature = "unstable"))]
+use crate::vector::search::prepared::{invalid_query, VectorQuery};
 use crate::vector::VectorElement;
+
+/// List count and member-row ranges for one persisted level.
+pub(crate) type LevelTopology = (usize, Vec<(u64, u64)>);
 
 /// Row index into a level's centroid or member arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -65,35 +66,32 @@ impl From<usize> for ClusterId {
     }
 }
 
-/// Default `nprobe_fraction` for parent levels (L1, L2, …).
+/// Default `nprobe_fraction` for parent levels (L1, L2, ...).
 pub(crate) const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
-/// Recall target used when this level searches its parent.
-pub(crate) const PARENT_RECALL_TARGET: f32 = 0.99;
+/// Member-heap overscan when converting a size-`k` request into how many
+/// lists to open: beam ~ `LIST_OVERSCAN * k` members, then to lists.
+pub(crate) const LIST_OVERSCAN: usize = 2;
 
-/// Default fan-out of the Multi-level IVF index
-pub(crate) const DEFAULT_BRANCHING_FACTOR: usize = 100;
+/// [`StackedIvfBuilder`] hangs a parent only while the current top has at
+/// least this many lists. Below that, the top is scored in full and pruned
+/// with [`StackedIvf::lists_to_open`] (floor [`PARENT_NPROBE_FRACTION`]).
+pub(crate) const MIN_NLIST_FOR_PARENT: usize = 256;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
 pub struct StackedIvfConfig {
     /// Initial candidate fraction `f_M`: `|S| = nprobe_fraction * nlist`.
+    /// List selection at search time is [`StackedIvf::lists_to_open`]: floor
+    /// [`PARENT_NPROBE_FRACTION`], beam ~ [`LIST_OVERSCAN`] * `k` members, cap
+    /// `nlist`.
     pub nprobe_fraction: f32,
-    /// IVF tree fan-out. Parent lists hold about this many children, and
-    /// stacking stops when the top has at most this many lists.
-    pub branching_factor: usize,
-    /// Recall target this level passes to its parent when APS is on.
-    /// `1.0` makes the parent scan its full candidate set (exact routing
-    /// when the parent is the top level).
-    pub parent_recall_target: f32,
 }
 
 impl Default for StackedIvfConfig {
     fn default() -> Self {
         Self {
             nprobe_fraction: 0.02,
-            branching_factor: DEFAULT_BRANCHING_FACTOR,
-            parent_recall_target: PARENT_RECALL_TARGET,
         }
     }
 }
@@ -102,18 +100,15 @@ impl StackedIvfConfig {
     fn for_parent(&self) -> Self {
         Self {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            branching_factor: self.branching_factor,
-            parent_recall_target: self.parent_recall_target,
         }
     }
 
-    fn nlist_for(&self, n: usize) -> usize {
-        assert!(
-            self.branching_factor >= 2,
-            "branching_factor must be >= 2, got {}",
-            self.branching_factor
-        );
-        (n / self.branching_factor).max(1).min(n)
+    /// k-means target for a level over `n` members: `ceil(√n)`.
+    fn nlist_for(n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        ((n as f64).sqrt().ceil() as usize).max(1).min(n)
     }
 }
 
@@ -185,7 +180,7 @@ pub trait LevelClusterer {
     ) -> (Vec<Self::Elem>, Vec<u32>);
 }
 
-/// [`HierarchicalSuperKMeans`] with `max_leaf_size ≈ n / nlist`. Meso and fine
+/// [`HierarchicalSuperKMeans`] with `target_leaf_size ≈ n / nlist`. Meso and fine
 /// iterations keep the library defaults. [`Self::for_metric`] clusters Cosine
 /// and Dot by angle, the same rule as the segment's IVF.
 #[derive(Clone, Copy, Debug, Default)]
@@ -197,7 +192,7 @@ impl SuperKMeansLevelClusterer {
     /// Angular clustering for Cosine and Dot; Euclidean for L2.
     pub fn for_metric(metric: Metric) -> Self {
         Self {
-            angular: matches!(metric, Metric::Cosine | Metric::Dot),
+            angular: metric.clusters_by_angle(),
         }
     }
 }
@@ -209,7 +204,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
         assert!(n > 0 && dim > 0 && nlist > 0);
         assert_eq!(data.len(), n * dim);
         let nlist = nlist.min(n).max(1);
-        let max_leaf_size = n.div_ceil(nlist).max(1);
+        let target_leaf_size = n.div_ceil(nlist).max(1);
 
         let base = SuperKMeansConfig {
             data_already_rotated: true,
@@ -218,7 +213,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
         };
         let cfg = HierarchicalSuperKMeansConfig {
             base,
-            max_leaf_size,
+            target_leaf_size,
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
@@ -231,7 +226,7 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
 /// One IVF level. `parent` is the next level up (L0's parent is L1).
 ///
 /// List `j` is `vectors` rows `offsets[j].0..offsets[j].1`. Search is
-/// available for any [`VectorArena`]; [`build`](StackedIvf::build) and
+/// available for any batch-scoring representation; [`build`](StackedIvf::build) and
 /// [`add_level`](StackedIvf::add_level) require [`InMemoryStore`].
 pub struct StackedIvf<S> {
     pub config: StackedIvfConfig,
@@ -243,17 +238,11 @@ pub struct StackedIvf<S> {
     pub vectors: S,
 }
 
-/// File-backed row-major `f32` matrix.
-///
-/// Rows are fetched per call through a [`FileSliceArena`] unless the store
-/// was opened [`pinned`](Self::pinned), in which case the decoded rows are
-/// held in memory. Router-level centroids are pinned at open: they are
-/// `nlist × dim` (tiny next to the member rows) and APS needs the full
-/// matrix to compute query-to-bisector distances.
+/// File-backed row-major `f32` matrix, read only as rows are scored.
+#[derive(Clone)]
 pub(crate) struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
-    pinned: Option<Vec<f32>>,
 }
 
 impl LazyStore {
@@ -262,30 +251,7 @@ impl LazyStore {
         LazyStore {
             arena: FileSliceArena::new(rows),
             dim,
-            pinned: None,
         }
-    }
-
-    /// Wraps `rows` and decodes them into memory once, so
-    /// [`CentroidMatrix`] is available and scoring skips the file.
-    pub(crate) fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
-        let bytes = rows.read_bytes()?;
-        if bytes.len() % (dim * mem::size_of::<f32>()) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pinned store bytes are not a multiple of the row stride",
-            ));
-        }
-        let values = bytes
-            .as_slice()
-            .chunks_exact(mem::size_of::<f32>())
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
-            .collect();
-        Ok(LazyStore {
-            arena: FileSliceArena::new(rows),
-            dim,
-            pinned: Some(values),
-        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -294,18 +260,13 @@ impl LazyStore {
 
     /// Appends row `index` to `out`.
     pub(crate) fn extend_with_row(&self, index: u32, out: &mut Vec<f32>) -> io::Result<()> {
-        match &self.pinned {
-            Some(rows) => out.extend_from_slice(&rows[index as usize * self.dim..][..self.dim]),
-            None => {
-                let bytes = self.arena.row_bytes(self.dim, index)?;
-                out.extend(
-                    bytes
-                        .as_slice()
-                        .chunks_exact(mem::size_of::<f32>())
-                        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))),
-                );
-            }
-        }
+        let bytes = self.arena.row_bytes(self.dim, index)?;
+        out.extend(
+            bytes
+                .as_slice()
+                .chunks_exact(mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))),
+        );
         Ok(())
     }
 }
@@ -326,14 +287,23 @@ impl VectorArena for LazyStore {
         index: u32,
         query: &[Self::Elem],
     ) -> Similarity {
-        match &self.pinned {
-            Some(rows) => metric.similarity(query, &rows[index as usize * dim..][..dim]),
-            None => self.arena.similarity(metric, dim, index, query),
-        }
+        self.arena.similarity(metric, dim, index, query)
+    }
+
+    fn batch_similarity(
+        &self,
+        query: &[Self::Elem],
+        metric: Metric,
+        query_norm: f32,
+        rows: std::ops::Range<usize>,
+        out: &mut Vec<Similarity>,
+    ) {
+        self.arena
+            .batch_similarity(query, metric, query_norm, rows, out);
     }
 }
 
-trait SerializableStore {
+pub(crate) trait SerializableStore {
     fn len(&self) -> usize;
     fn serialize_rows<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()>;
 }
@@ -364,51 +334,13 @@ impl SerializableStore for LazyStore {
     }
 }
 
-fn serialize_stacked_index<S, W>(index: &StackedIvf<S>, out: &mut W) -> io::Result<()>
+pub(crate) fn serialize_stacked_index<S, W>(index: &StackedIvf<S>, out: &mut W) -> io::Result<()>
 where
     S: SerializableStore,
     W: Write + ?Sized,
 {
-    let mut num_levels = 1usize;
-    let mut parent = index.parent.as_deref();
-    while let Some(level) = parent {
-        num_levels += 1;
-        parent = level.parent.as_deref();
-    }
-
     let mut topology = Vec::new();
-    u32::try_from(num_levels)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?
-        .serialize(&mut topology)?;
-
-    fn serialize_level<S>(index: &StackedIvf<S>, out: &mut Vec<u8>) -> io::Result<()>
-    where S: SerializableStore {
-        let nlist = index.centroids.len();
-        if index.offsets.len() != nlist {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "level has {} offset ranges for {nlist} lists",
-                    index.offsets.len()
-                ),
-            ));
-        }
-        u32::try_from(nlist)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
-            .serialize(out)?;
-        for &(start, end) in &index.offsets {
-            start.serialize(out)?;
-            end.serialize(out)?;
-        }
-        Ok(())
-    }
-
-    serialize_level(index, &mut topology)?;
-    let mut parent = index.parent.as_deref();
-    while let Some(level) = parent {
-        serialize_level(level, &mut topology)?;
-        parent = level.parent.as_deref();
-    }
+    index.serialize_topology(&mut topology, |store| store.len())?;
 
     let centroids_byte_offset = (mem::size_of::<u64>() + topology.len()) as u64;
     centroids_byte_offset.serialize(out)?;
@@ -422,25 +354,7 @@ where
     Ok(())
 }
 
-/// Row-major centroid access for APS. Stores without an in-memory matrix
-/// return `None` and search falls back to scanning every candidate list.
-pub(crate) trait CentroidMatrix {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)>;
-}
-
-impl CentroidMatrix for InMemoryStore {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)> {
-        Some((self.as_slice(), self.dim()))
-    }
-}
-
-impl CentroidMatrix for LazyStore {
-    fn centroid_matrix(&self) -> Option<(&[f32], usize)> {
-        self.pinned.as_deref().map(|rows| (rows, self.dim))
-    }
-}
-
-/// Work done by one [`StackedIvf::search`], summed over this level and
+/// Work done by one stacked search, summed over this level and
 /// every parent above it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackedSearchStats {
@@ -448,8 +362,18 @@ pub struct StackedSearchStats {
     pub lists_scanned: usize,
     /// Similarity computations at any level: rows in scanned lists plus
     /// the top level's brute-force centroid ranking. A parent's members
-    /// are this level's centroids, so this is the total query cost.
+    /// are this level's centroids. Includes optional exact refinement.
     pub members_scored: usize,
+    /// Members scored at the level where search was invoked, excluding parent
+    /// traversal and the root's centroid ranking. This is the input to the
+    /// output heap, and therefore the denominator for final shortlist pruning.
+    pub leaf_members_scored: usize,
+    /// Initial estimated scores across the whole invocation, including parents.
+    pub approximate_scored: usize,
+    /// Initial estimated member scores only at the requested level.
+    pub leaf_approximate_scored: usize,
+    /// Exact member evaluations at the requested level, including refinement.
+    pub leaf_exact_scored: usize,
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
@@ -485,12 +409,11 @@ fn permute_rows(data: &[f32], dim: usize, perm: &[u32]) -> Vec<f32> {
     out
 }
 
-/// Builds a stacked IVF, hanging parents until the top has at most
-/// [`StackedIvfConfig::branching_factor`] lists.
+/// Builds a stacked IVF: L0 via [`StackedIvf::build`], then parents while
+/// the current top has at least [`MIN_NLIST_FOR_PARENT`] lists.
 ///
-/// [`StackedIvf::build`] is one level. The builder walks up, calling
-/// [`StackedIvf::add_level`] on each current top. Only L0's member
-/// permutation is returned — later levels shuffle metadata, not L0 rows.
+/// Only L0's member permutation is returned — later levels shuffle
+/// metadata, not L0 rows.
 pub struct StackedIvfBuilder<'a, Cl> {
     data: Vec<f32>,
     n: usize,
@@ -516,8 +439,8 @@ impl<'a, Cl: LevelClusterer<Elem = f32>> StackedIvfBuilder<'a, Cl> {
         }
     }
 
-    /// Clusters L0, then walks up calling [`StackedIvf::add_level`]
-    /// while the current top's `nlist` is greater than `branching_factor`.
+    /// Clusters L0 (`nlist = ceil(√n)`), then hangs parents while the
+    /// current top's `nlist` is at least [`MIN_NLIST_FOR_PARENT`].
     ///
     /// Returns the stacked index and L0's member permutation
     /// (`perm[old] = new`).
@@ -530,9 +453,8 @@ impl<'a, Cl: LevelClusterer<Elem = f32>> StackedIvfBuilder<'a, Cl> {
             self.config,
         );
         let parent_cfg = index.config.for_parent();
-        let branching_factor = index.config.branching_factor;
         let mut cur = &mut index;
-        while cur.nlist() > branching_factor {
+        while cur.nlist() >= MIN_NLIST_FOR_PARENT {
             cur.add_level(self.clusterer, parent_cfg.clone())
                 .expect("L0 build produced centroids");
             cur = cur.parent.as_mut().expect("add_level hung a parent");
@@ -615,7 +537,8 @@ impl StackedIvf<InMemoryStore> {
         Ok(perm)
     }
 
-    /// Clusters `data` into a single level (no parent).
+    /// Clusters `data` into a single level (no parent) with
+    /// `nlist = ceil(√n)`.
     ///
     /// Returns the index and the permutation of input rows into cluster
     /// order (`perm[old] = new`). [`add_level`] does not permute members.
@@ -631,7 +554,7 @@ impl StackedIvf<InMemoryStore> {
         if n == 0 {
             return (Self::empty(config, dim), Vec::new());
         }
-        let nlist = config.nlist_for(n);
+        let nlist = StackedIvfConfig::nlist_for(n);
         let (centroids, assignments) = clusterer.cluster(&data, n, dim, nlist);
         let mut index = Self::empty(config, dim);
         let perm = index.populate(data, centroids, assignments);
@@ -698,52 +621,40 @@ impl StackedIvf<InMemoryStore> {
             level_centroids.push(values);
         }
 
-        let mut index: Option<Box<StackedIvf<InMemoryStore>>> = None;
-        for level in (0..level_topology.len()).rev() {
-            let (nlist, offsets) = &level_topology[level];
-            let level_members = if level == 0 {
-                members.clone()
-            } else {
-                level_centroids[level - 1].clone()
-            };
-            if !ranges_cover_members(offsets, level_members.len() / dim) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("level {level} offsets do not cover its members"),
-                ));
-            }
-            let _ = nlist;
-            index = Some(Box::new(StackedIvf {
-                config: if level == 0 {
-                    config.clone()
-                } else {
-                    config.for_parent()
-                },
-                parent: index,
-                offsets: offsets.clone(),
-                centroids: InMemoryStore::new(level_centroids[level].clone(), dim),
-                vectors: InMemoryStore::new(level_members, dim),
-            }));
-        }
-        Ok(*index.expect("at least one level"))
+        let mut sets = vec![InMemoryStore::new(members, dim)];
+        sets.extend(
+            level_centroids
+                .into_iter()
+                .map(|values| InMemoryStore::new(values, dim)),
+        );
+        Self::from_vector_sets(level_topology, sets, config, InMemoryStore::len)
     }
 }
 
-fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64, u64)>)>> {
-    let num_levels = u32::deserialize(&mut topology)? as usize;
+/// Reads the same topology layout for every vector representation. `read`
+/// supplies one metadata range at a time, from memory or a lazy file cursor.
+pub(crate) fn read_level_topology<B: AsRef<[u8]>>(
+    num_levels: usize,
+    mut read: impl FnMut(usize) -> io::Result<B>,
+) -> io::Result<Vec<LevelTopology>> {
     if num_levels == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "stacked IVF has zero levels",
         ));
     }
-    let mut level_topology = Vec::with_capacity(num_levels);
+    let mut topology = Vec::new();
     for _ in 0..num_levels {
-        let nlist = u32::deserialize(&mut topology)? as usize;
-        let mut offsets = Vec::with_capacity(nlist);
+        let header = read(4)?;
+        let nlist = u32::deserialize(&mut header.as_ref())? as usize;
+        let bytes = read(nlist.checked_mul(16).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "router topology size overflow")
+        })?)?;
+        let mut input = bytes.as_ref();
+        let mut offsets = Vec::new();
         for _ in 0..nlist {
-            let start = u64::deserialize(&mut topology)?;
-            let end = u64::deserialize(&mut topology)?;
+            let start = u64::deserialize(&mut input)?;
+            let end = u64::deserialize(&mut input)?;
             if start > end {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -752,21 +663,150 @@ fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<(u64,
             }
             offsets.push((start, end));
         }
-        level_topology.push((nlist, offsets));
+        topology.push((nlist, offsets));
     }
+    Ok(topology)
+}
+
+fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<LevelTopology>> {
+    let num_levels = u32::deserialize(&mut topology)? as usize;
+    let levels = read_level_topology(num_levels, |len| {
+        if len > topology.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated stacked IVF topology",
+            ));
+        }
+        let (bytes, rest) = topology.split_at(len);
+        topology = rest;
+        Ok(bytes)
+    })?;
     if !topology.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "stacked IVF topology has trailing bytes before centroids",
         ));
     }
-    Ok(level_topology)
+    Ok(levels)
+}
+
+impl<S> StackedIvf<S> {
+    pub fn nlist(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Consume the hierarchy as one member bank followed by each centroid bank.
+    /// Parent member copies are redundant with their child's centroid bank.
+    pub(crate) fn into_vector_sets(self) -> (StackedIvfConfig, Vec<LevelTopology>, Vec<S>) {
+        let Self {
+            config,
+            parent,
+            offsets,
+            centroids,
+            vectors,
+        } = self;
+        let mut topology = vec![(offsets.len(), offsets)];
+        let mut sets = vec![vectors, centroids];
+        let mut next = parent;
+        while let Some(level) = next {
+            let Self {
+                parent,
+                offsets,
+                centroids,
+                ..
+            } = *level;
+            topology.push((offsets.len(), offsets));
+            sets.push(centroids);
+            next = parent;
+        }
+        (config, topology, sets)
+    }
+
+    pub(crate) fn levels(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |level| level.parent.as_deref())
+    }
+
+    pub(crate) fn serialize_topology<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+        rows: impl Fn(&S) -> usize,
+    ) -> io::Result<()> {
+        let count = u32::try_from(self.levels().count())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?;
+        count.serialize(out)?;
+        for level in self.levels() {
+            let nlist = rows(&level.centroids);
+            if nlist != level.offsets.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "centroid count differs from list count",
+                ));
+            }
+            u32::try_from(nlist)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
+                .serialize(out)?;
+            for &(start, end) in &level.offsets {
+                start.serialize(out)?;
+                end.serialize(out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One member set followed by one centroid set per level. A parent's
+    /// members reuse its child's centroid set, regardless of representation.
+    pub(crate) fn from_vector_sets(
+        topology: Vec<LevelTopology>,
+        sets: Vec<S>,
+        config: StackedIvfConfig,
+        rows: impl Fn(&S) -> usize,
+    ) -> io::Result<Self>
+    where
+        S: Clone,
+    {
+        if topology.is_empty() || sets.len() != topology.len() + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF vector-set count differs from topology",
+            ));
+        }
+        let mut parent = None;
+        for (level, (nlist, offsets)) in topology.into_iter().enumerate().rev() {
+            if nlist != rows(&sets[level + 1])
+                || offsets.len() != nlist
+                || !ranges_cover_members(&offsets, rows(&sets[level]))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stacked IVF offsets do not cover their vector set",
+                ));
+            }
+            parent = Some(Box::new(Self {
+                config: if level == 0 {
+                    config.clone()
+                } else {
+                    config.for_parent()
+                },
+                parent,
+                offsets,
+                centroids: sets[level + 1].clone(),
+                vectors: sets[level].clone(),
+            }));
+        }
+        Ok(*parent.expect("validated nonempty hierarchy"))
+    }
 }
 
 /// Ranges must be a partition of `0..n` (possibly not in list-id order).
-fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
+pub(crate) fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
     if ranges.is_empty() {
         return n == 0;
+    }
+    if ranges
+        .iter()
+        .any(|&(start, end)| start > end || end > n as u64)
+    {
+        return false;
     }
     let mut packed: Vec<(u64, u64)> = ranges.to_vec();
     // Sort by (start, end) so empty ranges `(s, s)` precede a non-empty
@@ -823,7 +863,6 @@ impl StackedIvf<LazyStore> {
                 "stacked IVF member rows are not a multiple of the row stride",
             ));
         }
-        let num_members = member_rows.len() / row_bytes;
         let expected: usize = level_topology
             .iter()
             .map(|(nlist, _)| nlist * row_bytes)
@@ -843,179 +882,95 @@ impl StackedIvf<LazyStore> {
             start = end;
         }
 
-        // Every level's centroids are pinned: they are what APS reads, and
-        // they are small. L0 members (the caller's rows) stay file-backed;
-        // a parent's members are the level below's centroids, pinned too.
-        let mut index: Option<Box<StackedIvf<LazyStore>>> = None;
-        for level in (0..level_topology.len()).rev() {
-            let (_, offsets) = &level_topology[level];
-            let (level_members, level_member_count) = if level == 0 {
-                (LazyStore::new(member_rows.clone(), dim), num_members)
-            } else {
-                (
-                    LazyStore::pinned(centroid_slices[level - 1].clone(), dim)?,
-                    level_topology[level - 1].0,
-                )
-            };
-            if !ranges_cover_members(offsets, level_member_count) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("level {level} offsets do not cover its members"),
-                ));
-            }
-            index = Some(Box::new(StackedIvf {
-                config: if level == 0 {
-                    config.clone()
-                } else {
-                    config.for_parent()
-                },
-                parent: index,
-                offsets: offsets.clone(),
-                centroids: LazyStore::pinned(centroid_slices[level].clone(), dim)?,
-                vectors: level_members,
-            }));
-        }
-        Ok(*index.expect("at least one level"))
+        // Raw member rows remain lazy. Parent members reuse the child centroid
+        // stores; all centroid rows remain file-backed.
+        let mut sets = vec![LazyStore::new(member_rows, dim)];
+        sets.extend(
+            centroid_slices
+                .into_iter()
+                .map(|slice| LazyStore::new(slice, dim))
+                .collect::<Vec<_>>(),
+        );
+        Self::from_vector_sets(level_topology, sets, config, LazyStore::len)
     }
 }
 
 impl<S> StackedIvf<S>
-where S: VectorArena<Elem = f32> + CentroidMatrix
+where S: VectorArena<Elem = f32>
 {
-    pub fn nlist(&self) -> usize {
-        self.offsets.len()
-    }
-
     /// Levels from this one up (L0 alone is 1; L0+L1 is 2).
     #[cfg(any(test, feature = "unstable"))]
     pub fn depth(&self) -> usize {
         1 + self.parent.as_ref().map(|p| p.depth()).unwrap_or(0)
     }
 
+    /// Fraction-only probe size (`nprobe_fraction * nlist`). Search uses
+    /// [`Self::lists_to_open`] instead; this remains for benches that sweep
+    /// `nprobe_fraction` directly.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn n_probe(&self) -> usize {
         let nlist = self.nlist();
         let n = ((nlist as f32 * self.config.nprobe_fraction).ceil().max(1.0)) as usize;
         n.min(nlist).max(1)
     }
 
+    /// How many lists to open so a size-`k` member heap stays fed.
+    ///
+    /// Converts the member request into a list count with beam
+    /// [`LIST_OVERSCAN`] * `k`, then clamps to
+    /// `[ceil(PARENT_NPROBE_FRACTION * nlist), nlist]`. Used as the parent
+    /// ask when a parent exists, and as the flat-top keep otherwise.
+    pub fn lists_to_open(&self, k: usize) -> usize {
+        crate::vector::router::search::lists_to_open(
+            self.nlist(),
+            self.offsets
+                .iter()
+                .map(|&(start, end)| (end - start) as usize)
+                .sum(),
+            k,
+            PARENT_NPROBE_FRACTION,
+        )
+    }
+
     /// Nearest members from the lists selected at this level, plus the
     /// work done across the whole stack to find them.
     ///
-    /// If a parent is present it ranks which lists to probe; otherwise
-    /// all centroids at this level are scored. Lists are scanned nearest
-    /// centroid first. When `recall < 1.0` and centroids are in-memory,
-    /// scanning stops once the estimated recall of the lists scanned so
-    /// far reaches `recall` (Quake APS).
+    /// List count is [`Self::lists_to_open`]: enough clusters to feed the
+    /// size-`k` heap (~2x member overscan), floored at 25% of `nlist` and
+    /// capped at `nlist`. A parent is asked for that many of this level's
+    /// lists; without a parent every centroid is scored and only that many
+    /// are expanded. Lists are scanned nearest centroid first.
+    /// [`StackedRouting`](super::search::StackedRouting) shares the layer walk and adaptive
+    /// stopping with global routing.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn search(
         &self,
         query: &[S::Elem],
         k: usize,
-        recall: f32,
         metric: Metric,
-    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
-        if k == 0 {
-            return (Vec::new(), StackedSearchStats::default());
-        }
-
-        let dim = query.len();
-        let can_aps = recall < 1.0
-            && aps::supports_metric(metric)
-            && self.centroids.centroid_matrix().is_some();
-
-        // Candidate lists, nearest centroid first; `candidates[0]` is P0.
-        let (candidates, mut stats) = if let Some(parent) = &self.parent {
-            let parent_recall = if can_aps {
-                self.config.parent_recall_target
-            } else {
-                recall.max(1.0)
-            };
-            parent.search(query, self.n_probe(), parent_recall, metric)
-        } else {
-            let mut all: Vec<Candidate<ClusterId>> = (0..self.nlist())
-                .map(|i| Candidate {
-                    sim: self.centroids.similarity(metric, dim, i as u32, query),
-                    node: ClusterId(i as u32),
-                })
-                .collect();
-            all.sort_unstable_by(|a, b| b.cmp(a));
-            let stats = StackedSearchStats {
-                lists_scanned: 0,
-                members_scored: all.len(),
-            };
-            (all, stats)
-        };
-
-        if candidates.is_empty() {
-            return (Vec::new(), stats);
-        }
-
-        let mut estimator = can_aps.then(|| {
-            let (matrix, _) = self.centroids.centroid_matrix().expect("can_aps");
-            let rows: Vec<&[f32]> = candidates
-                .iter()
-                .map(|c| {
-                    let j = usize::from(c.node);
-                    &matrix[j * dim..(j + 1) * dim]
-                })
-                .collect();
-            let sims: Vec<Similarity> = candidates.iter().map(|c| c.sim).collect();
-            RecallEstimator::new(query, &sims, Box::new(rows), metric)
-        });
-
-        let mut result = BinaryHeap::with_capacity(k);
-        for c in &candidates {
-            stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
-            stats.lists_scanned += 1;
-            let Some(estimator) = estimator.as_mut() else {
-                continue;
-            };
-            let kth = result
-                .peek()
-                .filter(|_| result.len() >= k)
-                .map(|Reverse(kth)| kth.sim);
-            let estimate = estimator
-                .cover_next(kth)
-                .expect("in-memory centroid rows cannot fail to load");
-            if estimate.is_some_and(|est| est >= recall) {
-                break;
-            }
-        }
-
-        let hits = result
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(c)| c)
-            .collect();
-        (hits, stats)
+    ) -> crate::Result<(Vec<Candidate<ClusterId>>, StackedSearchStats)> {
+        let query =
+            VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())).map_err(invalid_query)?;
+        Ok(self.search_prepared(&query, k))
     }
 
-    fn scan_cluster(
+    #[cfg(any(test, feature = "unstable"))]
+    pub(crate) fn search_prepared<T: VectorElement>(
         &self,
-        query: &[S::Elem],
-        metric: Metric,
-        list: ClusterId,
-        result: &mut BinaryHeap<Reverse<Candidate<ClusterId>>>,
+        query: &VectorQuery<T>,
         k: usize,
-    ) -> usize {
-        let dim = query.len();
-        let (start, end) = self.offsets[usize::from(list)];
-        let start = start as usize;
-        let end = end as usize;
-        for row in start..end {
-            let id = ClusterId::from(row);
-            let cand = Candidate {
-                sim: self.vectors.similarity(metric, dim, id.0, query),
-                node: id,
-            };
-            if result.len() < k {
-                result.push(Reverse(cand));
-            } else if let Some(mut worst) = result.peek_mut() {
-                if cand > worst.0 {
-                    *worst = Reverse(cand);
-                }
-            }
-        }
-        end.saturating_sub(start)
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        crate::vector::router::search::search(
+            self,
+            query,
+            k,
+            crate::vector::router::search::SearchPolicy {
+                aps: true,
+                min_fraction: PARENT_NPROBE_FRACTION,
+                rerank_factor: 1.0,
+            },
+            crate::vector::router::search::OutputPrecision::Exact,
+        )
     }
 }
 
@@ -1032,13 +987,8 @@ mod tests {
         data
     }
 
-    /// Small-fixture config: leaf size matches fan-out so n=16..64 still
-    /// produces multiple L0 lists.
-    fn test_config(branching_factor: usize) -> StackedIvfConfig {
-        StackedIvfConfig {
-            branching_factor,
-            ..Default::default()
-        }
+    fn test_config() -> StackedIvfConfig {
+        StackedIvfConfig::default()
     }
 
     fn build_with_parent(
@@ -1046,15 +996,9 @@ mod tests {
         n: usize,
         dim: usize,
         clusterer: &SuperKMeansLevelClusterer,
-        branching_factor: usize,
     ) -> (StackedIvf<InMemoryStore>, Vec<u32>) {
-        let (mut index, perm) = StackedIvf::<InMemoryStore>::build(
-            data.to_vec(),
-            n,
-            dim,
-            clusterer,
-            test_config(branching_factor),
-        );
+        let (mut index, perm) =
+            StackedIvf::<InMemoryStore>::build(data.to_vec(), n, dim, clusterer, test_config());
         let parent_cfg = index.config.for_parent();
         index
             .add_level(clusterer, parent_cfg)
@@ -1069,7 +1013,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (index, member_perm) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(4));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         assert!(index.nlist() > 1);
         assert_eq!(index.vectors.len(), n);
         assert_eq!(member_perm.len(), n);
@@ -1077,7 +1021,7 @@ mod tests {
         assert_eq!(index.depth(), 1);
 
         let query = [1.0f32, 0.0];
-        let (hits, _) = index.search(&query, 4, 1.0, Metric::L2);
+        let (hits, _) = index.search(&query, 4, Metric::L2).unwrap();
         assert!(!hits.is_empty());
         assert!(
             hits.len() < n,
@@ -1091,7 +1035,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, member_perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, member_perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut seen = vec![false; n];
         for &new in &member_perm {
@@ -1123,7 +1067,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut bytes = Vec::new();
         index.serialize_router_payload(&mut bytes).unwrap();
@@ -1149,8 +1093,8 @@ mod tests {
         );
 
         for query in [[0.0f32, 0.0], [7.5, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
-            let (got, _) = decoded.search(&query, 4, 1.0, Metric::L2);
+            let (expected, _) = index.search(&query, 4, Metric::L2).unwrap();
+            let (got, _) = decoded.search(&query, 4, Metric::L2).unwrap();
             assert_eq!(
                 got.len(),
                 expected.len(),
@@ -1170,7 +1114,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         assert_eq!(index.depth(), 1);
 
         let parent_cfg = index.config.for_parent();
@@ -1195,7 +1139,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         let parent_cfg = index.config.for_parent();
         index.add_level(&clusterer, parent_cfg.clone()).expect("L1");
         let members = index.vectors.as_slice().to_vec();
@@ -1217,37 +1161,108 @@ mod tests {
     }
 
     #[test]
-    fn test_nlist() {
-        let config = StackedIvfConfig {
-            branching_factor: 100,
-            ..Default::default()
-        };
-        assert_eq!(config.nlist_for(200_000), 2_000);
-        assert_eq!(config.nlist_for(20_000), 200);
-        assert_eq!(config.nlist_for(200), 2);
-        assert_eq!(config.nlist_for(2), 1);
+    fn test_nlist_for_sqrt() {
+        assert_eq!(StackedIvfConfig::nlist_for(0), 0);
+        assert_eq!(StackedIvfConfig::nlist_for(1), 1);
+        assert_eq!(StackedIvfConfig::nlist_for(2_000), 45);
+        assert_eq!(StackedIvfConfig::nlist_for(65_536), 256);
+        assert_eq!(StackedIvfConfig::nlist_for(1_000_000), 1_000);
+        assert_eq!(StackedIvfConfig::nlist_for(400_000), 633);
+    }
+
+    /// A run of lists that miss the full heap stops the walk short of the shortlist.
+    #[test]
+    fn test_patience_stops_before_the_shortlist_is_exhausted() {
+        let dim = 2;
+        let n = 2048;
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(line_data(n), n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+
+        let query = [0.0f32, 0.0];
+        let k = 16;
+        let shortlist = index.lists_to_open(k);
+        let (hits, stats) = index.search(&query, k, Metric::L2).unwrap();
+
+        assert_eq!(hits.len(), k);
+        assert!(
+            stats.lists_scanned < shortlist,
+            "stop scanned {} lists, shortlist {}",
+            stats.lists_scanned,
+            shortlist
+        );
     }
 
     #[test]
-    fn test_builder_stacks_until_top_level_fits_branching_factor() {
+    fn test_top_level_prunes_to_parent_nprobe_fraction() {
         let dim = 2;
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let config = test_config(2);
-        let (index, perm) =
-            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
-        assert!(index.depth() > 1, "builder must hang at least one parent");
-        let mut top = &index;
-        while let Some(p) = top.parent.as_deref() {
-            top = p;
-        }
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
+        assert!(index.parent.is_none());
+        let nlist = index.nlist();
+        assert!(nlist > 1);
+        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+        // Small k: beam stays under the floor, so keep == 25% of nlist.
+        assert_eq!(index.lists_to_open(1), floor);
+
+        let query = [0.0f32, 0.0];
+        let (hits, stats) = index.search(&query, 1, Metric::L2).unwrap();
+        assert!(!hits.is_empty());
+        // Cap is the shortlist; patience may stop earlier after five quiet lists.
         assert!(
-            top.nlist() <= config.branching_factor,
-            "top nlist {} should be <= branching_factor {}",
-            top.nlist(),
-            config.branching_factor
+            stats.lists_scanned <= floor,
+            "small-k top level must not expand past ceil(0.25 × nlist), scanned {} floor {}",
+            stats.lists_scanned,
+            floor
         );
+        assert!(
+            stats.members_scored >= nlist,
+            "every top centroid is scored before the prune"
+        );
+    }
+
+    #[test]
+    fn test_lists_to_open_grows_with_k_then_caps_at_nlist() {
+        let dim = 2;
+        let n = 64;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
+        let nlist = index.nlist();
+        let floor = ((nlist as f32 * PARENT_NPROBE_FRACTION).ceil() as usize).max(1);
+
+        assert_eq!(index.lists_to_open(1), floor);
+        // 2k members ≈ half the corpus → about half the lists (above the floor).
+        let mid = index.lists_to_open(n / 4);
+        assert!(
+            mid > floor && mid < nlist,
+            "mid-size k should sit between the 25% floor and nlist, got {mid}"
+        );
+        assert_eq!(index.lists_to_open(n), nlist);
+
+        let query = [0.0f32, 0.0];
+        let (_, stats) = index.search(&query, n, Metric::L2).unwrap();
+        assert_eq!(
+            stats.lists_scanned, nlist,
+            "k covering all members must open every list"
+        );
+    }
+
+    #[test]
+    fn test_builder_skips_parent_when_below_threshold() {
+        let dim = 2;
+        let n = 64;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer::default();
+        assert!(StackedIvfConfig::nlist_for(n) < MIN_NLIST_FOR_PARENT);
+        let (index, perm) = StackedIvfBuilder::new(data, n, dim, &clusterer, test_config()).build();
+        assert!(index.parent.is_none());
+        assert!(index.nlist() < MIN_NLIST_FOR_PARENT);
         assert_eq!(perm.len(), n);
         let mut seen = vec![false; n];
         for &new in &perm {
@@ -1273,7 +1288,7 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
+        let (index, _perm) = build_with_parent(&data, n, dim, &clusterer);
 
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
@@ -1299,15 +1314,81 @@ mod tests {
             index.parent.as_ref().unwrap().offsets
         );
 
-        for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
-            let (expected, _) = index.search(&query, 4, 1.0, Metric::L2);
-            let (got, _) = opened.search(&query, 4, 1.0, Metric::L2);
-            assert_eq!(got.len(), expected.len());
-            for (g, e) in got.iter().zip(&expected) {
-                assert_eq!(g.node, e.node);
-                assert_eq!(g.sim, e.sim);
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
+                let (expected, _) = index.search(&query, 4, metric).unwrap();
+                let (got, _) = opened.search(&query, 4, metric).unwrap();
+                assert_eq!(got, expected);
             }
         }
+    }
+
+    #[test]
+    fn upper_centroids_are_read_only_when_scored() {
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex};
+
+        use common::OwnedBytes;
+
+        use crate::directory::FileHandle;
+
+        #[derive(Debug)]
+        struct TrackedFile {
+            bytes: OwnedBytes,
+            reads: Arc<Mutex<Vec<Range<usize>>>>,
+        }
+
+        impl HasLen for TrackedFile {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+
+        impl FileHandle for TrackedFile {
+            fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+                self.reads.lock().unwrap().push(range.clone());
+                Ok(self.bytes.slice(range))
+            }
+        }
+
+        let dim = 2;
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let (index, _) = build_with_parent(&line_data(64), 64, dim, &clusterer);
+        let mut slot = Vec::new();
+        index.serialize_router_payload(&mut slot).unwrap();
+        let centroid_start = u64::deserialize(&mut slot.as_slice()).unwrap() as usize;
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let opened = StackedIvf::<LazyStore>::open(
+            FileSlice::new(Arc::new(TrackedFile {
+                bytes: OwnedBytes::new(slot),
+                reads: reads.clone(),
+            })),
+            FileSlice::from(vec![0; 64 * dim * 4]),
+            dim,
+            test_config(),
+        )
+        .unwrap();
+        assert_eq!(*reads.lock().unwrap(), vec![0..8, 8..centroid_start]);
+
+        reads.lock().unwrap().clear();
+        let query = [1.0, 0.0];
+        let mut scores = Vec::new();
+        opened.parent.as_ref().unwrap().vectors.batch_similarity(
+            &query,
+            Metric::L2,
+            1.0,
+            1..3,
+            &mut scores,
+        );
+        let mut expected = Vec::new();
+        index
+            .centroids
+            .batch_similarity(&query, Metric::L2, 1.0, 1..3, &mut expected);
+        assert_eq!(scores, expected);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![centroid_start + dim * 4..centroid_start + 3 * dim * 4]
+        );
     }
 
     /// Empty lists after `add_level` share start offsets with the next
@@ -1324,15 +1405,15 @@ mod tests {
         let clusterer = SuperKMeansLevelClusterer::default();
         let config = StackedIvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            branching_factor: 64,
             ..StackedIvfConfig::default()
         };
-        let (index, _perm) =
-            StackedIvfBuilder::new(data, n, dim, &clusterer, config.clone()).build();
-        assert!(
-            index.depth() >= 2,
-            "need a parent so permute_lists scrambles L0 list order"
-        );
+        // √20k ≈ 142 < 256, so the builder would stay flat; hang a parent
+        // so permute_lists scrambles L0 list order (and can leave empties).
+        let (mut index, _perm) =
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, config.clone());
+        let parent_cfg = index.config.for_parent();
+        index.add_level(&clusterer, parent_cfg).expect("L1");
+        assert_eq!(index.depth(), 2);
         assert!(
             index.offsets.iter().any(|&(start, end)| start == end),
             "need at least one empty list to exercise the tie-break"
@@ -1361,7 +1442,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer::default();
         let (index, _perm) =
-            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config(2));
+            StackedIvf::<InMemoryStore>::build(data, n, dim, &clusterer, test_config());
         let mut slot = Vec::new();
         index.serialize_router_payload(&mut slot).unwrap();
         let member_bytes: Vec<u8> = index
@@ -1402,149 +1483,5 @@ mod tests {
             data.push(0.0);
         }
         data
-    }
-
-    #[test]
-    fn test_aps_recall_zero_still_scans_p0() {
-        let n_per = 16;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
-        let (hits, stats) = index.search(&[0.0f32, 0.0], 4, 0.0, Metric::L2);
-        assert!(
-            stats.lists_scanned >= 1,
-            "recall=0 must still scan P0, got {}",
-            stats.lists_scanned
-        );
-        assert!(!hits.is_empty());
-    }
-
-    #[test]
-    fn test_aps_low_recall_scans_fewer_lists_than_full() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
-        index.config.nprobe_fraction = 1.0;
-        let query = [0.0f32, 0.0];
-        let (full_hits, full) = index.search(&query, 4, 1.0, Metric::L2);
-        let (low_hits, low) = index.search(&query, 4, 0.8, Metric::L2);
-        assert!(
-            low.lists_scanned <= full.lists_scanned,
-            "APS 0.8 scanned {} lists, full scanned {}",
-            low.lists_scanned,
-            full.lists_scanned
-        );
-        assert!(!low_hits.is_empty());
-        assert!(
-            low_hits[0].sim >= full_hits[0].sim
-                || low_hits.iter().any(|h| h.node == full_hits[0].node),
-            "low-recall top hit should be in or as good as the full-scan nearest"
-        );
-    }
-
-    /// An opened (file-backed) index pins its centroids, so APS runs there
-    /// too: a low recall target scans fewer lists than the full nprobe
-    /// pass, and the two agree on the nearest member.
-    #[test]
-    fn test_opened_index_runs_aps() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
-        index.config.nprobe_fraction = 1.0;
-
-        let mut slot = Vec::new();
-        index.serialize_router_payload(&mut slot).unwrap();
-        let member_bytes: Vec<u8> = index
-            .vectors
-            .as_slice()
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let opened = StackedIvf::<LazyStore>::open(
-            FileSlice::from(slot),
-            FileSlice::from(member_bytes),
-            2,
-            index.config.clone(),
-        )
-        .unwrap();
-        assert!(
-            opened.centroids.centroid_matrix().is_some(),
-            "opened router centroids must be pinned for APS"
-        );
-
-        let query = [0.0f32, 0.0];
-        let (full_hits, full) = opened.search(&query, 4, 1.0, Metric::L2);
-        let (low_hits, low) = opened.search(&query, 4, 0.8, Metric::L2);
-        assert!(
-            low.lists_scanned < full.lists_scanned,
-            "APS 0.8 scanned {} lists, full scanned {}",
-            low.lists_scanned,
-            full.lists_scanned
-        );
-        assert_eq!(low_hits[0].node, full_hits[0].node);
-    }
-
-    #[test]
-    fn test_aps_parent_keeps_high_recall() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (index, _) = build_with_parent(&data, n_per * 2, 2, &clusterer, 2);
-        let query = [0.0f32, 0.0];
-        let (leaf, _) = index.search(&query, 4, 0.9, Metric::L2);
-        let (full, _) = index.search(&query, 4, 1.0, Metric::L2);
-        assert!(!leaf.is_empty());
-        assert_eq!(leaf[0].node, full[0].node);
-    }
-
-    /// Cosine APS depends only on direction: scaling the query or the
-    /// data leaves the scan unchanged, and a low target scans no more than
-    /// the full nprobe.
-    #[test]
-    fn test_aps_cosine_ignores_vector_norms() {
-        let n = 256;
-        let angle = |i: usize| i as f32 * std::f32::consts::TAU / n as f32;
-        let data: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                let norm = 1.0 + (i % 7) as f32;
-                [norm * angle(i).cos(), norm * angle(i).sin()]
-            })
-            .collect();
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n, 2, &clusterer, test_config(2));
-        index.config.nprobe_fraction = 1.0;
-        let query = [0.3f32.cos(), 0.3f32.sin()];
-        let scaled = [query[0] * 10.0, query[1] * 10.0];
-        let (_, full) = index.search(&query, 8, 1.0, Metric::Cosine);
-        let (unit_hits, unit) = index.search(&query, 8, 0.8, Metric::Cosine);
-        let (scaled_hits, scaled) = index.search(&scaled, 8, 0.8, Metric::Cosine);
-        assert!(unit.lists_scanned <= full.lists_scanned);
-        assert_eq!(unit.lists_scanned, scaled.lists_scanned);
-        let nodes = |hits: &[Candidate<ClusterId>]| hits.iter().map(|h| h.node).collect::<Vec<_>>();
-        assert_eq!(nodes(&unit_hits), nodes(&scaled_hits));
-    }
-
-    /// Dot scores past 1 would clamp the query radius to zero and stop
-    /// APS after the first full heap; Dot scans its full nprobe instead.
-    #[test]
-    fn test_aps_is_off_for_dot() {
-        let n_per = 32;
-        let data = two_blobs(n_per);
-        let clusterer = SuperKMeansLevelClusterer::default();
-        let (mut index, _) =
-            StackedIvf::<InMemoryStore>::build(data, n_per * 2, 2, &clusterer, test_config(2));
-        index.config.nprobe_fraction = 1.0;
-        let query = [1.0f32, 0.0];
-        let (full_hits, full) = index.search(&query, 4, 1.0, Metric::Dot);
-        let (low_hits, low) = index.search(&query, 4, 0.5, Metric::Dot);
-        assert!(full.lists_scanned > 1);
-        assert_eq!(low.lists_scanned, full.lists_scanned);
-        assert_eq!(low_hits, full_hits);
     }
 }

@@ -65,6 +65,7 @@ Tantivy works on stable Rust and supports Linux, macOS, and Windows.
 index documents, and search via the CLI or a small server with a REST API.
 It walks you through getting a Wikipedia search engine up and running in a few minutes.
 - [Reference doc for the last released version](https://docs.rs/tantivy/)
+- [Vector index storage](src/vector/storage/FORMAT.md) - layouts of the `.vec` and `.centroids` files, document mappings, and quantization columns.
 
 ## How can I support this project?
 

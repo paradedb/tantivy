@@ -69,7 +69,6 @@ impl VectorStage {
 
 const FIXED_SLOTS: usize = 11;
 const STAGE_SLOTS: usize = FIXED_SLOTS + 2 * MAX_QUANTIZATION_LAYERS;
-const FALLBACK_LAYERS: usize = 3;
 
 /// Accounting slot of `stage`; layers past the schedule limit fold into `Other`.
 fn slot(stage: VectorStage) -> usize {
@@ -98,16 +97,25 @@ fn slot(stage: VectorStage) -> usize {
     }
 }
 
-/// Exclusive time and storage reads per stage, and sign-word fallbacks per layer, of one measured
-/// operation.
-#[derive(Clone, Debug, Default)]
+/// Exclusive time and storage reads per stage of one measured operation.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageTotals {
     time_ns: [u64; STAGE_SLOTS],
     io: [VectorIoStats; STAGE_SLOTS],
-    sign_word_fallbacks: [u64; FALLBACK_LAYERS],
 }
 
 impl StageTotals {
+    pub(crate) fn append(&mut self, other: &Self) {
+        for (total, added) in self.time_ns.iter_mut().zip(other.time_ns) {
+            *total += added;
+        }
+        for (total, added) in self.io.iter_mut().zip(other.io) {
+            total.reads += added.reads;
+            total.bytes_read += added.bytes_read;
+            total.storage_blocks += added.storage_blocks;
+        }
+    }
+
     /// Nanoseconds spent in `stage` with no inner stage running.
     pub(crate) fn time_ns(&self, stage: VectorStage) -> u64 {
         self.time_ns[slot(stage)]
@@ -117,11 +125,6 @@ impl StageTotals {
     pub(crate) fn io(&self, stage: VectorStage) -> VectorIoStats {
         self.io[slot(stage)]
     }
-
-    /// Owned-word decoding fallbacks in layer `layer`'s sign-plane scoring.
-    pub(crate) fn sign_word_fallbacks(&self, layer: usize) -> u64 {
-        self.sign_word_fallbacks.get(layer).copied().unwrap_or(0)
-    }
 }
 
 // --- Meter ---
@@ -130,8 +133,8 @@ thread_local! {
     static SCOPE: RefCell<Option<Meter>> = const { RefCell::new(None) };
 }
 
-/// One operation's telemetry: the running stage, time and reads per stage, and sign-word fallbacks
-/// per layer. It exists only inside [`measure`], which owns it, so there is nothing to reset.
+/// One operation's telemetry: the running stage, and time and reads per stage. It exists only
+/// inside [`measure`], which owns it, so there is nothing to reset.
 struct Meter {
     running: VectorStage,
     since: Instant,
@@ -167,20 +170,28 @@ impl Meter {
     }
 }
 
-/// The meter a [`measure`] shadows, put back in scope when dropped, unwinding included.
+/// The meter a [`measure`] shadows, put back in scope when dropped, unwinding included. Its clock
+/// restarts there, so the shadowed interval is charged to no enclosing stage.
 struct Enclosing(Option<Meter>);
 
 impl Drop for Enclosing {
     fn drop(&mut self) {
+        if let Some(meter) = &mut self.0 {
+            meter.since = Instant::now();
+        }
         SCOPE.set(self.0.take());
     }
 }
 
 /// Runs `op` with a fresh meter in scope on this thread; returns its result and the meter's
 /// totals. Stage switches and reads inside `op` charge this meter only. A nested `measure`
-/// shadows this one until it returns.
+/// shadows this one until it returns: the enclosing stage is charged up to the nested call and
+/// resumes after it, so the nested time counts only in the nested totals.
 pub(crate) fn measure<R>(op: impl FnOnce() -> R) -> (R, StageTotals) {
-    let enclosing = Enclosing(SCOPE.replace(Some(Meter::new())));
+    let enclosing = Enclosing(SCOPE.replace(Some(Meter::new())).map(|mut meter| {
+        meter.charge_time();
+        meter
+    }));
     let result = op();
     let totals = SCOPE.take().map(Meter::finish).unwrap_or_default();
     drop(enclosing);
@@ -230,22 +241,6 @@ pub(crate) fn charge_read(bytes: u64, storage_blocks: u64) {
             io.reads += 1;
             io.bytes_read += bytes;
             io.storage_blocks += storage_blocks;
-        }
-    });
-}
-
-/// Charges `count` sign-word fallbacks in `layer`; does nothing outside a [`measure`].
-pub(crate) fn charge_fallbacks(layer: usize, count: u64) {
-    // Aligned codes, the usual case, leave the thread-local untouched.
-    if count == 0 {
-        return;
-    }
-    SCOPE.with_borrow_mut(|scope| {
-        if let Some(fallbacks) = scope
-            .as_mut()
-            .and_then(|meter| meter.totals.sign_word_fallbacks.get_mut(layer))
-        {
-            *fallbacks += count;
         }
     });
 }
@@ -333,6 +328,25 @@ mod tests {
         assert_eq!(outer.io(VectorStage::Locate).reads, 0);
     }
 
+    /// The stage wrapped around a nested measure is charged only its own time: the nested
+    /// duration counts in the nested totals and nowhere in the enclosing ones.
+    #[test]
+    fn enclosing_stage_is_not_charged_for_a_nested_measure() {
+        let (inner, outer) = measure(|| {
+            let _routing = enter_vector_stage(VectorStage::Routing);
+            let ((), inner) = measure(|| std::thread::sleep(std::time::Duration::from_millis(30)));
+            inner
+        });
+        let nested = inner.time_ns(VectorStage::Other);
+        assert!(nested >= 30_000_000, "nested {nested} ns");
+        let own = outer.time_ns(VectorStage::Routing);
+        assert!(
+            own < nested / 2,
+            "routing {own} ns around a {nested} ns nested measure"
+        );
+        assert!(outer.time_ns(VectorStage::Other) < nested / 2);
+    }
+
     /// A panic inside a measure puts the enclosing meter back in scope at the stage it left.
     #[test]
     fn panic_inside_measure_restores_the_enclosing_meter() {
@@ -369,20 +383,6 @@ mod tests {
         assert_eq!(totals.io(VectorStage::Other).reads, 0);
         assert_eq!(totals.io(VectorStage::Routing).reads, 0);
         assert_eq!(totals.time_ns(VectorStage::Routing), 0);
-    }
-
-    /// Fallbacks charge the meter in scope by layer, and nothing outside one.
-    #[test]
-    fn fallbacks_charge_the_meter_in_scope() {
-        charge_fallbacks(1, 5);
-        let ((), totals) = measure(|| {
-            charge_fallbacks(1, 2);
-            charge_fallbacks(2, 1);
-        });
-        let fallbacks: Vec<u64> = (0..FALLBACK_LAYERS)
-            .map(|layer| totals.sign_word_fallbacks(layer))
-            .collect();
-        assert_eq!(fallbacks, [0, 2, 1]);
     }
 
     /// A thread without its own measure charges nothing to the parent's meter.

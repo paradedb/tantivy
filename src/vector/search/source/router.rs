@@ -1,36 +1,32 @@
 //! The router cluster source: clusters in the router's order, admitted under the work budget,
-//! the bounds gate and the filter.
+//! and the filter.
+
+use std::sync::Arc;
 
 use common::BitSet;
 
 use crate::fastfield::AliveBitSet;
-use crate::schema::Metric;
-use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::{RouterIter, RouterMetrics, RoutingParams};
-use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
-use crate::vector::search::prepared::VectorQuery;
+use crate::vector::router::{RouterIter, RouterMetrics};
+use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::source::controller::{
-    ProbeController, ProbeOutcome, WorkBudget, WorkMeter,
-};
-use crate::vector::storage::bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, BoundStore, HeapPeek,
-    QueryBound, QueryBoundTracker, Verdict,
+    ProbeController, ProbeOutcome, SharedVectorWork, WorkBudget, WorkMeter,
 };
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::telemetry::enter_vector_stage;
-use crate::vector::{VectorElement, VectorStage};
+use crate::vector::VectorStage;
 use crate::{DocId, SegmentReader};
 
 // --- Filter and gate ---
 
 /// The filter's matches as the router source gates rows with them.
+#[derive(Clone)]
 pub(crate) enum DocFilter {
     /// Every doc id below `max_doc` matches, deleted docs included; no bitset is built.
     All,
     /// The matching doc ids.
-    Docs(BitSet),
+    Docs(Arc<BitSet>),
 }
 
 impl DocFilter {
@@ -51,9 +47,9 @@ impl DocFilter {
 pub(crate) enum RowGate<'a> {
     Open,
     AliveOnly(&'a AliveBitSet),
-    FilterOnly(BitSet),
+    FilterOnly(Arc<BitSet>),
     FilterAndAlive {
-        filter: BitSet,
+        filter: Arc<BitSet>,
         alive: &'a AliveBitSet,
     },
 }
@@ -85,7 +81,7 @@ impl<'a> RowGate<'a> {
     /// Gates a cluster whose DocIds column is `doc_ids`, writing the kept cluster-local offsets.
     pub(crate) fn select(&self, doc_ids: &[DocId], offsets: &mut Vec<u32>) -> GatedRows {
         offsets.clear();
-        let (pruned_filter, pruned_dead) = match self {
+        let verdicts = match self {
             RowGate::Open => {
                 return GatedRows {
                     all: true,
@@ -94,60 +90,67 @@ impl<'a> RowGate<'a> {
                 }
             }
             RowGate::AliveOnly(alive) => gate(doc_ids, offsets, |doc| {
-                if alive.is_alive(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Dead
+                let alive = alive.is_alive(doc);
+                RowVerdict {
+                    matches: true,
+                    keep: alive,
                 }
             }),
             RowGate::FilterOnly(filter) => gate(doc_ids, offsets, |doc| {
-                if filter.contains(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Filtered
+                let matches = filter.contains(doc);
+                RowVerdict {
+                    matches,
+                    keep: matches,
                 }
             }),
             RowGate::FilterAndAlive { filter, alive } => gate(doc_ids, offsets, |doc| {
-                if !filter.contains(doc) {
-                    RowVerdict::Filtered
-                } else if alive.is_alive(doc) {
-                    RowVerdict::Keep
-                } else {
-                    RowVerdict::Dead
+                let matches = filter.contains(doc);
+                RowVerdict {
+                    matches,
+                    keep: matches & alive.is_alive(doc),
                 }
             }),
         };
         GatedRows {
             all: false,
-            pruned_filter,
-            pruned_dead,
+            pruned_filter: doc_ids.len() - verdicts.matched,
+            pruned_dead: verdicts.matched - verdicts.kept,
         }
     }
 }
 
-enum RowVerdict {
-    Keep,
-    Filtered,
-    Dead,
+/// One row's verdict: whether it matches the filter, and whether it is kept, which also needs it
+/// alive.
+struct RowVerdict {
+    matches: bool,
+    keep: bool,
 }
 
-/// Keeps the offsets `verdict` accepts; returns `(pruned_filter, pruned_dead)`.
+/// Rows a gate counted: those matching the filter, and those kept.
+struct GateCounts {
+    matched: usize,
+    kept: usize,
+}
+
+/// Keeps the offsets `verdict` accepts. Each row's offset is written at the next free slot and the
+/// slot advances by the verdict, so the loop has no branch on it.
 #[inline(always)]
 fn gate(
     doc_ids: &[DocId],
     offsets: &mut Vec<u32>,
     verdict: impl Fn(DocId) -> RowVerdict,
-) -> (usize, usize) {
-    let mut pruned_filter = 0usize;
-    let mut pruned_dead = 0usize;
+) -> GateCounts {
+    offsets.resize(doc_ids.len(), 0);
+    let mut kept = 0usize;
+    let mut matched = 0usize;
     for (offset, &doc) in (0u32..).zip(doc_ids) {
-        match verdict(doc) {
-            RowVerdict::Keep => offsets.push(offset),
-            RowVerdict::Filtered => pruned_filter += 1,
-            RowVerdict::Dead => pruned_dead += 1,
-        }
+        let RowVerdict { matches, keep } = verdict(doc);
+        offsets[kept] = offset;
+        kept += usize::from(keep);
+        matched += usize::from(matches);
     }
-    (pruned_filter, pruned_dead)
+    offsets.truncate(kept);
+    GateCounts { matched, kept }
 }
 
 // --- Source ---
@@ -161,16 +164,12 @@ pub(crate) struct RouterCounters {
     pub(crate) postings_skipped: usize,
     /// Of `postings_skipped`, clusters with no eligible row.
     pub(crate) clusters_skipped_empty: usize,
-    /// Clusters the bounds gate passed over.
-    pub(crate) bounds_skips: u32,
     /// Rows the gate looked at.
     pub(crate) vectors_visited: usize,
     pub(crate) pruned_filter: usize,
     pub(crate) pruned_dead: usize,
     /// Rows admitted and charged.
     pub(crate) eligible: usize,
-    /// The zero-based probe at which the query bound armed.
-    pub(crate) bound_armed_at: Option<u32>,
 }
 
 /// A finished router source's report.
@@ -181,63 +180,43 @@ pub(crate) struct RouterReport {
     pub(crate) probe: ProbeOutcome,
 }
 
-/// Clusters in the router's order, admitted under the work budget, the bounds gate and the
-/// filter. Owns the ranked stream, the work meter, the probe controller, the query bound and the
-/// buffers each cluster's rows borrow.
-pub(crate) struct RouterClusters<'a, T: VectorElement> {
+/// Clusters in the router's order, admitted under the work budget and the filter.
+pub(crate) struct RouterClusters<'a> {
     index: &'a ClusterIndex,
     reader: &'a VectorIndexReader,
-    query: &'a VectorQuery<T>,
     ranked: RouterIter,
     meter: WorkMeter,
-    controller: ProbeController<'a>,
-    bounds: BoundStore<'a>,
-    tracker: QueryBoundTracker,
+    controller: ProbeController,
     gate: RowGate<'a>,
-    /// The current cluster's DocIds column; read only when the gate is closed.
+    /// Whether a document may sit in two clusters: the scan then needs every opened cluster's
+    /// doc ids to score each document once.
+    replicated: bool,
+    /// The current cluster's DocIds column; read when the gate is closed or the segment is
+    /// replicated.
     docs: Vec<DocId>,
     offsets: Vec<u32>,
     selected_docs: Vec<DocId>,
     counters: RouterCounters,
 }
 
-impl<'a, T: VectorElement> RouterClusters<'a, T> {
-    /// Ranks as many of `segment`'s clusters as `budget` buys at the filter's match fraction, and
-    /// prepares the probe controller. `reader` is the segment's IVF reader.
-    pub(crate) fn new(
+impl<'a> RouterClusters<'a> {
+    pub(crate) fn from_ranked(
         reader: &'a VectorIndexReader,
-        query: &'a VectorQuery<T>,
+        ranked: RouterIter,
         budget: WorkBudget,
         filter: DocFilter,
         segment: &'a SegmentReader,
-        params: &'a ProbeParams,
+        shared_work: Option<Arc<dyn SharedVectorWork>>,
     ) -> Self {
-        let index = reader
-            .index()
-            .expect("the router source runs on an IVF segment");
-        let clusters = index.num_clusters();
-        let routing = RoutingParams {
-            k: params.router_k(
-                budget.total.get(),
-                budget.per_cluster.get(),
-                filter.match_fraction(segment.max_doc()),
-                clusters,
-            ),
-            recall: params.router_recall_target,
-        };
-        let _routing = enter_vector_stage(VectorStage::Routing);
-        let ranked = index.rank_clusters(query.widened(), routing);
-        let estimator = index.recall_estimator(&ranked, query.widened(), params.recall_target);
+        let index = reader.index().expect("IVF segment");
         Self {
             index,
             reader,
-            query,
             ranked,
-            meter: WorkMeter::new(budget),
-            controller: ProbeController::new(clusters, estimator, params.recall_target),
-            bounds: index.bounds(),
-            tracker: QueryBoundTracker::new(),
+            meter: WorkMeter::new(budget, shared_work),
+            controller: ProbeController::new(index.num_clusters()),
             gate: RowGate::new(filter, segment.alive_bitset()),
+            replicated: reader.replicated(),
             docs: Vec::new(),
             offsets: Vec::new(),
             selected_docs: Vec::new(),
@@ -245,50 +224,84 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         }
     }
 
-    /// The bounds gate's verdict for `cluster`, whose routing key is `sim`.
-    fn verdict(&self, cluster: usize, sim: f32) -> Verdict {
-        let query_bound = self.tracker.bound();
-        bounds_verdict(query_bound, || {
-            let QueryBound::Armed { t } = query_bound else {
-                // Never called while filling; +inf keeps the impossible case fail-open.
-                return f32::INFINITY;
-            };
-            // Every margin assumes the stream key is the exact centroid similarity. The row is
-            // read unmetered, so debug builds report the same IO.
-            #[cfg(debug_assertions)]
-            {
-                let row = self
-                    .index
-                    .centroid_row_slice(cluster)
-                    .and_then(|row| Ok(row.read_bytes()?))
-                    .expect("readable centroid row");
-                let exact = self
-                    .query
-                    .metric()
-                    .similarity_bytes::<f32>(self.query.widened(), &row);
-                debug_assert_eq!(
-                    sim,
-                    exact.score(),
-                    "routing stream key must be the exact centroid similarity"
-                );
-            }
-            let r = self.bounds.ball_r(cluster);
-            match self.query.metric() {
-                Metric::L2 | Metric::Cosine => {
-                    margin_ball_ball(t, r, to_bound_space(self.query.metric(), sim))
-                }
-                Metric::Dot => margin_ball_halfspace(sim, self.query.norm(), r, t),
-            }
-        })
+    /// Prepares this segment for a global search across multiple segments.
+    /// The global search supplies clusters in ranked order and enforces the shared budget.
+    pub(crate) fn for_global(
+        reader: &'a VectorIndexReader,
+        budget: WorkBudget,
+        filter: DocFilter,
+        segment: &'a SegmentReader,
+        metrics: RouterMetrics,
+    ) -> Self {
+        Self::from_ranked(
+            reader,
+            RouterIter::new(Vec::new(), metrics),
+            budget,
+            filter,
+            segment,
+            None,
+        )
     }
 
-    /// Selects `cluster`'s rows into `offsets` and counts what the gate pruned.
-    fn gate_cluster(&mut self, cluster: usize, rows: usize) -> crate::Result<GatedRows> {
-        // DocIds alone, then the gate, before any payload read.
-        if !self.gate.is_open() {
-            self.reader.read_doc_ids(cluster, &mut self.docs)?;
-            debug_assert_eq!(self.docs.len(), rows);
+    /// Prepares a cluster chosen by the global router.
+    pub(crate) fn probe_global(
+        &mut self,
+        candidate: Candidate,
+    ) -> crate::Result<Option<ClusterRows<'_>>> {
+        let Candidate { sim, node } = candidate;
+        let cluster = node as usize;
+        self.meter.open();
+        let rows = 0..self.open_cluster(cluster)?;
+        if rows.is_empty() {
+            self.skip_empty();
+            return Ok(None);
         }
+        let gated = self.gate_cluster(rows.len());
+        if !gated.all && self.offsets.is_empty() {
+            self.skip_empty();
+            return Ok(None);
+        }
+        let (offsets, docs) = self.selection(gated);
+        Ok(Some(ClusterRows {
+            cluster,
+            rows,
+            offsets,
+            docs,
+            centroid: Some(sim),
+        }))
+    }
+
+    /// The gated selection as the scan takes it: offsets and doc ids of the kept rows, or, with
+    /// every row kept, no offsets and the whole DocIds column when the segment is replicated.
+    fn selection(&mut self, gated: GatedRows) -> (Option<&[u32]>, Option<&[DocId]>) {
+        if gated.all {
+            return (None, self.replicated.then_some(&self.docs[..]));
+        }
+        self.selected_docs.clear();
+        self.selected_docs.extend(
+            self.offsets
+                .iter()
+                .map(|&offset| self.docs[offset as usize]),
+        );
+        (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
+    }
+
+    /// The row count of `cluster`, with its DocIds column in `docs` when the gate or replication
+    /// needs it: the count then comes from the block lookup that reads the column.
+    fn open_cluster(&mut self, cluster: usize) -> crate::Result<usize> {
+        // DocIds alone, then the gate, before any payload read; a replicated segment reads them for
+        // every cluster so the scan can drop a document's second copy.
+        if !self.gate.is_open() || self.replicated {
+            self.reader.read_doc_ids(cluster, &mut self.docs)?;
+            Ok(self.docs.len())
+        } else {
+            self.index.cluster_num_rows(cluster)
+        }
+    }
+
+    /// Selects the opened cluster's `rows` into `offsets` and counts what the gate pruned.
+    fn gate_cluster(&mut self, rows: usize) -> GatedRows {
+        debug_assert!((self.gate.is_open() && !self.replicated) || self.docs.len() == rows);
         let gated = {
             let _routing = enter_vector_stage(VectorStage::Routing);
             self.gate.select(&self.docs, &mut self.offsets)
@@ -296,23 +309,17 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
         self.counters.vectors_visited += rows;
         self.counters.pruned_filter += gated.pruned_filter;
         self.counters.pruned_dead += gated.pruned_dead;
-        Ok(gated)
+        gated
     }
 
     /// Counts an opened cluster that contributes no rows.
-    fn skip_empty(&mut self, feedback: Feedback) -> crate::Result<()> {
+    fn skip_empty(&mut self) {
         self.counters.postings_skipped += 1;
         self.counters.clusters_skipped_empty += 1;
-        self.controller.cover(feedback.kth_estimate)
     }
 
     /// Ends the walk and reports what it counted.
-    pub(crate) fn finish(mut self) -> RouterReport {
-        debug_assert!(
-            self.tracker.armed_at_probe().is_some()
-                == matches!(self.tracker.bound(), QueryBound::Armed { .. })
-        );
-        self.counters.bound_armed_at = self.tracker.armed_at_probe();
+    pub(crate) fn finish(self) -> RouterReport {
         RouterReport {
             counters: self.counters,
             routing: self.ranked.metrics(),
@@ -321,8 +328,12 @@ impl<'a, T: VectorElement> RouterClusters<'a, T> {
     }
 }
 
-impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
-    fn next(&mut self, feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+impl ClusterSource for RouterClusters<'_> {
+    fn work_meter(&mut self) -> &mut WorkMeter {
+        &mut self.meter
+    }
+
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         loop {
             let next = {
                 let _routing = enter_vector_stage(VectorStage::Routing);
@@ -336,37 +347,19 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
             }
             let cluster = node as usize;
 
-            // A skip charges the open share and covers the cluster. The bound is the pessimistic
-            // k-th, so a skip never drops a true top-k row; APS covers with the point estimate.
-            if self.verdict(cluster, sim.score()) == Verdict::Skip {
-                self.meter.open();
-                self.controller.cover(feedback.kth_estimate)?;
-                self.counters.bounds_skips += 1;
-                continue;
-            }
             self.meter.open();
-            let rows = self.index.cluster_range(cluster);
+            let rows = 0..self.open_cluster(cluster)?;
             if rows.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
 
-            let gated = self.gate_cluster(cluster, rows.len())?;
+            let gated = self.gate_cluster(rows.len());
             if !gated.all && self.offsets.is_empty() {
-                self.skip_empty(feedback)?;
+                self.skip_empty();
                 continue;
             }
-            let (offsets, docs) = if gated.all {
-                (None, None)
-            } else {
-                self.selected_docs.clear();
-                self.selected_docs.extend(
-                    self.offsets
-                        .iter()
-                        .map(|&offset| self.docs[offset as usize]),
-                );
-                (Some(&self.offsets[..]), Some(&self.selected_docs[..]))
-            };
+            let (offsets, docs) = self.selection(gated);
             return Ok(Some(ClusterRows {
                 cluster,
                 rows,
@@ -377,16 +370,10 @@ impl<T: VectorElement> ClusterSource for RouterClusters<'_, T> {
         }
     }
 
-    fn admitted(&mut self, rows: usize, feedback: Feedback) -> crate::Result<()> {
+    fn admitted(&mut self, rows: usize) -> crate::Result<()> {
         self.meter.rows(rows);
         self.counters.eligible += rows;
         self.counters.postings_row += 1;
-        let probe = (self.counters.postings_row + self.counters.postings_skipped - 1) as u32;
-        self.tracker.observe(
-            self.query.metric(),
-            HeapPeek::from_kth(feedback.kth_lower),
-            probe,
-        );
-        self.controller.cover(feedback.kth_estimate)
+        Ok(())
     }
 }

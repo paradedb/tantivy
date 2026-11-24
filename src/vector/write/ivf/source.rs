@@ -96,8 +96,11 @@ impl RowReader<'_> {
         let mut remaining = self.order.as_slice();
         while let Some(&first) = remaining.first() {
             let segment_ord = address(first).segment_ord;
-            let run_len =
-                remaining.partition_point(|&slot| address(slot).segment_ord == segment_ord);
+            let block = address(first).block_address.block;
+            let run_len = remaining.partition_point(|&slot| {
+                address(slot).segment_ord == segment_ord
+                    && address(slot).block_address.block == block
+            });
             let (run, rest) = remaining.split_at(run_len);
             remaining = rest;
             let reader = &self.readers[segment_ord as usize];
@@ -106,14 +109,18 @@ impl RowReader<'_> {
                     return Err(TantivyError::Cancelled);
                 }
                 self.scratch.rows.clear();
-                self.scratch
-                    .rows
-                    .extend(chunk.iter().map(|&slot| address(slot).row_id));
+                self.scratch.rows.extend(
+                    chunk
+                        .iter()
+                        .map(|&slot| address(slot).block_address.row as usize),
+                );
                 self.scratch.rows.dedup();
-                let batch = reader.read_vector_rows_planned(&mut self.scratch)?;
+                let batch = reader.read_vector_rows_planned(block as usize, &mut self.scratch)?;
                 let mut slots = chunk.iter().copied().peekable();
                 for (row, bytes) in batch.iter() {
-                    while let Some(slot) = slots.next_if(|&slot| address(slot).row_id == row) {
+                    while let Some(slot) =
+                        slots.next_if(|&slot| address(slot).block_address.row as usize == row)
+                    {
                         let slot = slot as usize;
                         decode_row_into::<f32>(bytes, &mut values[slot * dim..(slot + 1) * dim])?;
                         doc_ids[slot] = requested[slot].1;

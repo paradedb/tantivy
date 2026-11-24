@@ -9,7 +9,10 @@ use crate::schema::{Metric, VectorOptions};
 use crate::vector::clustering::IvfCentroids;
 use crate::vector::router::arena::VectorArena;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::stacked::levels::{InMemoryStore, LazyStore};
+use crate::vector::router::stacked::levels::{ClusterId, InMemoryStore, LazyStore};
+use crate::vector::router::{RouterIter, RouterMetrics};
+use crate::vector::search::prepared::VectorQuery;
+use crate::vector::VectorElement;
 
 pub(crate) struct ExactRouter<S> {
     centroids: S,
@@ -19,25 +22,46 @@ pub(crate) struct ExactRouter<S> {
 }
 
 impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
-    pub(super) fn rank(&self, query: &[f32]) -> Ranking {
-        let mut ranked = (0..self.num_centroids)
-            .map(|cluster| Candidate {
-                sim: self
-                    .centroids
-                    .similarity(self.metric, self.dim, cluster as u32, query),
-                node: cluster as u32,
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|a, b| b.cmp(a));
-        Ranking {
-            ranked: ranked.into_iter(),
-            visited_count: self.num_centroids,
-        }
+    pub(super) fn rank<T: VectorElement>(&self, query: &VectorQuery<T>) -> RouterIter {
+        assert_eq!(query.widened().len(), self.dim);
+        debug_assert_eq!(query.metric(), self.metric);
+        rank_rows(&self.centroids, self.num_centroids, query)
     }
 
     pub(super) fn serialize_payload<W: Write + ?Sized>(&self, _out: &mut W) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Scores centroid rows `0..count` against the query and ranks them all, most similar first.
+pub(super) fn rank_rows<S: VectorArena<Elem = f32>, T: VectorElement>(
+    centroids: &S,
+    count: usize,
+    query: &VectorQuery<T>,
+) -> RouterIter {
+    let mut scores = Vec::with_capacity(count);
+    centroids.batch_similarity(
+        query.widened(),
+        query.metric(),
+        query.routing_norm(),
+        0..count,
+        &mut scores,
+    );
+    let mut ranked = scores
+        .into_iter()
+        .enumerate()
+        .map(|(cluster, sim)| Candidate {
+            sim,
+            node: ClusterId::from(cluster),
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    RouterIter::new(
+        ranked,
+        RouterMetrics::Exact {
+            visited_count: count,
+        },
+    )
 }
 
 pub(super) fn build(
@@ -77,21 +101,45 @@ pub(super) fn open(
     })
 }
 
-pub(crate) struct Ranking {
-    ranked: std::vec::IntoIter<Candidate>,
-    visited_count: usize,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::clustering::IvfMatrix;
 
-impl Ranking {
-    pub(super) fn visited_count(&self) -> usize {
-        self.visited_count
-    }
-}
-
-impl Iterator for Ranking {
-    type Item = Candidate;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.ranked.next()
+    #[test]
+    fn batch_ranking_matches_single_row_scoring() -> crate::Result<()> {
+        let matrix: IvfMatrix<f32> = IvfMatrix {
+            values: vec![
+                1.0, -2.0, 3.0, 0.0, 0.0, 0.0, -4.0, 5.0, -6.0, 1.0, -2.0, 3.0,
+            ],
+            rows: 4,
+            dims: 3,
+        };
+        let bytes: Vec<_> = matrix.values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let options = VectorOptions::new(matrix.dims, metric);
+            let router = build(&options, &IvfCentroids::F32(matrix.clone()));
+            let opened = open(
+                FileSlice::from(Vec::new()),
+                FileSlice::from(bytes.clone()),
+                &options,
+            )?;
+            for query in [[1.5, -0.5, 2.0], [0.0, 0.0, 0.0]] {
+                let mut expected: Vec<_> = matrix
+                    .values
+                    .chunks_exact(matrix.dims)
+                    .enumerate()
+                    .map(|(node, row)| Candidate {
+                        sim: metric.similarity(&query, row),
+                        node: node as u32,
+                    })
+                    .collect();
+                expected.sort_unstable_by(|a, b| b.cmp(a));
+                let query = VectorQuery::new(metric, std::sync::Arc::new(query.to_vec())).unwrap();
+                assert_eq!(router.rank(&query).collect::<Vec<_>>(), expected);
+                assert_eq!(opened.rank(&query).collect::<Vec<_>>(), expected);
+            }
+        }
+        Ok(())
     }
 }

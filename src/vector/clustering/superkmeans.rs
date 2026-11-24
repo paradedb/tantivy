@@ -3,16 +3,18 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use superkmeans::{Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix};
+use superkmeans::{
+    Dataset, HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SoarAssigner,
+};
 
-use crate::schema::{Metric, VectorOptions};
+use crate::schema::VectorOptions;
 use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::TantivyError;
 
-/// Default [`SuperKMeansClusterer::with_max_leaf_size`].
-pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
+/// Default [`SuperKMeansClusterer::with_target_leaf_size`].
+pub const DEFAULT_TARGET_LEAF_SIZE: usize = 200;
 /// Default [`SuperKMeansClusterer::with_training_sample_ratio`].
 pub const DEFAULT_TRAINING_SAMPLE_RATIO: f64 = 0.32;
 
@@ -127,11 +129,11 @@ impl fmt::Debug for SuperKMeansClusterer {
 }
 
 impl SuperKMeansClusterer {
-    /// Defaults: [`DEFAULT_MAX_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
+    /// Defaults: [`DEFAULT_TARGET_LEAF_SIZE`], [`DEFAULT_TRAINING_SAMPLE_RATIO`], no memory limit.
     pub fn new() -> Self {
         let mut config = HierarchicalSuperKMeansConfig::default();
         config.base.suppress_warnings = true;
-        config.max_leaf_size = DEFAULT_MAX_LEAF_SIZE;
+        config.target_leaf_size = DEFAULT_TARGET_LEAF_SIZE;
         Self {
             config,
             training_sample_ratio: DEFAULT_TRAINING_SAMPLE_RATIO as f32,
@@ -140,9 +142,9 @@ impl SuperKMeansClusterer {
         }
     }
 
-    /// At most `max_leaf_size` training vectors per clustering leaf.
-    pub fn with_max_leaf_size(mut self, max_leaf_size: usize) -> Self {
-        self.config.max_leaf_size = max_leaf_size;
+    /// Target training vectors per clustering leaf, enforced as a hard cap.
+    pub fn with_target_leaf_size(mut self, target_leaf_size: usize) -> Self {
+        self.config.target_leaf_size = target_leaf_size;
         self
     }
 
@@ -193,6 +195,22 @@ impl SuperKMeansClusterer {
     }
 }
 
+/// The SOAR assignment's batch rows and Gram budget for `budget_rows` rows of `row_bytes` and
+/// `centroids` centroids. The Gram budget is a quarter of the memory budget; a Gram matrix that
+/// fits it (and has a second centroid to pick) is held, and the batches give up its bytes.
+fn soar_budget(budget_rows: usize, row_bytes: usize, centroids: usize) -> (usize, usize) {
+    let gram_budget = budget_rows.saturating_mul(row_bytes) / 4;
+    let gram_bytes = centroids
+        .checked_mul(centroids)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f32>()))
+        .filter(|&bytes| bytes <= gram_budget && centroids >= 2)
+        .unwrap_or(0);
+    let batch_rows = budget_rows
+        .saturating_sub(gram_bytes.div_ceil(row_bytes.max(1)))
+        .max(1);
+    (batch_rows, gram_budget)
+}
+
 /// The end of the fine-step group of meso clusters starting at `start`, given the partition's
 /// `offsets`. Clusters join while the group plus the fine step's working copy of its largest
 /// cluster stays within `capacity` rows; a group always holds at least one cluster.
@@ -209,11 +227,6 @@ fn fine_group_end(offsets: &[usize], start: usize, capacity: usize) -> usize {
         end += 1;
     }
     end
-}
-
-/// Whether `metric` clusters by angle.
-fn is_angular(metric: Metric) -> bool {
-    matches!(metric, Metric::Cosine | Metric::Dot)
 }
 
 impl IvfClusterer for SuperKMeansClusterer {
@@ -234,7 +247,7 @@ impl IvfClusterer for SuperKMeansClusterer {
             ));
         }
         let mut config = self.config.clone();
-        if is_angular(options.metric()) {
+        if options.metric().clusters_by_angle() {
             config.base.angular = true;
         }
         let kmeans = HierarchicalSuperKMeans::with_config(dim, config);
@@ -326,7 +339,7 @@ impl IvfClusterer for SuperKMeansClusterer {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
         let mut assignments = Vec::with_capacity(source.num_rows());
-        let kmeans = self.assigner(options.dim(), is_angular(options.metric()));
+        let kmeans = self.assigner(options.dim(), options.metric().clusters_by_angle());
         let IvfCentroids::F32(centroids) = centroids;
         for_each_batch(
             source,
@@ -341,6 +354,44 @@ impl IvfClusterer for SuperKMeansClusterer {
         )?;
         Ok(assignments)
     }
+
+    /// The nearest centroid and the SOAR secondary over every centroid, from one assigner
+    /// prepared for the whole source; `None` with a single centroid.
+    ///
+    /// The assigner holds the centroid Gram matrix when it fits a quarter of the memory budget,
+    /// and each secondary then comes from the nearest-centroid pass's dot products alone. The
+    /// batches shrink by the Gram's size so rows plus Gram stay within the budget.
+    fn assign_pairs(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
+        let mut pairs = Vec::with_capacity(source.num_rows());
+        let IvfCentroids::F32(centroids) = centroids;
+        let (batch_rows, gram_budget) = soar_budget(
+            self.budget_rows(options),
+            options.bytes_per_vector(),
+            centroids.rows,
+        );
+        let soar = SoarAssigner::new(
+            Matrix::new(&centroids.values, centroids.rows, centroids.dims),
+            lambda,
+            2,
+            gram_budget,
+        );
+        for_each_batch(source, batch_rows, |IvfTrainingVectors::F32(batch)| {
+            let (primary, secondary) = soar.assign(&batch.matrix.values, batch.matrix.rows);
+            pairs.extend(
+                primary
+                    .into_iter()
+                    .zip(secondary)
+                    .map(|(first, second)| (first, (second != u32::MAX).then_some(second))),
+            );
+        })?;
+        Ok(pairs)
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +400,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
+    use crate::schema::Metric;
     use crate::vector::clustering::IvfTrainingBatch;
 
     /// In-memory [`VectorSource`] that records every range read and counts `read_rows` calls.
@@ -443,7 +495,7 @@ mod tests {
     fn trains_and_assigns_from_the_source() {
         let (n, dim) = (5_000, 16);
         let mut source = VecSource::new(blobs(n, dim), dim);
-        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
 
         let centroids = train(&clusterer, &mut source);
@@ -463,7 +515,7 @@ mod tests {
     #[test]
     fn a_cancel_stops_training_in_the_meso_and_fine_steps() {
         let (n, dim) = (5_000, 16);
-        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
         let options = VectorOptions::new(dim, Metric::L2);
 
         let mut source = CancellingSource {
@@ -488,6 +540,113 @@ mod tests {
         }
     }
 
+    /// Every vector gets a secondary distinct from its primary; with a large `lambda` the
+    /// secondary's residual lies further off the primary residual than the second-nearest
+    /// centroid's does for most vectors; one centroid gives no secondary.
+    #[test]
+    fn assigns_pairs_off_the_primary_residual() {
+        let (n, dim) = (3_000, 16);
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let centroids = train(&clusterer, &mut source);
+        let trained = IvfCentroids::F32(centroids.clone());
+        let nearest = clusterer.assign(&options, &mut source, &trained).unwrap();
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &trained, 50.0)
+            .unwrap();
+        assert_eq!(pairs.len(), n);
+        let projection = |x: &[f32], primary: u32, cluster: u32| -> f32 {
+            let c1 = &centroids.values[primary as usize * dim..][..dim];
+            let c = &centroids.values[cluster as usize * dim..][..dim];
+            let residual: Vec<f32> = x.iter().zip(c1).map(|(a, b)| a - b).collect();
+            let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+            x.iter()
+                .zip(c)
+                .zip(&residual)
+                .map(|((a, b), r)| (a - b) * r / norm)
+                .sum::<f32>()
+                .abs()
+        };
+        let mut off_residual = 0;
+        for (row, &(primary, second)) in pairs.iter().enumerate() {
+            assert_eq!(primary, nearest[row]);
+            let second = second.expect("more than one centroid");
+            assert_ne!(second, primary, "row {row}");
+            let x = &source.values[row * dim..(row + 1) * dim];
+            let mut by_distance: Vec<(f32, u32)> = (0..centroids.rows as u32)
+                .map(|c| {
+                    let centroid = &centroids.values[c as usize * dim..][..dim];
+                    (
+                        x.iter().zip(centroid).map(|(a, b)| (a - b) * (a - b)).sum(),
+                        c,
+                    )
+                })
+                .collect();
+            by_distance.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let second_nearest = by_distance[1].1;
+            if projection(x, primary, second) <= projection(x, primary, second_nearest) {
+                off_residual += 1;
+            }
+        }
+        assert!(
+            off_residual * 10 >= n * 9,
+            "{off_residual} of {n} secondaries lie at least as far off the residual as nearest-2"
+        );
+
+        let one = IvfCentroids::F32(IvfMatrix {
+            values: centroids.values[..dim].to_vec(),
+            rows: 1,
+            dims: dim,
+        });
+        let pairs = clusterer
+            .assign_pairs(&options, &mut source, &one, 1.0)
+            .unwrap();
+        assert!(pairs
+            .iter()
+            .all(|&(primary, second)| primary == 0 && second.is_none()));
+    }
+
+    /// A Gram matrix inside a quarter of the budget is held and the batches give up its bytes; a
+    /// larger one is not held and the batches keep the whole budget.
+    #[test]
+    fn soar_batches_leave_room_for_the_gram_matrix() {
+        let (n, dim) = (5_000, 16);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let row_bytes = options.bytes_per_vector();
+        let centroids = train(
+            &SuperKMeansClusterer::new().with_target_leaf_size(100),
+            &mut VecSource::new(blobs(n, dim), dim),
+        );
+        let k = centroids.rows;
+        let gram_rows = (k * k * 4).div_ceil(row_bytes);
+        let trained = IvfCentroids::F32(centroids);
+
+        // Room for the Gram: a quarter of 8 x gram_rows rows is twice its size.
+        let budget_rows = 8 * gram_rows;
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let pairs = SuperKMeansClusterer::new()
+            .with_memory_limit(budget_rows * row_bytes)
+            .assign_pairs(&options, &mut source, &trained, 2.0)
+            .unwrap();
+        assert_eq!(pairs.len(), n);
+        let batch = budget_rows - gram_rows;
+        assert_eq!(source.ranges[0], 0..batch, "{k} centroids");
+        assert!(source.ranges.iter().all(|range| range.len() <= batch));
+
+        // No room: the batches take every row of the budget.
+        let budget_rows = 2 * gram_rows;
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let unheld = SuperKMeansClusterer::new()
+            .with_memory_limit(budget_rows * row_bytes)
+            .assign_pairs(&options, &mut source, &trained, 2.0)
+            .unwrap();
+        assert_eq!(source.ranges[0], 0..budget_rows);
+        let primaries =
+            |pairs: &[(u32, Option<u32>)]| pairs.iter().map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(primaries(&unheld), primaries(&pairs));
+    }
+
     #[test]
     fn rejects_an_empty_source() {
         let mut source = VecSource::new(Vec::new(), 4);
@@ -505,7 +664,7 @@ mod tests {
         let (n, dim) = (5_000, 16);
         let mut source = VecSource::new(blobs(n, dim), dim);
         train(
-            &SuperKMeansClusterer::new().with_max_leaf_size(100),
+            &SuperKMeansClusterer::new().with_target_leaf_size(100),
             &mut source,
         );
         assert_eq!(source.ranges.len(), 1);
@@ -521,7 +680,7 @@ mod tests {
         let mut source = VecSource::new(blobs(n, dim), dim);
         let options = VectorOptions::new(dim, Metric::L2);
         let clusterer = SuperKMeansClusterer::new()
-            .with_max_leaf_size(100)
+            .with_target_leaf_size(100)
             .with_memory_limit(1_000 * options.bytes_per_vector());
         train(&clusterer, &mut source);
 
@@ -546,7 +705,7 @@ mod tests {
     fn the_memory_limit_does_not_change_the_centroids() {
         let (n, dim) = (5_000, 16);
         let options = VectorOptions::new(dim, Metric::L2);
-        let clusterer = SuperKMeansClusterer::new().with_max_leaf_size(100);
+        let clusterer = SuperKMeansClusterer::new().with_target_leaf_size(100);
         let reference = train(&clusterer, &mut VecSource::new(blobs(n, dim), dim));
         for limit_rows in [n, 1_000] {
             let mut source = VecSource::new(blobs(n, dim), dim);
@@ -588,15 +747,15 @@ mod tests {
     fn settings_default_and_set_independently() {
         let clusterer = SuperKMeansClusterer::new();
         assert_eq!(clusterer.training_sample_ratio(), 0.32);
-        assert_eq!(clusterer.config.max_leaf_size, DEFAULT_MAX_LEAF_SIZE);
+        assert_eq!(clusterer.config.target_leaf_size, DEFAULT_TARGET_LEAF_SIZE);
 
         let clusterer = SuperKMeansClusterer::new()
-            .with_max_leaf_size(20)
+            .with_target_leaf_size(20)
             .with_training_sample_ratio(0.25);
         assert_eq!(clusterer.training_sample_ratio(), 0.25);
-        assert_eq!(clusterer.config.max_leaf_size, 20);
+        assert_eq!(clusterer.config.target_leaf_size, 20);
         let clusterer = clusterer.with_training_sample_ratio(1.0);
         assert_eq!(clusterer.training_sample_ratio(), 1.0);
-        assert_eq!(clusterer.config.max_leaf_size, 20);
+        assert_eq!(clusterer.config.target_leaf_size, 20);
     }
 }

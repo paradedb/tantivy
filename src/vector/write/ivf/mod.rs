@@ -24,14 +24,15 @@ use crate::vector::clustering::{IvfCentroids, IvfClusterer, IvfMatrix};
 use crate::vector::distance::l2_squared;
 use crate::vector::router::RouterKind;
 use crate::vector::storage::header::{
-    write_centroid_header, write_vector_header, CENTROIDS_EXT, VEC_EXT,
+    write_centroid_header, write_vector_header, VectorEntry, CENTROIDS_EXT, HEADER_LEN, VEC_EXT,
 };
-use crate::vector::storage::id_map::DocLocation;
+use crate::vector::storage::metadata::Assignment;
 #[cfg(test)]
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::write::flat::{write_flat_rows, RowBytes};
 use crate::vector::write::{merge_source_rows, RowAddress};
-use crate::vector::VectorQuantizationConfig;
+use crate::vector::{VectorQuantizationConfig, ENTRY_ALIGN};
 use crate::{DocId, TantivyError};
 
 mod assign;
@@ -48,6 +49,9 @@ struct AssignedVector {
     cluster: usize,
     target_doc_id: DocId,
     source: RowAddress,
+    /// Whether this is the document's primary row, the one its location map points at; a
+    /// document's replica row is the same vector encoded against a second cluster.
+    primary: bool,
 }
 
 /// Per-field IVF build counters and timings, reported on `paradedb::ivf_build`.
@@ -59,7 +63,9 @@ struct IvfBuildTimings {
     assign_reads: usize,
     /// Source vectors read while encoding the clustered rows.
     encode_reads: usize,
-    spill_bytes: usize,
+    /// Source vectors read while writing the document-ordered full-precision rows.
+    exact_reads: usize,
+    replica_bytes: usize,
     pad_bytes: usize,
     /// Bytes written to this field's vector entries, including entry padding.
     /// File headers and the composite footer are excluded.
@@ -68,6 +74,8 @@ struct IvfBuildTimings {
     assign: Duration,
     id_map_write: Duration,
     encode: Duration,
+    /// Time writing the document-ordered full-precision rows.
+    exact: Duration,
 }
 
 /// One vector field's merge inputs.
@@ -80,6 +88,8 @@ struct FieldMerge<'a> {
     /// The field's reader in each source segment.
     readers: Vec<Arc<VectorIndexReader>>,
     num_target_docs: u32,
+    /// IVF clusters each vector is assigned to: 1, or 2 with a replica row in a second cluster.
+    replication: u8,
 }
 
 #[cfg(test)]
@@ -108,6 +118,7 @@ pub(crate) fn merge_ivf(
     if !has_vector_field {
         return Ok(());
     }
+    ctx.settings.validate_vector_replication()?;
 
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
     if num_target_docs == 0 {
@@ -162,10 +173,16 @@ pub(crate) fn merge_ivf(
             quantization,
             readers: field_readers,
             num_target_docs,
+            // Replica rows carry codes alone, so only a quantized field can hold them.
+            replication: if quantization.is_some() {
+                ctx.settings.vector_replication
+            } else {
+                1
+            },
         };
         if vector_count == 0 {
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-            id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
+            id_maps.push(write::FieldIdMaps::empty(&merge));
             continue;
         }
 
@@ -179,7 +196,7 @@ pub(crate) fn merge_ivf(
                     // no-vectors path: the reader errors on slots missing from composites the
                     // other fields still write.
                     write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
-                    id_maps.push((field, vec![DocLocation::ABSENT; num_target_docs as usize]));
+                    id_maps.push(write::FieldIdMaps::empty(&merge));
                     continue;
                 };
                 let mut centroids = trained.centroids;
@@ -189,36 +206,73 @@ pub(crate) fn merge_ivf(
                 let mut assigned_vectors = assign::assign(
                     &merge,
                     clusterer,
-                    source_rows,
+                    &source_rows,
                     &centroids,
                     vector_count,
                     &mut timings,
                 )?;
-                debug_assert_eq!(assigned_vectors.len(), trained.present_vectors);
-                // The `.centroids` doc count: one posting row per document.
-                let num_present_docs = assigned_vectors.len();
+                // The `.centroids` doc count: one primary row per document.
+                let num_present_docs = assigned_vectors
+                    .iter()
+                    .filter(|assigned| assigned.primary)
+                    .count();
+                debug_assert_eq!(num_present_docs, trained.present_vectors);
                 let cluster_offsets = assign::cluster_offsets(&mut assigned_vectors, num_centroids);
 
-                let (centroid_bytes, mut bounds_builder) =
-                    encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                let centroid_bytes = encode::encode_centroids(&merge, &centroids, num_centroids)?;
+                // The stored assignment says what the blocks hold: replica rows, or one row per
+                // document when the clusterer produced no secondary.
+                let assignment = if assigned_vectors.len() > num_present_docs {
+                    Assignment::Soar
+                } else {
+                    Assignment::Nearest
+                };
                 let locations = encode::write_data_entry(
                     &merge,
                     &mut vec_write,
                     &assigned_vectors,
                     &cluster_offsets,
                     &centroid_bytes,
-                    &mut bounds_builder,
+                    assignment,
                     &mut timings,
                 )?;
-                id_maps.push((field, locations));
+                // A quantized field keeps its full-precision rows in document order, in their own
+                // entry, normalized as the encode pass normalizes the rows it codes; the cluster
+                // blocks carry codes and document ids only.
+                let exact_present = if quantization.is_some() {
+                    let exact_start = Instant::now();
+                    timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+                    let entry_start = vec_write.written_bytes();
+                    let rows_w =
+                        vec_write.for_field_with_idx(field, VectorEntry::ExactRows.index());
+                    let present = write_flat_rows(
+                        rows_w,
+                        opts,
+                        &source_rows,
+                        &merge.readers,
+                        RowBytes::Normalized,
+                        ctx.cancel,
+                    )?;
+                    timings.exact_reads += present.len();
+                    timings.vec_bytes += vec_write.written_bytes() - entry_start;
+                    timings.exact = exact_start.elapsed();
+                    Some(present)
+                } else {
+                    None
+                };
+                id_maps.push(write::FieldIdMaps {
+                    field,
+                    locations,
+                    exact_present,
+                    num_target_docs,
+                });
 
                 write::centroid_slots(
                     &mut centroids_write,
                     &merge,
                     num_present_docs,
                     &centroid_bytes,
-                    &cluster_offsets,
-                    &bounds_builder.finish(),
+                    num_centroids,
                     &router,
                 )?;
 

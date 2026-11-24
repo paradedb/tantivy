@@ -7,8 +7,8 @@ use std::ops::Range;
 
 use crate::schema::Metric;
 use crate::vector::quantization::{
-    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
+    corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix, quantized_sigma,
+    refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
 };
 use crate::vector::search::scan::columns::Columns;
 use crate::vector::search::scan::layer_read::Decoded;
@@ -24,19 +24,32 @@ pub(crate) struct CombineCtx {
     pub(crate) query_error_squared: f32,
     /// The query's similarity to the cluster's centroid.
     pub(crate) cluster_score: f32,
+    /// Whether the query's error widths are unknown: every sigma is +inf.
+    pub(crate) width_unknown: bool,
 }
 
 // --- Combine ---
 
 /// Turns a shortlisted cluster's decoded layer-0 rows into the candidates at `at`, growing `out` to
 /// `at.end`.
-#[inline(always)]
+#[inline]
 pub(crate) fn combine_initial(
     ctx: &CombineCtx,
     decoded: &Decoded,
     out: &mut Columns,
     at: Range<usize>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if fma::detected() {
+        // SAFETY: `fma::detected` reports true only when the CPU has AVX2 and FMA.
+        return unsafe { fma::combine_initial(ctx, decoded, out, at) };
+    }
+    combine_initial_body(ctx, decoded, out, at)
+}
+
+/// The loops of [`combine_initial`]; the same body compiles for every feature set.
+#[inline(always)]
+fn combine_initial_body(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns, at: Range<usize>) {
     let rows = decoded.kernel.len();
     debug_assert_eq!(decoded.norms.len(), rows);
     debug_assert_eq!(at.len(), rows);
@@ -126,8 +139,24 @@ fn seed_initial(ctx: &CombineCtx, decoded: &Decoded, out: &mut Columns, at: Rang
 }
 
 /// Refines the candidates at `at` in place with a later layer's decoded rows.
-#[inline(always)]
+#[inline]
 pub(crate) fn combine_refine(
+    ctx: &CombineCtx,
+    decoded: &Decoded,
+    columns: &mut Columns,
+    at: Range<usize>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if fma::detected() {
+        // SAFETY: `fma::detected` reports true only when the CPU has AVX2 and FMA.
+        return unsafe { fma::combine_refine(ctx, decoded, columns, at) };
+    }
+    combine_refine_body(ctx, decoded, columns, at)
+}
+
+/// The loops of [`combine_refine`]; the same body compiles for every feature set.
+#[inline(always)]
+fn combine_refine_body(
     ctx: &CombineCtx,
     decoded: &Decoded,
     columns: &mut Columns,
@@ -186,40 +215,102 @@ pub(crate) fn combine_refine(
 
 // --- Sigma ---
 
-/// Sets the sigmas at `at`: each row's data-model sigma, widened by its arithmetic error.
+/// Sets the sigmas at `at`: each row's data-model and arithmetic variance under one square root.
+/// The loop stays free of calls so it vectorizes. The variance is in squared score units, so it
+/// can overflow f32 for admitted rows and queries of large norm; the sigma is then +inf, an
+/// unbounded width, and the row is never pruned. A query whose widths are unknown gets +inf for
+/// every row.
 #[inline(always)]
 fn fill_sigmas(ctx: &CombineCtx, error_ratios: &[f32], columns: &mut Columns, at: Range<usize>) {
     let sigmas = &mut columns.sigmas[at.clone()];
     let residual_norms_squared = &columns.residual_norm_squared[at.clone()];
     let gammas = &columns.gammas[at.clone()];
     let sign_query_error_terms = &columns.sign_query_error_terms[at.clone()];
-    debug_assert_eq!(sigmas.len(), error_ratios.len());
-    for (index, sigma) in sigmas.iter_mut().enumerate() {
-        *sigma = quantized_model_sigma(
-            ctx.metric,
-            ctx.dimension,
-            residual_norms_squared[index],
-            error_ratios[index],
-            gammas[index],
-            ctx.query_norm_squared,
-            sign_query_error_terms[index],
-        );
-    }
     let arithmetic_variances = &columns.arithmetic_variances[at.clone()];
     let raw_prefixes = &columns.raw_prefixes[at.clone()];
     let bases = &columns.bases[at.clone()];
-    for (index, sigma) in sigmas.iter_mut().enumerate() {
-        *sigma = arithmetic_variances[index].sigma(
-            ctx.metric,
-            *sigma,
-            gammas[index],
-            raw_prefixes[index],
-            bases[index],
-        );
+    debug_assert_eq!(sigmas.len(), error_ratios.len());
+    if ctx.width_unknown {
+        sigmas.fill(f32::INFINITY);
+    } else {
+        for (index, sigma) in sigmas.iter_mut().enumerate() {
+            *sigma = quantized_sigma(
+                ctx.metric,
+                ctx.dimension,
+                residual_norms_squared[index],
+                error_ratios[index],
+                gammas[index],
+                ctx.query_norm_squared,
+                sign_query_error_terms[index],
+                arithmetic_variances[index],
+                raw_prefixes[index],
+                bases[index],
+            );
+        }
     }
     debug_assert!(
-        columns.estimates[at].iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| s.is_finite())
+        columns.estimates[at].iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| *s >= 0.0),
+        "estimates must be finite and sigmas non-negative (+inf is an unbounded width)"
     );
+}
+
+// --- x86 FMA ---
+
+/// The combine loops compiled with AVX2 and FMA.
+///
+/// Every estimate goes through `f32::mul_add`. Shipped x86-64 builds carry no target-cpu, so it
+/// lowers to a `fmaf` call per row; under these features it is one fused instruction. Both round
+/// the exact `a * b + c` once, so every estimate and sigma is bit-identical to the plain body's.
+#[cfg(target_arch = "x86_64")]
+mod fma {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use super::{combine_initial_body, combine_refine_body, CombineCtx};
+    use crate::vector::search::scan::columns::Columns;
+    use crate::vector::search::scan::layer_read::Decoded;
+
+    /// Whether the CPU has AVX2 and FMA, probed once per process.
+    #[inline]
+    pub(super) fn detected() -> bool {
+        static DETECTED: AtomicU8 = AtomicU8::new(u8::MAX);
+        match DETECTED.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let detected = std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma");
+                DETECTED.store(u8::from(detected), Ordering::Relaxed);
+                detected
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn combine_initial(
+        ctx: &CombineCtx,
+        decoded: &Decoded,
+        out: &mut Columns,
+        at: Range<usize>,
+    ) {
+        combine_initial_body(ctx, decoded, out, at)
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn combine_refine(
+        ctx: &CombineCtx,
+        decoded: &Decoded,
+        columns: &mut Columns,
+        at: Range<usize>,
+    ) {
+        combine_refine_body(ctx, decoded, columns, at)
+    }
 }
 
 // --- Benchmark ---
@@ -265,6 +356,7 @@ pub fn quantization_bench_layer0_cosine_cluster(
         query_norm_squared,
         query_error_squared,
         cluster_score,
+        width_unknown: false,
     };
     combine_initial(&ctx, decoded, columns, 0..rows);
     columns.raw_prefixes[rows - 1] + columns.estimates[rows - 1] + columns.sigmas[rows - 1]
@@ -280,7 +372,7 @@ mod tests {
     use super::*;
     use crate::schema::VectorOptions;
     use crate::vector::diagnostics::audit::diagnostic_advance_raw_prefix;
-    use crate::vector::distance::Similarity;
+    use crate::vector::distance::{norm_squared_wide, Similarity};
     use crate::vector::quantization::QUANTIZED_BOUNDARY_KAPPA;
     use crate::vector::search::cluster_source::ClusterRows;
     use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
@@ -301,6 +393,7 @@ mod tests {
             query_norm_squared,
             query_error_squared,
             cluster_score,
+            width_unknown: false,
         }
     }
 
@@ -319,6 +412,256 @@ mod tests {
             errors: errors.to_vec(),
             constants: constants.to_vec(),
             norms: norms.to_vec(),
+            band_column: Vec::new(),
+        }
+    }
+
+    /// `rows` values cycling through signed zeros, subnormals, magnitudes near `f32::MAX` and
+    /// ordinary values; `scale` keeps a product of two of them finite.
+    #[cfg(target_arch = "x86_64")]
+    fn awkward(rows: usize, offset: usize, scale: f32) -> Vec<f32> {
+        let values = [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE / 8.0,
+            -f32::MIN_POSITIVE / 1024.0,
+            1e-40,
+            f32::MAX * 0.5,
+            -f32::MAX * 0.25,
+            f32::MAX.next_down(),
+            1.0,
+            -2.5,
+            1e-20,
+            -3e-19,
+            0.75,
+            123.456,
+        ];
+        (0..rows)
+            .map(|row| values[(row * 7 + offset) % values.len()] * scale)
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_columns_bit_equal(plain: &Columns, fused: &Columns, what: &str) {
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (name, a, b) in [
+            ("bases", &plain.bases, &fused.bases),
+            ("raw_prefixes", &plain.raw_prefixes, &fused.raw_prefixes),
+            ("estimates", &plain.estimates, &fused.estimates),
+            ("sigmas", &plain.sigmas, &fused.sigmas),
+            (
+                "residual_norm_squared",
+                &plain.residual_norm_squared,
+                &fused.residual_norm_squared,
+            ),
+            ("gammas", &plain.gammas, &fused.gammas),
+            (
+                "sign_query_error_terms",
+                &plain.sign_query_error_terms,
+                &fused.sign_query_error_terms,
+            ),
+        ] {
+            assert_eq!(bits(a), bits(b), "{what}: {name}");
+        }
+        let variances = |columns: &Columns| {
+            columns
+                .arithmetic_variances
+                .iter()
+                .map(|e| (e.raw_variance.to_bits(), e.base_variance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            variances(plain),
+            variances(fused),
+            "{what}: arithmetic_variances"
+        );
+    }
+
+    /// The AVX2+FMA compilation of the combine loops scores every row bit for bit as the plain body
+    /// does, called directly, on rows with signed zeros, subnormals and values near `f32::MAX`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_combine_is_bit_identical_to_the_plain_body() {
+        if !super::fma::detected() {
+            return;
+        }
+        const ROWS: usize = 98;
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let constants = |offset| {
+                if metric.scores_by_distance() {
+                    awkward(ROWS, offset, 0.5)
+                } else {
+                    Vec::new()
+                }
+            };
+            let layer = |offset| {
+                decoded(
+                    &awkward(ROWS, offset, 1e-3),
+                    &awkward(ROWS, offset + 3, 0.5),
+                    &awkward(ROWS, offset + 5, 1.0)
+                        .iter()
+                        .map(|g| g.abs().min(4.0))
+                        .collect::<Vec<_>>(),
+                    &awkward(ROWS, offset + 1, 1.0)
+                        .iter()
+                        .map(|e| e.abs().min(1.0))
+                        .collect::<Vec<_>>(),
+                    &constants(offset + 2),
+                    &awkward(ROWS, offset + 4, 0.25)
+                        .iter()
+                        .map(|n| n.abs())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for (cluster_score, query_error_squared) in [
+                (0.5, 1e-3),
+                (-0.0, 0.0),
+                (1e-40, f32::MIN_POSITIVE),
+                (1e30, 2.0),
+            ] {
+                let ctx = ctx(metric, 64, 1.0, query_error_squared, cluster_score);
+                let (mut plain, mut fused) = (Columns::default(), Columns::default());
+                let first = layer(0);
+                combine_initial_body(&ctx, &first, &mut plain, 0..ROWS);
+                // SAFETY: `fma::detected` returned true above, so the CPU has AVX2 and FMA.
+                unsafe { super::fma::combine_initial(&ctx, &first, &mut fused, 0..ROWS) };
+                assert_columns_bit_equal(&plain, &fused, &format!("{metric:?} initial"));
+                let second = layer(6);
+                combine_refine_body(&ctx, &second, &mut plain, 0..ROWS);
+                // SAFETY: as above.
+                unsafe { super::fma::combine_refine(&ctx, &second, &mut fused, 0..ROWS) };
+                assert_columns_bit_equal(&plain, &fused, &format!("{metric:?} refine"));
+            }
+        }
+    }
+
+    /// An inner-product query at or above the tiny-query bound of 1e-30 gets every layer-0 estimate
+    /// and sigma from the width formula, bit for bit; a smaller one keeps its estimates and gets
+    /// an unbounded sigma for every row.
+    #[test]
+    fn inner_product_widths_follow_the_formula_at_or_above_the_tiny_query_bound() {
+        const DIM: usize = 64;
+        const ROWS: usize = 32;
+        let config = VectorQuantizationConfig::materialize(
+            "tiny_inner_product".to_string(),
+            &VectorOptions::new(DIM, Metric::Dot),
+            vec![
+                VectorQuantizationLayer { bits: 1, seed: 17 },
+                VectorQuantizationLayer { bits: 1, seed: 23 },
+            ],
+        )
+        .unwrap();
+        let index = Arc::new(QuantizedIndexCtx::from_config(config).unwrap());
+        let centroid: Vec<f32> = (0..DIM)
+            .map(|coordinate| ((coordinate as f32 + 0.5) * 0.071).cos() * 0.1)
+            .collect();
+        let mut rows: Vec<f32> = (0..ROWS * DIM)
+            .map(|i| centroid[i % DIM] + ((i as f32 + 0.75) * 0.113).sin())
+            .collect();
+        let encoded = encode_batch_in_place(
+            &mut rows,
+            ROWS,
+            &prepare_centroid(&centroid, &index.specs),
+            &index.specs,
+            &index.grids,
+        );
+        let layer = &encoded.layers[0];
+        let gammas: Vec<f32> = layer.gammas.iter().copied().map(f16_to_f32).collect();
+        let errors: Vec<f32> = layer
+            .corrected_error_ratios
+            .iter()
+            .copied()
+            .map(f16_to_f32)
+            .collect();
+        let direction: Vec<f32> = (0..DIM)
+            .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
+            .collect();
+        for (target, unbounded) in [
+            (1e-31, true),
+            (1e-30, false),
+            (1e-12, false),
+            (1.0, false),
+            (1e30, false),
+        ] {
+            let scale = (target / norm_squared_wide(&direction)).sqrt() as f32;
+            let mut values: Vec<f32> = direction.iter().map(|value| value * scale).collect();
+            while norm_squared_wide(&values) < target {
+                values.iter_mut().for_each(|value| *value = value.next_up());
+            }
+            let vector_query = VectorQuery::new(Metric::Dot, Arc::new(values.clone())).unwrap();
+            let query = QuantizedQueryCtx::new(Arc::clone(&index), &vector_query);
+            let mut kernel = vec![0.0; ROWS];
+            query.score_layer_batch_unscaled(
+                0,
+                &layer.codes,
+                layer.codes.len() / ROWS,
+                &mut kernel,
+            );
+            let cluster_score = Metric::Dot.similarity(&values, &centroid).score();
+            let query_norm = query.score_query_norm(cluster_score);
+            let query_error_squared = query.query_error_squared(0) as f32;
+            let combine = CombineCtx {
+                metric: Metric::Dot,
+                dimension: DIM,
+                query_norm_squared: query_norm * query_norm,
+                query_error_squared,
+                cluster_score,
+                width_unknown: query.width_unknown(),
+            };
+            let mut columns = Columns::default();
+            combine_initial(
+                &combine,
+                &decoded(
+                    &kernel,
+                    &layer.scales,
+                    &gammas,
+                    &errors,
+                    &[],
+                    &encoded.residual_norms_squared,
+                ),
+                &mut columns,
+                0..ROWS,
+            );
+            for row in 0..ROWS {
+                let scale = layer.scales[row];
+                let raw_prefix = initial_dot_raw_prefix(kernel[row], scale);
+                let estimate = corrected_quantized_estimate(
+                    Metric::Dot,
+                    gammas[row],
+                    raw_prefix,
+                    cluster_score,
+                );
+                let sigma = quantized_sigma(
+                    Metric::Dot,
+                    DIM,
+                    encoded.residual_norms_squared[row],
+                    errors[row],
+                    gammas[row],
+                    query_norm * query_norm,
+                    scale * scale * query_error_squared,
+                    ArithmeticError::initial(
+                        Metric::Dot,
+                        kernel[row],
+                        scale,
+                        0.0,
+                        cluster_score,
+                        encoded.residual_norms_squared[row],
+                    ),
+                    raw_prefix,
+                    cluster_score,
+                );
+                let expected_sigma = if unbounded { f32::INFINITY } else { sigma };
+                assert_eq!(
+                    columns.estimates[row].to_bits(),
+                    estimate.to_bits(),
+                    "target {target:e} row {row}"
+                );
+                assert_eq!(
+                    columns.sigmas[row].to_bits(),
+                    expected_sigma.to_bits(),
+                    "target {target:e} row {row}"
+                );
+            }
         }
     }
 
@@ -339,7 +682,26 @@ mod tests {
         assert_eq!(columns.residual_norm_squared, [7.0]);
         assert_eq!(columns.sign_query_error_terms, [117.0]);
         let variance: f32 = 7.0 * 0.5 * 11.0 + 4.0 * 117.0;
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * variance.sqrt()).abs() < 1e-5);
+        // The model variance is one non-negative summand under the width's square root and the
+        // pad multiplies by at least one, so it bounds sigma from below; the stored columns and
+        // the combine context re-evaluate the width exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * variance.sqrt());
+        assert_eq!(
+            columns.sigmas[0].to_bits(),
+            quantized_sigma(
+                Metric::L2,
+                1,
+                columns.residual_norm_squared[0],
+                0.5,
+                columns.gammas[0],
+                11.0,
+                columns.sign_query_error_terms[0],
+                columns.arithmetic_variances[0],
+                columns.raw_prefixes[0],
+                columns.bases[0],
+            )
+            .to_bits()
+        );
     }
 
     /// A refining L2 gamma corrects only the raw prefix, and refining one candidate leaves the
@@ -373,8 +735,31 @@ mod tests {
         assert_eq!(columns.estimates, [22.0, 44.0]);
         assert_eq!(columns.residual_norm_squared, [9.0, 4.0]);
         assert_eq!(columns.sign_query_error_terms, [99.0, 53.0]);
-        assert!((columns.sigmas[0] - 2.0 * 1.15 * 427.5_f32.sqrt()).abs() < 1e-5);
-        assert!((columns.sigmas[1] - 2.0 * 1.15 * 136.25_f32.sqrt()).abs() < 1e-5);
+        // The model variances are non-negative summands under each width's square root and the
+        // pad multiplies by at least one, so they bound the sigmas from below; the stored
+        // columns and each refinement's own context re-evaluate the widths exactly.
+        assert!(columns.sigmas[0] >= 2.0 * 1.15 * 427.5_f32.sqrt());
+        assert!(columns.sigmas[1] >= 2.0 * 1.15 * 136.25_f32.sqrt());
+        for (index, (error_ratio, query_norm_squared)) in
+            [(0.5, 7.0), (0.25, 17.0)].into_iter().enumerate()
+        {
+            assert_eq!(
+                columns.sigmas[index].to_bits(),
+                quantized_sigma(
+                    Metric::L2,
+                    1,
+                    columns.residual_norm_squared[index],
+                    error_ratio,
+                    columns.gammas[index],
+                    query_norm_squared,
+                    columns.sign_query_error_terms[index],
+                    columns.arithmetic_variances[index],
+                    columns.raw_prefixes[index],
+                    columns.bases[index],
+                )
+                .to_bits()
+            );
+        }
     }
 
     fn assert_diagnostic_prefix_matches_integrated(metric: Metric) {
@@ -398,7 +783,8 @@ mod tests {
                         .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
                         .collect(),
                 ),
-            ),
+            )
+            .unwrap(),
         );
         let centroid: Vec<f32> = (0..DIM)
             .map(|coordinate| ((coordinate as f32 + 0.5) * 0.071).cos() * 0.1)
@@ -417,10 +803,14 @@ mod tests {
             &index.grids,
         );
         let residual_norm_squared = encoded.residual_norms_squared[0];
-        let cluster_score = if metric == Metric::L2 { -1.75 } else { 0.25 };
+        let cluster_score = if metric.scores_by_distance() {
+            -1.75
+        } else {
+            0.25
+        };
         let score_query_norm = query.score_query_norm(cluster_score);
         let score_query_norm_squared = score_query_norm * score_query_norm;
-        let base = if metric == Metric::L2 {
+        let base = if metric.scores_by_distance() {
             cluster_score - residual_norm_squared
         } else {
             cluster_score
@@ -429,7 +819,7 @@ mod tests {
         let first = &encoded.layers[0];
         let first_gamma = f16_to_f32(first.gammas[0]);
         let first_error_ratio = f16_to_f32(first.corrected_error_ratios[0]);
-        let first_constant = (metric == Metric::L2).then_some(first.constants[0]);
+        let first_constant = metric.scores_by_distance().then_some(first.constants[0]);
         let mut diagnostic_arithmetic = ArithmeticError::default();
         let diagnostic_first_raw = diagnostic_advance_raw_prefix(
             &query,
@@ -446,18 +836,15 @@ mod tests {
         .unwrap();
         let diagnostic_sign_query_error_term =
             first.scales[0] * first.scales[0] * query.query_error_squared(0) as f32;
-        let diagnostic_first_sigma = diagnostic_arithmetic.sigma(
+        let diagnostic_first_sigma = quantized_sigma(
             metric,
-            quantized_model_sigma(
-                metric,
-                DIM,
-                residual_norm_squared,
-                first_error_ratio,
-                first_gamma,
-                score_query_norm_squared,
-                diagnostic_sign_query_error_term,
-            ),
+            DIM,
+            residual_norm_squared,
+            first_error_ratio,
             first_gamma,
+            score_query_norm_squared,
+            diagnostic_sign_query_error_term,
+            diagnostic_arithmetic,
             diagnostic_first_raw,
             base,
         );
@@ -500,7 +887,9 @@ mod tests {
         let refinement = &encoded.layers[1];
         let refinement_gamma = f16_to_f32(refinement.gammas[0]);
         let refinement_error_ratio = f16_to_f32(refinement.corrected_error_ratios[0]);
-        let refinement_constant = (metric == Metric::L2).then_some(refinement.constants[0]);
+        let refinement_constant = metric
+            .scores_by_distance()
+            .then_some(refinement.constants[0]);
         let diagnostic_refined_raw = diagnostic_advance_raw_prefix(
             &query,
             metric,
@@ -514,18 +903,15 @@ mod tests {
             &mut diagnostic_arithmetic,
         )
         .unwrap();
-        let diagnostic_refined_sigma = diagnostic_arithmetic.sigma(
+        let diagnostic_refined_sigma = quantized_sigma(
             metric,
-            quantized_model_sigma(
-                metric,
-                DIM,
-                residual_norm_squared,
-                refinement_error_ratio,
-                refinement_gamma,
-                score_query_norm_squared,
-                diagnostic_sign_query_error_term,
-            ),
+            DIM,
+            residual_norm_squared,
+            refinement_error_ratio,
             refinement_gamma,
+            score_query_norm_squared,
+            diagnostic_sign_query_error_term,
+            diagnostic_arithmetic,
             diagnostic_refined_raw,
             base,
         );
@@ -677,7 +1063,7 @@ mod tests {
                 );
                 initial_sigmas = scan.candidates.columns.sigmas[at].to_vec();
             } else {
-                let rows = scan.candidates.global_rows();
+                let rows = scan.candidates.row_labels();
                 let select =
                     |values: &[f32]| -> Vec<f32> { rows.iter().map(|&row| values[row]).collect() };
                 let refined = decoded(
@@ -692,14 +1078,14 @@ mod tests {
                 combine_refine(&combine, &refined, &mut scan.candidates.columns, 0..count);
             }
             scan.band(k, QUANTIZED_BOUNDARY_KAPPA);
-            let survivors = scan.candidates.global_rows();
+            let survivors = scan.candidates.row_labels();
             assert!(
                 exact[..k].iter().all(|row| survivors.contains(row)),
                 "true top-k lost at layer {level}"
             );
             boundaries.push(survivors);
         }
-        let mut result = scan.candidates.global_rows();
+        let mut result = scan.candidates.row_labels();
         result.sort_by(|&a, &b| truth[b].total_cmp(&truth[a]).then(a.cmp(&b)));
         result.truncate(k);
         assert_eq!(result, exact[..k]);

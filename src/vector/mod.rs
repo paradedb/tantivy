@@ -39,18 +39,59 @@
 //! let searcher = index.reader()?.searcher();
 //! let hits = searcher.search(
 //!     &even,
-//!     &TopDocs::with_limit(10).order_by_similarity(embedding, query),
+//!     &TopDocs::with_limit(10)
+//!         .order_by_similarity(embedding, query)
+//!         .build_for_searcher(&searcher, &even)?,
+//! )?;
+//! assert_eq!(hits.results.len(), 10);
+//!
+//! // The same search with explicit preparation, routing, and document collection.
+//! use tantivy::collector::Collector;
+//! use tantivy::query::{EnableScoring, Query};
+//! use tantivy::vector::{
+//!     ProbeParams, TopClustersBySimilarityCollector, VectorSearchBudget, VectorSegment,
+//! };
+//! let params = ProbeParams::default();
+//! let query = vec![0.5_f32; 64];
+//! let builder = TopDocs::with_limit(10)
+//!     .order_by_similarity(embedding, query.clone())
+//!     .with_probe_params(params.clone());
+//! let weight = even.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+//! let segments: Vec<_> = searcher.segment_readers().iter().enumerate()
+//!     .map(|(ord, reader)| VectorSegment::from((ord as u32, reader))).collect();
+//! let budget = VectorSearchBudget::for_segments(embedding, &params, &segments)?;
+//! let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+//! let router = TopClustersBySimilarityCollector::new(
+//!     embedding, query, params, prepared.match_fraction(),
+//! )?.with_budget(prepared.budget());
+//! let candidates = router.collect_segments(&prepared.routing_segments(), |_| {})?;
+//! let inputs = prepared.with_candidates(candidates, None)?
+//!     .with_routing_statistics(router.take_statistics());
+//! let collector = builder.build(inputs);
+//! let hits = collector.merge_fruits(
+//!     collector.collect_segments(weight.as_ref(), &segments, |_| {})?,
 //! )?;
 //! assert_eq!(hits.results.len(), 10);
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Parallel callers resolve a [`VectorSearchBudget`] over the complete snapshot and pass it
+//! to each worker's [`TopDocsByVectorSimilarityBuilder::prepare`]. Distribute the coordinator's
+//! ranked candidates by original segment ordinal and attach each assignment with
+//! [`PreparedVectorSearch::with_candidates`], supplying the same [`SharedVectorWork`] counter
+//! to every worker. [`AtomicVectorWork`] supports threads or caller-owned shared memory.
+//! Workers charge actual cluster opens and scored rows to the query-wide ceiling, with at most
+//! one final cluster's overshoot per active worker. Located scans use separate size-based caps
+//! and need neither candidates nor routing publication. Reset the counter for each new query
+//! or rescan; never copy its value into independent worker counters.
 
 mod collector;
 mod distance;
 mod element;
 mod params;
 pub(crate) mod quantization;
+mod rotation_plan;
 mod stats;
 mod telemetry;
 mod tie_break;
@@ -66,19 +107,30 @@ pub(crate) mod storage;
 pub(crate) mod write;
 
 #[cfg(test)]
+mod exhaustive_metric_tests;
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
+pub use collector::{
+    SegmentVectorFruit, TopDocsByVectorSimilarity, TopDocsByVectorSimilarityBuilder,
+    VectorSimilarityFruit,
+};
 pub use element::{Accumulator, VectorElement, ENTRY_ALIGN};
 pub use params::{
-    LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS, DEFAULT_ROUTER_RECALL,
+    AdaptiveProbeParams, LocatedPath, ProbeParams, Selectivity, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use quantization::{VectorQuantizationConfig, VectorQuantizationLayer};
+pub use router::candidate::Candidate;
+pub use router::collector::{TopClustersBySimilarityCollector, VectorRoutingStats};
 pub use router::{RouterKind, RouterMetrics};
-pub use search::source::controller::ProbeTermination;
+pub use search::input::{
+    ClusterRef, PreparedVectorSearch, VectorScanInputs, VectorSearchBudget, VectorSegment,
+};
+pub use search::source::controller::{AtomicVectorWork, ProbeTermination, SharedVectorWork};
 pub use stats::ProbeStats;
+pub use storage::blocks::BlockAddress;
 pub use storage::io::{current_vector_read_kind, VectorReadKind};
 pub use storage::{VectorIndexReader, VectorIoStats};
 pub use telemetry::{current_vector_stage, VectorStage};

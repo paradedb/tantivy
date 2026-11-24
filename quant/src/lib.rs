@@ -6,6 +6,7 @@
 //! them into layered residual encoding, query preparation and layer boundaries.
 
 pub mod cascade;
+mod cpu;
 pub mod grid;
 pub mod model;
 pub mod rotation;

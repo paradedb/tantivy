@@ -397,6 +397,7 @@ impl IndexBuilder {
                 }
             }
             self.index_settings.validate_vector_quantization(schema)?;
+            self.index_settings.validate_vector_replication()?;
             if !(1..=100).contains(&self.index_settings.bitmap_postings.min_density_percent) {
                 return Err(crate::TantivyError::InvalidArgument(
                     "bitmap posting density must be between 1 and 100 percent".into(),
@@ -608,7 +609,11 @@ impl Index {
             inventory,
             custom_plugins: Vec::new(),
             ivf_clusterer: Arc::new(SuperKMeansClusterer::new()),
-            ivf_router: RouterKind::default(),
+            ivf_router: if metas.index_settings.vector_centroid_quantization {
+                RouterKind::QuantizedStacked
+            } else {
+                RouterKind::default()
+            },
         }
     }
 

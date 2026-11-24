@@ -1,10 +1,10 @@
 //! The filter-match source: a sparse filter's own matches, found through the document location
-//! map and served one cluster at a time in ascending id. No router or bounds gate; the work meter
+//! map and served one cluster at a time in ascending id. No router; the work meter
 //! charges every cluster and row, but every match is scored.
 
 use std::ops::Range;
 
-use crate::vector::search::cluster_source::{ClusterRows, ClusterSource, Feedback};
+use crate::vector::search::cluster_source::{ClusterRows, ClusterSource};
 use crate::vector::search::source::controller::{WorkBudget, WorkMeter};
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::reader::VectorIndexReader;
@@ -63,8 +63,6 @@ impl<'a> MatchClusters<'a> {
         }
         let mut located = Vec::with_capacity(docs.len());
         reader.locate_docs(&docs, &mut located)?;
-        // Cluster ids ascend with their row ranges, so this is ascending row order.
-        located.sort_unstable_by_key(|&(_, location)| (location.cluster, location.local));
         let report = MatchReport {
             matches: located.len(),
             absent: docs.len() - located.len(),
@@ -81,13 +79,13 @@ impl<'a> MatchClusters<'a> {
             docs,
             clusters: Vec::new(),
             next: 0,
-            meter: WorkMeter::new(budget),
+            meter: WorkMeter::new(budget, None),
             report,
         };
-        for (position, &(doc, location)) in located.iter().enumerate() {
-            source.offsets.push(location.local);
+        for (position, &(doc, address)) in located.iter().enumerate() {
+            source.offsets.push(address.row);
             source.docs[position] = doc;
-            let cluster = location.cluster as usize;
+            let cluster = address.block as usize;
             match source.clusters.last_mut() {
                 Some((last, positions)) if *last == cluster => positions.end = position + 1,
                 _ => source.clusters.push((cluster, position..position + 1)),
@@ -112,7 +110,11 @@ impl<'a> MatchClusters<'a> {
 }
 
 impl ClusterSource for MatchClusters<'_> {
-    fn next(&mut self, _feedback: Feedback) -> crate::Result<Option<ClusterRows<'_>>> {
+    fn work_meter(&mut self) -> &mut WorkMeter {
+        &mut self.meter
+    }
+
+    fn next(&mut self) -> crate::Result<Option<ClusterRows<'_>>> {
         let Some((cluster, positions)) = self.clusters.get(self.next).cloned() else {
             return Ok(None);
         };
@@ -120,14 +122,14 @@ impl ClusterSource for MatchClusters<'_> {
         self.meter.open();
         Ok(Some(ClusterRows {
             cluster,
-            rows: self.index.cluster_range(cluster),
+            rows: (0..self.index.cluster_num_rows(cluster)?),
             offsets: Some(&self.offsets[positions.clone()]),
             docs: Some(&self.docs[positions]),
             centroid: None,
         }))
     }
 
-    fn admitted(&mut self, rows: usize, _feedback: Feedback) -> crate::Result<()> {
+    fn admitted(&mut self, rows: usize) -> crate::Result<()> {
         self.meter.rows(rows);
         Ok(())
     }

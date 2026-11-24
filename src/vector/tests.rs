@@ -14,7 +14,7 @@ use crate::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::params::{LocatedPath, ProbeParams};
-use crate::vector::RouterKind;
+use crate::vector::{BlockAddress, RouterKind};
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -303,7 +303,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_vector_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V4);
+            assert_eq!(version, VectorFileVersion::V6);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -321,8 +321,16 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_centroid_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V3);
-                    CompositeFile::open(&body)?;
+                    assert_eq!(version, VectorFileVersion::V5);
+                    let composite = CompositeFile::open(&body)?;
+                    let mut slots: Vec<_> = composite
+                        .field_indices()
+                        .filter_map(|(field, idx)| {
+                            (field == index.embedding_field()).then_some(idx)
+                        })
+                        .collect();
+                    slots.sort_unstable();
+                    assert_eq!(slots, [0, 2]);
                 }
             }
         }
@@ -448,14 +456,14 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
     let query = grid2d::centroids()[0];
     let top_k = 3;
     let expected = index.ground_truth(query, top_k)?;
-    let hits = index
-        .index
-        .reader()?
-        .searcher()
+    let searcher = index.index.reader()?.searcher();
+    let hits = searcher
         .search(
             &AllQuery,
             &TopDocs::with_limit(top_k)
-                .order_by_similarity(index.embedding_field(), query.to_vec()),
+                .order_by_similarity(index.embedding_field(), query.to_vec())
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap(),
         )?
         .results;
     assert_eq!(hits, expected);
@@ -536,7 +544,9 @@ fn default_setup_clusters_past_the_threshold() -> crate::Result<()> {
             &AllQuery,
             &TopDocs::with_limit(10)
                 .order_by_similarity(field, query.to_vec())
-                .with_probe_params(exhaustive_params(0)),
+                .with_probe_params(exhaustive_params(0))
+                .build_for_searcher(&searcher, &crate::query::AllQuery)
+                .unwrap(),
         )?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -643,44 +653,469 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
-/// Non-finite elements are rejected at ingest on normalizing fields
-/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
-/// rides the normalize path only. `IndexWriter::add_document` enqueues
-/// to a worker, so the rejection may surface either from the enqueue or
-/// from the following `commit`.
+/// Non-finite elements are rejected at ingest for every metric, with the same error, and finite
+/// vectors are accepted. `IndexWriter::add_document` enqueues to a worker, so the rejection may
+/// surface either from the enqueue or from the following `commit`.
 #[test]
-fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
-    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        // L2: same vector is accepted; nothing normalizes, data is stored raw.
-        let mut schema_builder = Schema::builder();
-        let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
-        let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
-        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
-        let mut doc = TantivyDocument::new();
-        doc.add_vector(l2_field, &[bad, 1.0]);
-        writer.add_document(doc)?;
-        writer.commit()?;
-
-        // Cosine: rejected.
-        let mut schema_builder = Schema::builder();
-        let cos_field =
-            schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
-        let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
-        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
-        let mut doc = TantivyDocument::new();
-        doc.add_vector(cos_field, &[bad, 1.0]);
-        let err = match writer.add_document(doc) {
-            Err(err) => err.to_string(),
-            Ok(_) => writer
-                .commit()
-                .expect_err("non-finite vector must fail ingest")
-                .to_string(),
+fn ingest_rejects_non_finite_vector_for_every_metric() -> crate::Result<()> {
+    for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let single_doc_index = |vector: &[f32]| -> crate::Result<(Index, crate::Result<()>)> {
+            let mut schema_builder = Schema::builder();
+            let field = schema_builder.add_vector_field("v", VectorOptions::new(2, metric));
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .create_in_ram()?;
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            let result = writer
+                .add_document(doc)
+                .and_then(|_| writer.commit().map(|_| ()));
+            Ok((index, result))
         };
-        assert!(err.contains("non-finite"), "bad={bad}, err={err}");
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (_, result) = single_doc_index(&[bad, 1.0])?;
+            let err = result
+                .expect_err("non-finite vector must fail ingest")
+                .to_string();
+            assert!(
+                err.contains("non-finite element in vector field 'v'"),
+                "metric={metric:?}, bad={bad}, err={err}"
+            );
+        }
+
+        let (index, result) = single_doc_index(&[0.6, 0.8])?;
+        result?;
+        assert_eq!(
+            index.reader()?.searcher().num_docs(),
+            1,
+            "metric={metric:?}"
+        );
     }
     Ok(())
+}
+
+/// Metrics that store the row as given (L2, dot product) reject a row whose squared norm exceeds
+/// [`MAX_NORM_SQUARED`] with its own error and accept one just below it. Cosine normalizes, so
+/// it accepts any finite row.
+#[test]
+fn ingest_bounds_the_squared_norm_of_rows_stored_as_given() -> crate::Result<()> {
+    use crate::vector::distance::MAX_NORM_SQUARED;
+
+    const DIM: usize = 1024;
+    let single_doc_index =
+        |metric: Metric, vector: &[f32]| -> crate::Result<(Index, crate::Result<()>)> {
+            let mut schema_builder = Schema::builder();
+            let field = schema_builder.add_vector_field("v", VectorOptions::new(DIM, metric));
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .create_in_ram()?;
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector);
+            let result = writer
+                .add_document(doc)
+                .and_then(|_| writer.commit().map(|_| ()));
+            Ok((index, result))
+        };
+
+    let just_under = ((MAX_NORM_SQUARED / DIM as f64).sqrt() * 0.999) as f32;
+    let just_over = ((MAX_NORM_SQUARED / DIM as f64).sqrt() * 1.001) as f32;
+    for metric in [Metric::L2, Metric::Dot] {
+        for value in [1.0e20_f32, just_over] {
+            let (_, result) = single_doc_index(metric, &[value; DIM])?;
+            let err = result
+                .expect_err("an overflowing squared norm must fail ingest")
+                .to_string();
+            assert!(
+                err.contains("vector in field 'v'") && err.contains("squared norm above the limit"),
+                "metric={metric:?}, value={value}, err={err}"
+            );
+        }
+        let (index, result) = single_doc_index(metric, &[just_under; DIM])?;
+        result?;
+        assert_eq!(
+            index.reader()?.searcher().num_docs(),
+            1,
+            "metric={metric:?}"
+        );
+    }
+
+    let (index, result) = single_doc_index(Metric::Cosine, &[1.0e20; DIM])?;
+    result?;
+    assert_eq!(index.reader()?.searcher().num_docs(), 1);
+    Ok(())
+}
+
+/// Admission conformance over every `(dtype, metric)`: each edge vector is refused or accepted,
+/// as a row and as a query, as the rule states; accepted queries over the accepted rows rank as
+/// an f64 brute force does through the flat scan and the IVF full-precision scans, and the IVF
+/// `[1, 1]` quantized scan returns finite scores that agree with it per document. Every cluster
+/// is probed.
+#[test]
+fn admission_conformance_for_every_dtype_and_metric() -> crate::Result<()> {
+    let mut failures = Vec::new();
+    for dtype in VectorDType::ALL {
+        for metric in Metric::ALL {
+            match dtype {
+                VectorDType::F32 => admission_conformance::run_f32(metric, &mut failures)?,
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+mod admission_conformance {
+    use std::sync::Arc;
+
+    use crate::query::AllQuery;
+    use crate::schema::{Metric, Schema, VectorOptions};
+    use crate::vector::distance::{norm_squared_wide, InvalidVector, MAX_NORM_SQUARED};
+    use crate::vector::search::prepared::VectorQuery;
+    use crate::vector::test_support::{Fixture, FixtureSpec, Lcg};
+    use crate::{DocAddress, Index, Score, TantivyDocument, TantivyError};
+
+    /// The smallest dimension the quantization grids accept.
+    const DIM: usize = 64;
+    const NORMAL_ROWS: usize = 200;
+    const NORMAL_QUERIES: usize = 3;
+    const K: usize = 10;
+    const CENTROIDS: usize = 4;
+    /// Scores agree with the f64 oracle to this fraction of the score's magnitude, the sum of
+    /// the absolute values of its terms.
+    const REL: f64 = 1e-4;
+    /// Plus the f32 subnormal spacing once per term, the most a score can lose to underflow.
+    const ABS: f64 = DIM as f64 * 1.401298464324817e-45;
+
+    /// One edge vector and whether each normalization policy refuses it.
+    struct Case {
+        name: &'static str,
+        vector: Vec<f32>,
+        as_given: Option<InvalidVector>,
+        unit: Option<InvalidVector>,
+    }
+
+    fn edge_cases() -> Vec<Case> {
+        use InvalidVector::{NonFinite, NormTooLarge};
+        let seeded = Lcg(7).vector(DIM, 1.0);
+        let with = |value: f32| {
+            let mut vector = seeded.clone();
+            vector[3] = value;
+            vector
+        };
+        let mut one_max = vec![0.0; DIM];
+        one_max[0] = f32::MAX;
+        let mut under = (MAX_NORM_SQUARED / DIM as f64).sqrt() as f32;
+        while norm_squared_wide(&[under; DIM]) > MAX_NORM_SQUARED {
+            under = under.next_down();
+        }
+        let over = under.next_up();
+        assert!(norm_squared_wide(&[over; DIM]) > MAX_NORM_SQUARED);
+        let case = |name, vector, as_given, unit| Case {
+            name,
+            vector,
+            as_given,
+            unit,
+        };
+        vec![
+            case(
+                "NaN element",
+                with(f32::NAN),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case(
+                "+inf element",
+                with(f32::INFINITY),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case(
+                "-inf element",
+                with(f32::NEG_INFINITY),
+                Some(NonFinite),
+                Some(NonFinite),
+            ),
+            case("zero", vec![0.0; DIM], None, None),
+            case(
+                "every element 2^-149: tiny cosine and inner-product query",
+                vec![f32::from_bits(1); DIM],
+                None,
+                None,
+            ),
+            case(
+                "every element 1e-25: tiny inner-product query",
+                vec![1e-25; DIM],
+                None,
+                None,
+            ),
+            case(
+                "every element 1e-22: tiny inner-product query",
+                vec![1e-22; DIM],
+                None,
+                None,
+            ),
+            case("one element f32::MAX", one_max, Some(NormTooLarge), None),
+            case(
+                "norm^2 just under the bound: near-bound L2 and inner product",
+                vec![under; DIM],
+                None,
+                None,
+            ),
+            case(
+                "norm^2 just over the bound",
+                vec![over; DIM],
+                Some(NormTooLarge),
+                None,
+            ),
+            case(
+                "every element 1e20",
+                vec![1e20; DIM],
+                Some(NormTooLarge),
+                None,
+            ),
+        ]
+    }
+
+    /// Seeded standard-normal rows.
+    fn normal_rows(seed: u64, count: usize) -> Vec<Vec<f32>> {
+        let mut rng = Lcg(seed);
+        let mut uniform = move || (rng.next_f32() as f64 + 1.0) / 2.0;
+        (0..count)
+            .map(|_| {
+                (0..DIM)
+                    .map(|_| {
+                        let radius = (-2.0 * (1.0 - uniform()).ln()).sqrt();
+                        (radius * (std::f64::consts::TAU * uniform()).cos()) as f32
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The refusal the rule states for `metric`.
+    fn expected(metric: Metric, case: &Case) -> Option<InvalidVector> {
+        match metric {
+            Metric::L2 | Metric::Dot => case.as_given,
+            Metric::Cosine => case.unit,
+        }
+    }
+
+    /// The f64 score of `row` for `query` and its magnitude.
+    fn oracle(metric: Metric, query: &[f32], row: &[f32]) -> (f64, f64) {
+        let pairs = || query.iter().zip(row).map(|(&q, &r)| (q as f64, r as f64));
+        match metric {
+            Metric::L2 => {
+                let distance: f64 = pairs().map(|(q, r)| (q - r) * (q - r)).sum();
+                (-distance, distance)
+            }
+            Metric::Dot => (
+                pairs().map(|(q, r)| q * r).sum(),
+                pairs().map(|(q, r)| (q * r).abs()).sum(),
+            ),
+            Metric::Cosine => {
+                let norm = |v: &[f32]| norm_squared_wide(v).sqrt();
+                let scale = norm(query) * norm(row);
+                if scale == 0.0 {
+                    return (0.0, 0.0);
+                }
+                (
+                    pairs().map(|(q, r)| q * r).sum::<f64>() / scale,
+                    pairs().map(|(q, r)| (q * r).abs()).sum::<f64>() / scale,
+                )
+            }
+        }
+    }
+
+    /// The refusal a single-document index reports for `row`, by its error message.
+    fn row_outcome(metric: Metric, row: &[f32]) -> crate::Result<Option<InvalidVector>> {
+        let mut schema = Schema::builder();
+        let field = schema.add_vector_field("v", VectorOptions::new(DIM, metric));
+        let index = Index::builder().schema(schema.build()).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(field, row);
+        match writer.add_document(doc).and_then(|_| writer.commit()) {
+            Ok(_) => Ok(None),
+            Err(TantivyError::InvalidArgument(message))
+                if message.starts_with("non-finite element in vector field 'v'") =>
+            {
+                Ok(Some(InvalidVector::NonFinite))
+            }
+            Err(TantivyError::InvalidArgument(message))
+                if message.contains("has a squared norm above the limit") =>
+            {
+                Ok(Some(InvalidVector::NormTooLarge))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn run_f32(metric: Metric, failures: &mut Vec<String>) -> crate::Result<()> {
+        let cases = edge_cases();
+        let mut rows = normal_rows(11, NORMAL_ROWS);
+        for case in &cases {
+            let want = expected(metric, case);
+            let got = row_outcome(metric, &case.vector)?;
+            if got != want {
+                failures.push(format!(
+                    "{metric:?} row '{}': expected {want:?}, got {got:?}",
+                    case.name
+                ));
+            }
+            if want.is_none() {
+                rows.push(case.vector.clone());
+            }
+        }
+
+        let centroids: Vec<Vec<f32>> = (0..CENTROIDS)
+            .map(|cluster| {
+                let mut centroid = vec![0.0; DIM];
+                centroid[cluster] = 1.0;
+                centroid
+            })
+            .collect();
+        let flat =
+            FixtureSpec::flat(metric, DIM, rows.iter().cloned().map(Some).collect()).build()?;
+        let ivf = FixtureSpec::ivf(metric, centroids.clone(), rows.clone()).build()?;
+        let quantized = FixtureSpec::ivf(metric, centroids, rows.clone())
+            .schedule(&[1, 1])
+            .build()?;
+        let params = super::exhaustive_params(CENTROIDS);
+
+        let mut queries: Vec<(String, Vec<f32>, Option<InvalidVector>)> =
+            normal_rows(23, NORMAL_QUERIES)
+                .into_iter()
+                .enumerate()
+                .map(|(i, query)| (format!("normal query {i}"), query, None))
+                .collect();
+        queries.extend(cases.iter().map(|case| {
+            (
+                case.name.to_string(),
+                case.vector.clone(),
+                expected(metric, case),
+            )
+        }));
+        for (name, query, want) in &queries {
+            let context = format!("{metric:?} query '{name}'");
+            let got = VectorQuery::new(metric, Arc::new(query.clone())).err();
+            if got != *want {
+                failures.push(format!("{context}: expected {want:?}, got {got:?}"));
+                continue;
+            }
+            if want.is_some() {
+                match flat.search(&AllQuery, query, K, params.clone()) {
+                    Err(TantivyError::InvalidArgument(message))
+                        if message.starts_with("invalid query vector: ") => {}
+                    other => failures.push(format!(
+                        "{context}: search must refuse the query, got {:?}",
+                        other.map(|fruit| fruit.results)
+                    )),
+                }
+                continue;
+            }
+            let scored: Vec<(f64, f64)> =
+                rows.iter().map(|row| oracle(metric, query, row)).collect();
+            let mut best: Vec<usize> = (0..rows.len()).collect();
+            best.sort_by(|&a, &b| scored[b].0.total_cmp(&scored[a].0));
+            best.truncate(K);
+            let exact_paths = [
+                (
+                    "flat",
+                    &flat,
+                    flat.search(&AllQuery, query, K, params.clone()),
+                ),
+                (
+                    "IVF full precision",
+                    &ivf,
+                    ivf.search(&AllQuery, query, K, params.clone()),
+                ),
+                (
+                    "IVF [1, 1] at full precision",
+                    &quantized,
+                    quantized.search_levels(&AllQuery, query, K, params.clone(), 0),
+                ),
+            ];
+            for (path, fixture, result) in exact_paths {
+                let context = format!("{context} {path}");
+                match result {
+                    Ok(fruit) => {
+                        check_ranking(&context, fixture, &fruit.results, &scored, &best, failures)?
+                    }
+                    Err(error) => failures.push(format!("{context}: {error}")),
+                }
+            }
+            let context = format!("{context} IVF [1, 1] quantized");
+            match quantized.search(&AllQuery, query, K, params.clone()) {
+                Ok(fruit) => {
+                    if fruit.results.len() != K {
+                        failures.push(format!(
+                            "{context}: {} results, expected {K}",
+                            fruit.results.len()
+                        ));
+                    }
+                    for &(score, address) in &fruit.results {
+                        check_score(&context, &quantized, score, address, &scored, failures)?;
+                    }
+                }
+                Err(error) => failures.push(format!("{context}: {error}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `score` for the document at `address` is finite and matches the oracle; returns
+    /// the oracle's entry for that document.
+    fn check_score(
+        context: &str,
+        fixture: &Fixture,
+        score: Score,
+        address: DocAddress,
+        scored: &[(f64, f64)],
+        failures: &mut Vec<String>,
+    ) -> crate::Result<(f64, f64)> {
+        let ordinal = fixture.ordinal(address)?;
+        let (want, magnitude) = scored[ordinal];
+        if !score.is_finite() || (score as f64 - want).abs() > REL * magnitude + ABS {
+            failures.push(format!(
+                "{context}: row {ordinal} scored {score:e}, oracle {want:e}"
+            ));
+        }
+        Ok(scored[ordinal])
+    }
+
+    /// Whether `results` are the oracle's top `K`, ties by score allowed.
+    fn check_ranking(
+        context: &str,
+        fixture: &Fixture,
+        results: &[(Score, DocAddress)],
+        scored: &[(f64, f64)],
+        best: &[usize],
+        failures: &mut Vec<String>,
+    ) -> crate::Result<()> {
+        if results.len() != best.len() {
+            failures.push(format!(
+                "{context}: {} results, expected {}",
+                results.len(),
+                best.len()
+            ));
+            return Ok(());
+        }
+        for (rank, (&(score, address), &expected)) in results.iter().zip(best).enumerate() {
+            let (want, magnitude) =
+                check_score(context, fixture, score, address, scored, failures)?;
+            let (rank_score, rank_magnitude) = scored[expected];
+            if (want - rank_score).abs() > REL * magnitude.max(rank_magnitude) + ABS {
+                failures.push(format!(
+                    "{context}: rank {rank} holds a row with oracle score {want:e}, expected \
+                     {rank_score:e}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
@@ -702,7 +1137,10 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     writer.commit()?;
 
     let searcher = index.reader()?.searcher();
-    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
+    let collector = TopDocs::with_limit(2)
+        .order_by_similarity(embedding_field, vec![1.0_f32, 0.0])
+        .build_for_searcher(&searcher, &crate::query::AllQuery)
+        .unwrap();
     let hits = searcher.search(&AllQuery, &collector)?.results;
     assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
     assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
@@ -710,14 +1148,133 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
+/// Seeded rows for the tiny-query tests, with the IVF centroids they are clustered around.
+fn tiny_query_rows(dim: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    use crate::vector::test_support::Lcg;
+    let rows = (0..200)
+        .map(|row| Lcg(1000 + row).vector(dim, 1.0))
+        .collect();
+    let centroids = (0..4)
+        .map(|cluster| {
+            let mut centroid = vec![0.0; dim];
+            centroid[cluster] = 1.0;
+            centroid
+        })
+        .collect();
+    (rows, centroids)
+}
+
+/// Checks that each search path returns `expected`'s rows, in order, with scores within `tol`.
+fn assert_paths_return(
+    metric: Metric,
+    rows: &[Vec<f32>],
+    centroids: &[Vec<f32>],
+    query: &[f32],
+    expected: &[(usize, f64)],
+    tol: f64,
+) -> crate::Result<()> {
+    use crate::vector::test_support::FixtureSpec;
+    let dim = query.len();
+    let flat = FixtureSpec::flat(metric, dim, rows.iter().cloned().map(Some).collect()).build()?;
+    let ivf = FixtureSpec::ivf(metric, centroids.to_vec(), rows.to_vec()).build()?;
+    let quantized = FixtureSpec::ivf(metric, centroids.to_vec(), rows.to_vec())
+        .schedule(&[1, 1])
+        .build()?;
+    let params = exhaustive_params(centroids.len());
+    for (path, fixture) in [
+        ("flat", &flat),
+        ("IVF full precision", &ivf),
+        ("IVF [1, 1] quantized", &quantized),
+    ] {
+        let results = fixture
+            .search(&AllQuery, query, expected.len(), params.clone())?
+            .results;
+        let got: Vec<usize> = results
+            .iter()
+            .map(|&(_, address)| fixture.ordinal(address))
+            .collect::<crate::Result<_>>()?;
+        let want: Vec<usize> = expected.iter().map(|&(row, _)| row).collect();
+        assert_eq!(got, want, "{metric:?} {path}");
+        for (&(score, _), &(_, oracle)) in results.iter().zip(expected) {
+            assert!(
+                (f64::from(score) - oracle).abs() <= tol,
+                "{metric:?} {path}: {score:e} vs {oracle:e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Inner-product queries with every element 2^-149, 1e-25 or 1e-22 are below the tiny-query
+/// bound, so the IVF `[1, 1]` quantized scan scores them without pruning and returns the
+/// brute-force top 10. Above 2^-149, f32 resolves their scores and the rows are the f64 top 10.
+#[test]
+fn tiny_dot_queries_return_the_oracle_top_k() -> crate::Result<()> {
+    use crate::vector::test_support::FixtureSpec;
+    const DIM: usize = 64;
+    let (rows, centroids) = tiny_query_rows(DIM);
+    let quantized = FixtureSpec::ivf(Metric::Dot, centroids, rows.clone())
+        .schedule(&[1, 1])
+        .build()?;
+    let mut by_sum: Vec<(usize, f64)> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, values)| (row, values.iter().map(|&v| f64::from(v)).sum()))
+        .collect();
+    by_sum.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let f64_top: Vec<usize> = by_sum[..10].iter().map(|&(row, _)| row).collect();
+    for value in [f32::from_bits(1), 1e-25, 1e-22] {
+        let query = vec![value; DIM];
+        let results = quantized
+            .search(&AllQuery, &query, 10, exhaustive_params(4))?
+            .results;
+        assert_eq!(
+            results,
+            quantized.oracle(&AllQuery, &query, 10)?,
+            "element {value:e}"
+        );
+        if value.is_normal() {
+            let got: Vec<usize> = results
+                .iter()
+                .map(|&(_, address)| quantized.ordinal(address))
+                .collect::<crate::Result<_>>()?;
+            assert_eq!(got, f64_top, "element {value:e}");
+        }
+    }
+    Ok(())
+}
+
+/// A cosine query with every element the smallest subnormal ranks as its unit vector does: the f64
+/// brute-force top 10 on the flat, IVF full-precision and IVF `[1, 1]` quantized scans.
+#[test]
+fn tiny_cosine_query_returns_the_oracle_top_k() -> crate::Result<()> {
+    const DIM: usize = 64;
+    let (rows, centroids) = tiny_query_rows(DIM);
+    let query = vec![f32::from_bits(1); DIM];
+    let mut oracle: Vec<(usize, f64)> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, values)| {
+            let norm = values
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum::<f64>()
+                .sqrt();
+            let dot: f64 = values.iter().map(|&v| f64::from(v)).sum();
+            (row, dot / (norm * (DIM as f64).sqrt()))
+        })
+        .collect();
+    oracle.sort_by(|a, b| b.1.total_cmp(&a.1));
+    oracle.truncate(10);
+    assert_paths_return(Metric::Cosine, &rows, &centroids, &query, &oracle, 1e-6)
+}
+
 /// "Scan everything" probe params: the full-capacity ceiling, so the
 /// budget never binds before the stream is exhausted. Used by
-/// oracle-equality tests, where every cluster the bounds gate cannot
-/// PROVE useless must be probed - provable skips never change the
-/// top-K, so oracle equality still holds under them.
+/// oracle-equality tests, where every cluster must be probed.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction: 1.0,
+        max_probe: usize::MAX,
         min_probe_clusters: 1,
         ..Default::default()
     }
@@ -747,7 +1304,7 @@ pub(crate) mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec()));
+        let query = VectorQuery::<f32>::new(metric, Arc::new(query.to_vec())).unwrap();
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -956,19 +1513,12 @@ mod grid2d {
     }
 }
 
-// ======================================================================
-// P1: bounds storage
-// ======================================================================
-
-/// C1 fixture tests: the `.centroids` bounds slot end to end — write,
-/// fold, roundtrip, and merge recomputation. The
-/// pure builder/kind cases live in `vector::bounds::bounds_storage_tests`.
-mod bounds_storage_tests {
+mod centroid_storage_tests {
     use std::sync::Arc;
 
-    use super::{TestVectorIndex, EMBEDDING_FIELD_NAME};
+    use super::EMBEDDING_FIELD_NAME;
     use crate::collector::TopDocs;
-    use crate::directory::{CompositeFile, RamDirectory};
+    use crate::directory::{CompositeFile, Directory, RamDirectory};
     use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
@@ -976,91 +1526,12 @@ mod bounds_storage_tests {
     use crate::vector::clustering::{
         for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
     };
-    use crate::vector::diagnostics::VectorStorageFormat;
     use crate::vector::router::stacked::levels::{InMemoryStore, StackedIvf, StackedIvfConfig};
     use crate::vector::router::RoutingParams;
-    use crate::vector::storage::bounds::{residual_norm, BoundKind};
-    use crate::vector::storage::centroids::ClusterIndex;
+    use crate::vector::search::prepared::VectorQuery;
     use crate::vector::storage::header::CENTROIDS_EXT;
     use crate::vector::RouterKind;
     use crate::{Index, IndexWriter, TantivyDocument};
-
-    /// Recompute one segment's expected fold from its stored artifacts:
-    /// per cluster, max [`residual_norm`] over the cluster's rows against
-    /// the stored centroid.
-    fn fresh_fold(
-        vec_reader: &crate::vector::VectorIndexReader,
-        ivf: &ClusterIndex,
-        dim: usize,
-        metric: Metric,
-    ) -> crate::Result<Vec<f32>> {
-        let centroid_bytes = ivf.centroid_bytes()?;
-        let stride = dim * std::mem::size_of::<f32>();
-        let mut expected = vec![0.0f32; ivf.num_clusters()];
-        for cluster in 0..ivf.num_clusters() {
-            let centroid: Vec<f32> = centroid_bytes[cluster * stride..(cluster + 1) * stride]
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect();
-            // The writer's degenerate-centroid rule: non-finite, or
-            // zero-norm under cosine renormalization, saturates.
-            let zero_norm = centroid.iter().all(|&value| value == 0.0);
-            if centroid.iter().any(|value| !value.is_finite())
-                || (metric == Metric::Cosine && zero_norm)
-            {
-                expected[cluster] = f32::INFINITY;
-                continue;
-            }
-            for row in ivf.cluster_range(cluster) {
-                let row_bytes = vec_reader.vector_bytes_for_row(row)?;
-                let residual = residual_norm::<f32>(&row_bytes, &centroid);
-                if !residual.is_finite() {
-                    expected[cluster] = f32::INFINITY;
-                } else if residual > expected[cluster] {
-                    expected[cluster] = residual;
-                }
-            }
-        }
-        Ok(expected)
-    }
-
-    /// Build, write, reopen: the stored bounds are bit-equal to a fresh
-    /// fold over the stored rows and centroids — for every metric.
-    #[test]
-    fn roundtrip_per_metric() -> crate::Result<()> {
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            let fixture = TestVectorIndex::builder(VectorDType::F32)
-                .metric(metric)
-                .vector_storage_format(VectorStorageFormat::Ivf)
-                .build()?;
-            let field = fixture.embedding_field();
-            let searcher = fixture.index.reader()?.searcher();
-            let mut ivf_segments = 0usize;
-            for segment_reader in searcher.segment_readers() {
-                let vec_reader = segment_reader.vector_index(field)?;
-                let Some(ivf) = vec_reader.index() else {
-                    continue;
-                };
-                ivf_segments += 1;
-                let bounds = ivf.bounds();
-                assert_eq!(bounds.kind(), BoundKind::Ball);
-                let expected =
-                    fresh_fold(&vec_reader, ivf, fixture.vector_options().dim(), metric)?;
-                assert_eq!(bounds.values().len(), expected.len());
-                for (cluster, (&stored, &fold)) in
-                    bounds.values().iter().zip(expected.iter()).enumerate()
-                {
-                    assert_eq!(
-                        stored.to_bits(),
-                        fold.to_bits(),
-                        "{metric:?} cluster {cluster}: stored {stored} != fold {fold}"
-                    );
-                }
-            }
-            assert!(ivf_segments > 0, "{metric:?}: fixture built no IVF segment");
-        }
-        Ok(())
-    }
 
     /// A clusterer with deterministic centroids for crafted-geometry
     /// builds: fixed rows when supplied, else the first
@@ -1183,139 +1654,43 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// Merge-level saturation: a huge-but-finite L2 member whose residual
-    /// overflows `f32` saturates its cluster through `add_native`; a
-    /// zero-norm cosine centroid saturates through the explicit
-    /// degenerate-centroid mark. Finite clusters stay finite.
     #[test]
-    fn saturated_sentinel() -> crate::Result<()> {
-        // L2: the doc at (3e38, 3e38) is finite (passes ingest) but its
-        // residual against centroid (0, 0) is sqrt(2)*3e38 > f32::MAX.
+    fn old_centroid_format_requires_rebuild_on_open_and_merge() -> crate::Result<()> {
+        let directory = RamDirectory::create();
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [50.0, 50.0]]),
-                num_centroids: 2,
-            },
-            &[&[[3.0e38, 3.0e38]], &[[50.0, 50.0], [50.5, 50.0]]],
-            None,
-        )?;
-        merge_all(&index)?;
-        let searcher = index.reader()?.searcher();
-        let segment_reader = &searcher.segment_readers()[0];
-        let vec_reader = segment_reader.vector_index(field)?;
-        let ivf = vec_reader.index().expect("IVF segment");
-        let bounds = ivf.bounds();
-        // Cluster ids are trained-centroid indices: the big doc's d2
-        // overflows to +inf against both centroids, and the assign rule's
-        // strict `<` keeps the first — cluster 0, whatever the merge's
-        // doc order. The (50, *) docs sit in cluster 1.
-        assert_eq!(
-            bounds.ball_r(0),
-            f32::INFINITY,
-            "overflowing residual must saturate"
-        );
-        assert!(
-            bounds.ball_r(1).is_finite(),
-            "finite cluster must stay finite: {}",
-            bounds.ball_r(1)
-        );
-
-        // Cosine: an all-zero cluster renormalizes its centroid to
-        // zero-norm → the degenerate-centroid saturation path.
-        let (index, field) = build_ivf_with_plan(
-            Metric::Cosine,
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
                 num_centroids: 2,
             },
-            &[&[[0.0, 0.0], [0.0, 0.0]], &[[10.0, 10.0], [10.0, 10.5]]],
-            None,
+            &[&[[0.0, 0.0]], &[[10.0, 10.0]]],
+            Some(directory.clone()),
         )?;
         merge_all(&index)?;
-        let searcher = index.reader()?.searcher();
-        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("IVF segment");
-        assert_eq!(
-            ivf.bounds().ball_r(0),
-            f32::INFINITY,
-            "zero-norm cosine centroid must saturate its cluster"
-        );
-        assert!(ivf.bounds().ball_r(1).is_finite());
-        Ok(())
-    }
-
-    /// A merge of merged segments re-runs the fold against the NEW
-    /// centroids over the re-assignment output: the stored bounds equal a
-    /// fresh fold, and exceed every input segment's bounds — no
-    /// combination of input radii could produce them.
-    #[test]
-    fn merge_recomputes_bounds() -> crate::Result<()> {
-        let clusterer = || TestClusterer {
-            fixed_centroids: None, // train on the first sample → data-dependent
-            num_centroids: 1,
-        };
-        let (index, field) = build_ivf_with_plan(
-            Metric::L2,
-            clusterer(),
-            &[
-                &[[0.0, 0.0], [0.1, 0.1]],
-                &[[0.05, 0.0], [0.0, 0.05]],
-                &[[10.0, 10.0], [10.1, 10.1]],
-                &[[10.0, 10.05], [10.05, 10.0]],
-            ],
-            None,
-        )?;
-        // Stage 1: two IVF segments, each trained on its own half.
-        {
-            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-            writer.set_merge_policy(Box::new(NoMergePolicy));
-            let mut segment_ids = index.searchable_segment_ids()?;
-            segment_ids.sort();
-            for pair in segment_ids.chunks_exact(2) {
-                writer.merge(pair).wait()?;
-            }
-            writer.wait_merging_threads()?;
-        }
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 2);
-        let mut max_input_bound = 0.0f32;
-        for segment_reader in searcher.segment_readers() {
-            let vec_reader = segment_reader.vector_index(field)?;
-            let ivf = vec_reader.index().expect("stage-1 segments are IVF");
-            for &value in ivf.bounds().values() {
-                assert!(value.is_finite());
-                max_input_bound = max_input_bound.max(value);
-            }
-        }
-        // Tight per-half clusters: every input bound is small.
-        assert!(
-            max_input_bound < 1.0,
-            "stage-1 bounds should be tight: {max_input_bound}"
-        );
-
-        // Stage 2: merge the merged segments. Training now sees the
-        // union and re-anchors the single centroid near (0, 0), so the
-        // far half's residuals stretch the fold far past any input value.
-        merge_all(&index)?;
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1);
-        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("merged segment is IVF");
-        let stored: Vec<f32> = ivf.bounds().values().to_vec();
-        let expected = fresh_fold(&vec_reader, ivf, 2, Metric::L2)?;
-        for (cluster, (&got, &fold)) in stored.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                fold.to_bits(),
-                "cluster {cluster}: stored {got} != fresh fold {fold}"
+        let segment = index.searchable_segments()?.remove(0);
+        let path = segment.relative_path(SegmentComponent::Custom(CENTROIDS_EXT.into()));
+        let mut bytes = directory.atomic_read(&path)?;
+        bytes[..4].copy_from_slice(&3u32.to_le_bytes());
+        directory.atomic_write(&path, &bytes)?;
+        let reader = crate::SegmentReader::open(&segment)?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        for error in [
+            segment.validate_vector_format().unwrap_err(),
+            reader.validate_vector_format().unwrap_err(),
+            reader
+                .vector_index(field)
+                .err()
+                .expect("old centroid reader"),
+            writer
+                .merge_foreground(&index.searchable_segment_ids()?, true)
+                .unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("centroid file format version 3"),
+                "{error}"
             );
+            assert!(error.to_string().contains("rebuild required"), "{error}");
         }
-        let max_merged = stored.iter().cloned().fold(0.0f32, f32::max);
-        assert!(
-            max_merged > max_input_bound * 10.0,
-            "merged fold ({max_merged}) must exceed any fold of input bounds ({max_input_bound})"
-        );
         Ok(())
     }
 
@@ -1380,13 +1755,13 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A clusterer that builds a stacked router: the merge stamps V3,
+    /// A clusterer that builds a stacked router: the merge stamps V4,
     /// writes the router into slot [2], and cascades the canonical
-    /// centroid permutation into slot [0] / the assignments / the bounds —
+    /// centroid permutation into slot [0] / the assignments —
     /// proven by parsing the router against the stored rows and by search
     /// staying exact.
     #[test]
-    fn ivf_merge_writes_stacked_slot_at_v3() -> crate::Result<()> {
+    fn ivf_merge_writes_stacked_slot_at_v5() -> crate::Result<()> {
         use crate::vector::storage::header::{read_centroid_header, VectorFileVersion};
 
         // 8 fixed centroids on a line; two tight docs per centroid split
@@ -1413,8 +1788,9 @@ mod bounds_storage_tests {
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
         let (version, body) = read_centroid_header(&centroids_file)?;
-        assert_eq!(version, VectorFileVersion::V3, "stacked files stamp V3");
+        assert_eq!(version, VectorFileVersion::V5, "stacked files stamp V5");
         let composite = CompositeFile::open(&body)?;
+        assert!(composite.open_read_with_idx(field, 3).is_none());
         let stacked_bytes = composite
             .open_read_with_idx(field, 2)
             .expect("stacked router slot must be written")
@@ -1455,13 +1831,16 @@ mod bounds_storage_tests {
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
-                .search(&query, 2, 1.0, Metric::L2)
+                .search(&query, 2, Metric::L2)
+                .unwrap()
                 .0
                 .into_iter()
                 .take(2)
                 .collect();
+            let prepared = VectorQuery::new(Metric::L2, Arc::new(query.to_vec())).unwrap();
             let lazy: Vec<_> = ivf
-                .rank_clusters(&query, RoutingParams::default())
+                .opened_router()
+                .rank(&prepared, RoutingParams::default())
                 .take(2)
                 .collect();
             assert_eq!(owned.len(), lazy.len());
@@ -1486,7 +1865,10 @@ mod bounds_storage_tests {
             let hits = searcher
                 .search(
                     &AllQuery,
-                    &TopDocs::with_limit(1).order_by_similarity(field, query),
+                    &TopDocs::with_limit(1)
+                        .order_by_similarity(field, query)
+                        .build_for_searcher(&searcher, &crate::query::AllQuery)
+                        .unwrap(),
                 )?
                 .results;
             assert_eq!(hits.len(), 1);
@@ -1551,7 +1933,8 @@ fn flat_uniform_boundary_survives_merge_and_sparse_presence() -> crate::Result<(
                 if row >= dense_reader.num_vectors() {
                     continue;
                 }
-                let bytes = dense_reader.vector_bytes_for_row(row)?;
+                let bytes = dense_reader
+                    .vector_bytes_for_row(BlockAddress::new((row / r) as u32, (row % r) as u32))?;
                 let value = f32::from_le_bytes(bytes.as_slice().try_into().unwrap()) as usize;
                 if let Some(sparse_bytes) = sparse_reader.vector_bytes(row as u32)? {
                     assert_eq!(value % 2, 0);
@@ -1572,7 +1955,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
     use crate::directory::error::Incompatibility;
     use crate::directory::{Directory, RamDirectory};
     use crate::index::SegmentComponent;
-    for version in [3u32, 99] {
+    for version in [3u32, 4, 5, 99] {
         let directory = RamDirectory::create();
         let mut schema = Schema::builder();
         let field = schema.add_vector_field("v", VectorOptions::new(2, Metric::L2));
@@ -1597,7 +1980,7 @@ fn unsupported_vector_versions_remain_typed_on_open_and_merge() -> crate::Result
             assert!(
                 matches!(error,
             crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch {
-                index_version, supported_version: 4,
+                index_version, supported_version: 6,
             }) if index_version == version),
                 "version {version}: {error:?}"
             )
@@ -1644,12 +2027,9 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
         crate::vector::storage::header::VEC_EXT.into(),
     ));
     let mut bytes = directory.atomic_read(&vec_path)?;
-    let mut centroids = 2u32.to_le_bytes().to_vec();
+    let mut centroids = 5u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
-    for slot in [
-        crate::vector::storage::header::CentroidSlot::Centroids,
-        crate::vector::storage::header::CentroidSlot::Offsets,
-    ] {
+    for slot in [crate::vector::storage::header::CentroidSlot::Centroids] {
         composite
             .for_field_with_idx(field, slot.index())
             .write_all(&[0; 8])?;
@@ -1660,7 +2040,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
     ))?;
     centroid_file.write_all(&centroids)?;
     centroid_file.terminate()?;
-    for version in [2u32, 3, 4] {
+    for version in [2u32, 3, 4, 5, 6, 7] {
         bytes[..4].copy_from_slice(&version.to_le_bytes());
         directory.atomic_write(&vec_path, &bytes)?;
         let reader = crate::SegmentReader::open(&segment)?;
@@ -1668,7 +2048,7 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
             .vector_index(field)
             .err()
             .expect("unsupported segment");
-        if version == 4 {
+        if version == 6 {
             segment.validate_vector_format()?;
             reader.validate_vector_format()?;
             assert!(
@@ -1681,12 +2061,12 @@ fn vector_format_mismatch_precedes_missing_centroid_router() -> crate::Result<()
                 reader.validate_vector_format().unwrap_err(),
             ] {
                 assert!(
-                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                    matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 6 }) if index_version == version),
                     "{error:?}"
                 );
             }
             assert!(
-                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 4 }) if index_version == version),
+                matches!(error, crate::TantivyError::IncompatibleIndex(Incompatibility::VectorFormatMismatch { index_version, supported_version: 6 }) if index_version == version),
                 "{error:?}"
             );
         }
@@ -1719,7 +2099,7 @@ fn graph_router_segments_fail_format_validation() -> crate::Result<()> {
     writer.add_document(doc)?;
     writer.commit()?;
     let segment = index.searchable_segments()?.remove(0);
-    let mut centroids = 3u32.to_le_bytes().to_vec();
+    let mut centroids = 5u32.to_le_bytes().to_vec();
     let mut composite = CompositeWrite::wrap(&mut centroids);
     composite
         .for_field_with_idx(

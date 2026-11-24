@@ -2,6 +2,7 @@
 //! serialized flat for EXPLAIN.
 
 use crate::vector::router::RouterMetrics;
+use crate::vector::search::scan::bound::ExactMerge;
 use crate::vector::search::scan::ScanReport;
 #[cfg(test)]
 use crate::vector::search::scan::ScanTrace;
@@ -18,18 +19,23 @@ use crate::vector::{VectorIoStats, VectorStage};
 /// One quantized layer's instrumentation.
 #[derive(Debug, Default)]
 pub(crate) struct LayerProbeStats {
-    /// Owned-word decoding fallbacks in sign-plane scoring.
+    /// Always zero: sign-plane scoring reads codes in place at any alignment and has no
+    /// owned-word fallback left to count. Still serialized because paradedb and pdbench check
+    /// the Segment Info key set.
     pub(crate) sign_word_fallbacks: u64,
     /// Reads charged to the layer's scan.
     pub(crate) io: VectorIoStats,
     scan_ns: u64,
     boundary_ns: u64,
+    /// Rows the layer scored, excluding replica copies dropped before layer 0.
     scored: usize,
+    admission_pruned: usize,
     survivors: usize,
     sparse_clusters: usize,
     full_clusters: usize,
     exact_clusters: usize,
     exact_rows: usize,
+    recheck_dropped: usize,
 }
 
 #[cfg(test)]
@@ -47,6 +53,11 @@ impl LayerProbeStats {
     /// Candidates the layer scored.
     pub(crate) fn scored(&self) -> usize {
         self.scored
+    }
+
+    /// Rows admission pruning dropped before they became candidates.
+    pub(crate) fn admission_pruned(&self) -> usize {
+        self.admission_pruned
     }
 
     /// Candidates left after the layer's boundary.
@@ -72,6 +83,11 @@ impl LayerProbeStats {
     /// Rows scored exactly, and finished, at this layer.
     pub(crate) fn exact_rows(&self) -> usize {
         self.exact_rows
+    }
+
+    /// Survivors of the previous boundary the layer dropped before reading them.
+    pub(crate) fn recheck_dropped(&self) -> usize {
+        self.recheck_dropped
     }
 }
 
@@ -101,6 +117,14 @@ impl serde::Serialize for LayerProbeStatsSet {
             serialize_prefixed(&layer.io, &format!("layer{index}"), &mut map)?;
             map.serialize_entry(&format!("layer{index}_scan_ns"), &layer.scan_ns)?;
             map.serialize_entry(&format!("layer{index}_scored"), &layer.scored)?;
+            if index == 0 {
+                map.serialize_entry("layer0_admission_pruned", &layer.admission_pruned)?;
+            } else {
+                map.serialize_entry(
+                    &format!("layer{index}_recheck_dropped"),
+                    &layer.recheck_dropped,
+                )?;
+            }
             map.serialize_entry(&format!("layer{index}_survivors"), &layer.survivors)?;
             map.serialize_entry(
                 &format!("layer{index}_sparse_clusters"),
@@ -151,6 +175,62 @@ where S: serde::Serializer {
     serialize_io(io, "centroid", serializer)
 }
 
+/// Flat numeric fields survive ParadeDB's accumulation of repeated Top-K calls
+/// and parallel-worker segment reports. Keep parent traversal out of the leaf
+/// shortlist funnel: approximate members = pruned + exact rerank inputs.
+fn serialize_routing<S>(routing: &Option<RouterMetrics>, serializer: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(None)?;
+    match routing {
+        Some(RouterMetrics::QuantizedStacked {
+            candidate_count,
+            lists_scanned,
+            approximate_scored,
+            approximate_members_scored,
+            exact_scored,
+        }) => {
+            map.serialize_entry("routing_kind", "quantized_stacked")?;
+            map.serialize_entry("routing_mode", "hierarchical")?;
+            map.serialize_entry("routing_lists_scanned", lists_scanned)?;
+            map.serialize_entry("routing_approximate_scored", approximate_scored)?;
+            map.serialize_entry(
+                "routing_approximate_members_scored",
+                approximate_members_scored,
+            )?;
+            // Exceptional non-finite queries bypass approximate scoring and
+            // rerank all raw rows; they have no approximate pruning.
+            map.serialize_entry(
+                "routing_approximate_pruned",
+                &approximate_members_scored.saturating_sub(*exact_scored),
+            )?;
+            map.serialize_entry("routing_exact_scored", exact_scored)?;
+            map.serialize_entry("routing_exact_pruned", &(exact_scored - candidate_count))?;
+            map.serialize_entry("routing_candidate_count", candidate_count)?;
+        }
+        Some(RouterMetrics::Stacked {
+            candidate_count,
+            lists_scanned,
+            members_scored,
+        }) => {
+            map.serialize_entry("routing_kind", "stacked")?;
+            map.serialize_entry("routing_mode", "hierarchical")?;
+            map.serialize_entry("routing_lists_scanned", lists_scanned)?;
+            map.serialize_entry("routing_exact_scored", members_scored)?;
+            map.serialize_entry("routing_candidate_count", candidate_count)?;
+        }
+        Some(RouterMetrics::Exact { visited_count }) => {
+            map.serialize_entry("routing_kind", "exact")?;
+            map.serialize_entry("routing_mode", "flat")?;
+            map.serialize_entry("routing_exact_scored", visited_count)?;
+            map.serialize_entry("routing_candidate_count", visited_count)?;
+        }
+        None => {}
+    }
+    map.end()
+}
+
 /// Where a segment's layer-0 clusters came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize)]
 pub(crate) enum AccessPath {
@@ -167,10 +247,12 @@ pub(crate) enum AccessPath {
 /// `segment_*` fields are per segment.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Rows admitted and scored at layer 0 or exactly.
+    /// Rows shortlisted from the source, including replica copies dropped before scoring.
     pub candidates_scored: usize,
-    /// Rows the routed source admitted and charged.
+    /// Rows the routed source admitted and charged, a replicated document's second copy included.
     pub layer0_eligible: usize,
+    /// Rows dropped at admission as the second copy of a document an earlier cluster held.
+    pub replication_dropped: usize,
     /// Routed clusters opened with no eligible row.
     pub clusters_skipped_empty: usize,
     /// Reads for exact scoring: full-precision rows and the DocIds they need.
@@ -204,6 +286,10 @@ pub struct ProbeStats {
     pub(crate) quantized_trace: ScanTrace,
     /// Rows scored at full precision, on every path.
     pub exact_rows: usize,
+    /// Survivors of the last boundary dropped before the exact phase read them.
+    pub exact_recheck_dropped: usize,
+    /// Thresholds this segment's scan stored in the query participants' shared slot.
+    pub cross_bound_publishes: usize,
     /// Nanoseconds initializing the scan.
     pub scan_init_ns: u64,
     /// Nanoseconds evaluating the filter.
@@ -232,26 +318,23 @@ pub struct ProbeStats {
     pub postings_row: usize,
     /// Clusters opened that contributed no row.
     pub postings_skipped: usize,
-    /// The router's counters.
-    #[serde(skip)]
+    /// The router's counters, serialized as additive `routing_*` fields.
+    #[serde(flatten, serialize_with = "serialize_routing")]
     pub routing: Option<RouterMetrics>,
     /// Centroids scored while ranking.
     pub routing_visited_count: usize,
-    /// Clusters the bounds gate passed over.
-    pub bounds_skips: u32,
-    /// Segment scans in which the query bound armed: 0 or 1.
-    pub bound_armed_count: u32,
-    /// The zero-based probe at which the query bound armed; 0 when it never armed.
-    pub bound_armed_probe_sum: u64,
     /// How the routed probe loop stopped.
     pub termination: ProbeTermination,
     /// Work units the probe loop charged.
     pub work_charged: f32,
     /// The work budget the probe loop ran against, in work units; 0 when no loop ran.
     pub work_budget: f32,
-    /// The APS recall estimate at the stop; absent when APS was off or never armed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recall_estimate: Option<f32>,
+    /// Routed clusters assigned to this segment before probing; 0 for flat or located scans.
+    pub planned_clusters: usize,
+    /// Exact scores of this segment's results offered to the query's shared bound.
+    pub shared_bound_offers: usize,
+    /// Offers that moved the shared bound's k-th.
+    pub shared_bound_tightenings: usize,
     /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
@@ -268,11 +351,18 @@ pub(crate) enum SegmentReport {
     Flat { rows_read: usize },
     /// Nothing could match; the located cap still reports.
     Empty { located_cap: usize },
-    /// An IVF segment search: its plan, cluster source and scan.
+    /// A routed IVF segment the global ranking gave no cluster: nothing was probed, but its plan
+    /// and its router's work still report.
+    Unplanned {
+        plan: PlanReport,
+        routing: Option<RouterMetrics>,
+    },
+    /// An IVF segment search: its plan, cluster source and scan. The scan's report is boxed, so
+    /// the enum stays close to the size of its other variants.
     Ivf {
         plan: PlanReport,
         source: SourceReport,
-        scan: ScanReport,
+        scan: Box<ScanReport>,
     },
 }
 
@@ -293,7 +383,20 @@ impl ProbeStats {
                 located_cap,
                 ..Self::default()
             },
-            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, scan, &totals),
+            SegmentReport::Unplanned { plan, routing } => {
+                let mut stats = Self {
+                    segment_rows: Some(plan.segment_rows),
+                    segment_clusters: Some(plan.segment_clusters),
+                    planned_clusters: plan.planned_clusters,
+                    located_cap: plan.located_cap,
+                    ..Self::default()
+                };
+                if let Some(routing) = routing {
+                    stats.record_routing(routing);
+                }
+                stats
+            }
+            SegmentReport::Ivf { plan, source, scan } => Self::ivf(plan, source, *scan, &totals),
         };
         // Every segment search reports its result assembly, an empty one included.
         stats.result_assembly_ns = Some(0);
@@ -307,19 +410,23 @@ impl ProbeStats {
         let mut stats = Self {
             candidates_scored: scan.candidates_scored,
             exact_rows: scan.exact_rows,
+            exact_recheck_dropped: scan.exact_recheck_dropped,
+            replication_dropped: scan.replication_dropped,
+            cross_bound_publishes: scan.cross_bound_publishes,
             layers: LayerProbeStatsSet(
                 scan.layers
                     .iter()
                     .enumerate()
                     .map(|(layer, report)| LayerProbeStats {
-                        sign_word_fallbacks: totals.sign_word_fallbacks(layer),
                         io: totals.io(VectorStage::LayerScan(layer as u8)),
                         scored: report.scored,
+                        admission_pruned: report.admission_pruned,
                         survivors: report.survivors,
                         sparse_clusters: report.sparse_clusters,
                         full_clusters: report.full_clusters,
                         exact_clusters: report.exact_clusters,
                         exact_rows: report.exact_rows,
+                        recheck_dropped: report.recheck_dropped,
                         ..LayerProbeStats::default()
                     })
                     .collect(),
@@ -329,12 +436,16 @@ impl ProbeStats {
             exact_scan_ns: full_precision.then_some(0),
             segment_rows: Some(plan.segment_rows),
             segment_clusters: Some(plan.segment_clusters),
+            planned_clusters: plan.planned_clusters,
             located_cap: plan.located_cap,
             ..Self::default()
         };
         match source {
             SourceReport::Router(routed) => stats.record_routed(routed),
             SourceReport::Matches(matches) => stats.record_matches(matches),
+        }
+        if scan.recall_reached {
+            stats.termination = ProbeTermination::QuantizedRecall;
         }
         stats.record_io(totals);
         debug_assert_eq!(
@@ -357,22 +468,23 @@ impl ProbeStats {
         self.pruned_dead = counters.pruned_dead;
         self.postings_row = counters.postings_row;
         self.postings_skipped = counters.postings_skipped;
-        self.bounds_skips = counters.bounds_skips;
-        if let Some(probe) = counters.bound_armed_at {
-            self.bound_armed_count = 1;
-            self.bound_armed_probe_sum = u64::from(probe);
-        }
+        self.record_routing(routing);
+        self.termination = probe.termination;
+        self.work_charged = probe.work_charged;
+        self.work_budget = probe.work_budget;
+    }
+
+    fn record_routing(&mut self, routing: RouterMetrics) {
         self.routing = Some(routing);
         self.routing_visited_count = match routing {
             RouterMetrics::Stacked {
                 candidate_count, ..
             } => candidate_count,
             RouterMetrics::Exact { visited_count } => visited_count,
+            RouterMetrics::QuantizedStacked {
+                candidate_count, ..
+            } => candidate_count,
         };
-        self.termination = probe.termination;
-        self.work_charged = probe.work_charged;
-        self.work_budget = probe.work_budget;
-        self.recall_estimate = probe.recall_estimate;
     }
 
     fn record_matches(&mut self, report: MatchReport) {
@@ -424,6 +536,12 @@ impl ProbeStats {
         }
     }
 
+    /// Records what the segment's exact scores did to the collector top-k.
+    pub(crate) fn record_shared_offer(&mut self, merge: ExactMerge) {
+        self.shared_bound_offers = merge.offers;
+        self.shared_bound_tightenings = merge.tightenings;
+    }
+
     /// Adds the result-assembly time of the merge, measured after the segment's statistics were
     /// built.
     pub(crate) fn add_assembly(&mut self, totals: &StageTotals) {
@@ -468,10 +586,7 @@ mod tests {
         SourceReport::Router(RouterReport {
             counters: RouterCounters::default(),
             routing: RouterMetrics::Exact { visited_count: 7 },
-            probe: ProbeOutcome {
-                recall_estimate: Some(0.9),
-                ..ProbeOutcome::default()
-            },
+            probe: ProbeOutcome::default(),
         })
     }
 
@@ -496,6 +611,9 @@ mod tests {
         "centroid_bytes_read",
         "centroid_storage_blocks",
         "exact_rows",
+        "exact_recheck_dropped",
+        "replication_dropped",
+        "cross_bound_publishes",
         "scan_init_ns",
         "non_vector_search_ns",
         "query_prep_ns",
@@ -509,12 +627,12 @@ mod tests {
         "postings_row",
         "postings_skipped",
         "routing_visited_count",
-        "bounds_skips",
-        "bound_armed_count",
-        "bound_armed_probe_sum",
         "termination",
         "work_charged",
         "work_budget",
+        "planned_clusters",
+        "shared_bound_offers",
+        "shared_bound_tightenings",
     ];
 
     fn expected(extra: &[&str], layers: usize) -> BTreeSet<String> {
@@ -541,6 +659,12 @@ mod tests {
             }
             keys.insert(format!("boundary{layer}_ns"));
         }
+        if layers > 0 {
+            keys.insert("layer0_admission_pruned".to_string());
+        }
+        for layer in 1..layers {
+            keys.insert(format!("layer{layer}_recheck_dropped"));
+        }
         keys
     }
 
@@ -551,20 +675,29 @@ mod tests {
         let plan = PlanReport {
             segment_rows: 100,
             segment_clusters: 5,
+            planned_clusters: 3,
             located_cap: 0,
         };
         let quantized = ScanReport {
             layers: vec![LayerReport::default(); 2],
             ..ScanReport::default()
         };
-        let segment = ["recall_estimate", "segment_rows", "segment_clusters"];
+        let segment = [
+            "segment_rows",
+            "segment_clusters",
+            "routing_kind",
+            "routing_mode",
+            "routing_exact_scored",
+            "routing_candidate_count",
+        ];
         let ivf = |scan| SegmentReport::Ivf {
             plan,
             source: routed(),
-            scan,
+            scan: Box::new(scan),
         };
         let stats = ProbeStats::new(ivf(quantized), StageTotals::default());
         assert_eq!(keys(&stats), expected(&segment, 2));
+        assert_eq!(serde_json::to_value(&stats).unwrap()["planned_clusters"], 3);
         let layer = stats.layers.get(1).unwrap();
         assert_eq!((layer.scan_ns(), layer.boundary_ns()), (0, 0));
         let full_precision = [&segment[..], &["exact_scan_ns"]].concat();
@@ -577,10 +710,84 @@ mod tests {
         );
         let flat = ProbeStats::new(SegmentReport::Flat { rows_read: 3 }, StageTotals::default());
         assert_eq!(keys(&flat), expected(&["exact_scan_ns"], 0));
+        assert_eq!(serde_json::to_value(&flat).unwrap()["planned_clusters"], 0);
         let empty = ProbeStats::new(
             SegmentReport::Empty { located_cap: 0 },
             StageTotals::default(),
         );
         assert_eq!(keys(&empty), expected(&[], 0));
+        assert_eq!(serde_json::to_value(&empty).unwrap()["planned_clusters"], 0);
+        let unplanned = ProbeStats::new(
+            SegmentReport::Unplanned {
+                plan: PlanReport {
+                    planned_clusters: 0,
+                    ..plan
+                },
+                routing: Some(RouterMetrics::Exact { visited_count: 5 }),
+            },
+            StageTotals::default(),
+        );
+        assert_eq!(
+            keys(&unplanned),
+            expected(
+                &[
+                    "segment_rows",
+                    "segment_clusters",
+                    "routing_kind",
+                    "routing_mode",
+                    "routing_exact_scored",
+                    "routing_candidate_count",
+                ],
+                0
+            )
+        );
+        let json = serde_json::to_value(&unplanned).unwrap();
+        assert_eq!(
+            (&json["segment_clusters"], &json["planned_clusters"]),
+            (&serde_json::json!(5), &serde_json::json!(0))
+        );
+        assert_eq!(json["routing_mode"], "flat");
+        assert_eq!(json["access_path"], "Routed");
+        assert_eq!(unplanned.routing_visited_count, 5);
+    }
+
+    #[test]
+    fn routing_funnel_is_flat_and_separates_parent_scores_from_member_pruning() {
+        let stats = ProbeStats {
+            routing: Some(RouterMetrics::QuantizedStacked {
+                candidate_count: 3,
+                lists_scanned: 4,
+                approximate_scored: 32,
+                approximate_members_scored: 24,
+                exact_scored: 6,
+            }),
+            ..ProbeStats::default()
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["routing_kind"], "quantized_stacked");
+        assert_eq!(json["routing_mode"], "hierarchical");
+        assert_eq!(json["routing_lists_scanned"], 4);
+        assert_eq!(json["routing_approximate_scored"], 32);
+        assert_eq!(json["routing_approximate_members_scored"], 24);
+        assert_eq!(json["routing_approximate_pruned"], 18);
+        assert_eq!(json["routing_exact_scored"], 6);
+        assert_eq!(json["routing_exact_pruned"], 3);
+        assert_eq!(json["routing_candidate_count"], 3);
+        assert!(json.get("routing").is_none());
+
+        let fallback = ProbeStats {
+            routing: Some(RouterMetrics::QuantizedStacked {
+                candidate_count: 3,
+                lists_scanned: 0,
+                approximate_scored: 0,
+                approximate_members_scored: 0,
+                exact_scored: 96,
+            }),
+            ..ProbeStats::default()
+        };
+        let json = serde_json::to_value(&fallback).unwrap();
+        assert_eq!(json["routing_approximate_pruned"], 0);
+        assert_eq!(json["routing_exact_scored"], 96);
+        assert_eq!(json["routing_exact_pruned"], 93);
     }
 }

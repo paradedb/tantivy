@@ -19,7 +19,7 @@ use tantivy::vector::clustering::{
     for_each_batch, IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
 };
 use tantivy::vector::{
-    LocatedPath, ProbeParams, ProbeStats, Selectivity, VectorQuantizationConfig,
+    LocatedPath, ProbeParams, ProbeStats, RouterKind, Selectivity, VectorQuantizationConfig,
     VectorQuantizationLayer,
 };
 use tantivy::{Index, IndexWriter, Searcher, TantivyDocument, Term};
@@ -184,7 +184,7 @@ fn vector(seed: u64, dim: usize) -> Vec<f32> {
 }
 
 /// Center `doc % centers` plus noise as wide as the centers' spread, so clusters overlap and the
-/// bounds gate rarely skips one.
+/// routing must explore many of them.
 fn doc_vector(doc: u64, centers: u64, dim: usize) -> Vec<f32> {
     let center = vector(1_000_000 + doc % centers, dim);
     let noise = vector(doc, dim);
@@ -234,6 +234,9 @@ impl Fixture {
             .ivf_clusterer(Arc::new(RoundRobinClusterer {
                 clusters: shape.clusters,
             }))
+            // Exact: Stacked's hard 25% top prune caps candidates below the
+            // probe ladder this scenario needs for strictly increasing opens.
+            .ivf_router(RouterKind::Exact)
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 1_000_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -297,7 +300,9 @@ impl Fixture {
         let run = || {
             let collector = TopDocs::with_limit(10)
                 .order_by_similarity(self.field, query.clone())
-                .with_probe_params(params.clone());
+                .with_probe_params(params.clone())
+                .build_for_searcher(searcher, filter)
+                .unwrap();
             searcher.search(filter, &collector).map(|fruit| fruit.stats)
         };
         run().expect("warm-up search");
@@ -309,8 +314,7 @@ impl Fixture {
 /// Probes about `clusters` clusters: the budget is that many average clusters of work.
 fn probing(clusters: usize, located: LocatedPath) -> ProbeParams {
     ProbeParams {
-        max_probe_fraction: 1e-6,
-        min_probe_clusters: clusters,
+        max_probe: clusters,
         located,
         ..ProbeParams::default()
     }
@@ -470,7 +474,7 @@ fn peak_on_a_large_segment() -> tantivy::Result<()> {
         ("located", located_everything()),
     ] {
         let params = ProbeParams {
-            max_probe_fraction: 0.25,
+            max_probe: 64,
             min_probe_clusters: 1,
             located,
             ..ProbeParams::default()

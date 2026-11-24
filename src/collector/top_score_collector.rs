@@ -14,7 +14,7 @@ use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::FastValue;
 use crate::schema::Field;
-use crate::vector::{TopDocsByVectorSimilarity, VectorElement};
+use crate::vector::{TopDocsByVectorSimilarityBuilder, VectorElement};
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
 /// The `TopDocs` collector keeps track of the top `K` documents
@@ -349,19 +349,19 @@ impl TopDocs {
     /// inferred from the `query` argument; it must match the schema's
     /// declared dtype.
     ///
-    /// The driving query (passed to `searcher.search`) decides which docs
-    /// are candidates. For brute-force scan over every doc, pair this with
-    /// [`AllQuery`](crate::query::AllQuery); pair with a filter query to
-    /// restrict candidates.
+    /// Prepare the filter and cluster candidates before building the collector, or use
+    /// [`TopDocsByVectorSimilarityBuilder::build_for_searcher`] to perform both stages.
+    /// The resulting collector is bound to that filter and segment snapshot; the driving
+    /// query passed to `searcher.search` must be the same filter.
     pub fn order_by_similarity<T>(
         self,
         field: Field,
         query: Vec<T>,
-    ) -> TopDocsByVectorSimilarity<T>
+    ) -> TopDocsByVectorSimilarityBuilder<T>
     where
         T: VectorElement,
     {
-        TopDocsByVectorSimilarity::new(field, query, self.limit).and_offset(self.offset)
+        TopDocsByVectorSimilarityBuilder::new(field, query, self.limit).and_offset(self.offset)
     }
 
     /// Helper function to tweak the similarity score of documents using a function.

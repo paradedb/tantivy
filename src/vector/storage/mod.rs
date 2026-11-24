@@ -1,8 +1,7 @@
-//! On-disk vector storage: file headers, block columns, metadata, cluster bounds, row maps, and
+//! On-disk vector storage: file headers, block columns, metadata, row maps, and
 //! the readers over them. See `FORMAT.md`.
 
 pub(crate) mod blocks;
-pub(crate) mod bounds;
 pub(crate) mod centroids;
 pub(crate) mod header;
 pub(crate) mod id_map;

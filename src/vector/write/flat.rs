@@ -3,38 +3,79 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
+
+use common::CountingWriter;
 
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, PluginWriter};
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::storage::blocks::{align_up, block_align, pad, write_metadata, BlockDirectory};
+use crate::vector::distance::{
+    admit, maybe_normalize_bytes, normalize_row_with_norm_squared, row_norm_squared, InvalidVector,
+    MAX_NORM_SQUARED,
+};
+use crate::vector::quantization::VectorNormPolicy;
+use crate::vector::storage::blocks::{
+    align_up, block_align, pad, write_metadata, BlockOffsetsWriter,
+};
 use crate::vector::storage::header::{write_vector_header, VectorEntry, HEADER_LEN, VEC_EXT};
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
+use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::write::RowAddress;
 use crate::vector::ENTRY_ALIGN;
 use crate::{DocId, TantivyError};
 
 // --- Writer ---
+
+/// The error for a document whose vector the admission rule refuses.
+fn refused_row(invalid: InvalidVector, field: &str, doc_id: DocId) -> TantivyError {
+    TantivyError::InvalidArgument(match invalid {
+        InvalidVector::NonFinite => format!(
+            "non-finite element in vector field '{field}' (doc {doc_id}): vectors must contain \
+             only finite values"
+        ),
+        InvalidVector::NormTooLarge => format!(
+            "vector in field '{field}' (doc {doc_id}) has a squared norm above the limit of \
+             {MAX_NORM_SQUARED:e}"
+        ),
+    })
+}
 
 /// Buffers one vector field before serialization.
 struct FieldBuffer {
     present_doc_ids: Vec<DocId>,
     row_bytes: Vec<u8>,
     opts: VectorOptions,
+    norm_policy: VectorNormPolicy,
 }
 
 impl FieldBuffer {
-    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> NormalizeOutcome {
-        let stride = self.opts.bytes_per_vector();
-        debug_assert_eq!(bytes.len(), stride);
+    /// Admits a document's row and buffers it, normalized when the field stores unit rows. The
+    /// row's one norm pass serves both the admission and the normalization; a refused row leaves
+    /// the buffer unchanged.
+    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> Result<(), InvalidVector> {
+        debug_assert_eq!(bytes.len(), self.opts.bytes_per_vector());
+        let norm_squared = row_norm_squared(self.opts.dtype(), bytes);
+        admit(norm_squared, self.norm_policy)?;
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride])
+        match self.norm_policy {
+            VectorNormPolicy::UnitL2 => {
+                normalize_row_with_norm_squared(
+                    self.opts.dtype(),
+                    &mut self.row_bytes[start..],
+                    norm_squared,
+                );
+            }
+            VectorNormPolicy::None => {}
+        }
+        Ok(())
     }
 
     fn mem_usage(&self) -> usize {
@@ -63,6 +104,7 @@ impl FlatVecWriter {
                         present_doc_ids: Vec::new(),
                         row_bytes: Vec::new(),
                         opts: opts.clone(),
+                        norm_policy: VectorNormPolicy::for_options(opts),
                     },
                 );
             }
@@ -107,13 +149,9 @@ impl PluginWriter for FlatVecWriter {
                     bytes.len(),
                 )));
             }
-            if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
-                     only finite values",
-                    schema.get_field_entry(field).name(),
-                )));
-            }
+            buf.push_bytes(doc_id, bytes).map_err(|invalid| {
+                refused_row(invalid, schema.get_field_entry(field).name(), doc_id)
+            })?;
         }
         Ok(())
     }
@@ -159,16 +197,14 @@ impl PluginWriter for FlatVecWriter {
             let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
             let start = data.written_bytes();
             write_metadata(data, &meta)?;
-            let mut directory = BlockDirectory::new(data.written_bytes() - start);
-            let mut rows = 0u32;
+            let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - start);
             // A full row group or the final partial group forms one aligned Rows column.
             for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
                 data.write_all(block)?;
                 pad(data, align_up(block.len(), align) - block.len())?;
-                rows += (block.len() / stride) as u32;
-                directory.push(data.written_bytes() - start, rows);
+                block_offsets.push(data.written_bytes() - start, block.len() / stride);
             }
-            directory.finish(data)?;
+            block_offsets.finish(data)?;
             assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
             data.flush()?;
         }
@@ -238,48 +274,17 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             .collect::<crate::Result<Vec<_>>>()?;
 
         let source_rows = crate::vector::write::merge_source_rows(ctx, &field_readers)?;
-        let mut target_present: Vec<DocId> = Vec::new();
-        let mut target_doc_id: DocId = 0;
-        {
-            let meta = VectorColMetadata::build_flat(opts);
-            let align = block_align(&meta.slots());
-            composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
-            let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
-            let start = rows_w.written_bytes();
-            write_metadata(rows_w, &meta)?;
-            let mut directory = BlockDirectory::new(rows_w.written_bytes() - start);
-            let mut block_bytes = 0;
-            // Row groups can be streamed without knowing the final vector count.
-
-            for source in source_rows {
-                if ctx.cancel.wants_cancel() {
-                    return Err(crate::TantivyError::Cancelled);
-                }
-                if let Some(source) = source {
-                    let bytes = field_readers[source.segment_ord as usize]
-                        .vector_bytes_for_row(source.row_id)?;
-                    target_present.push(target_doc_id);
-                    rows_w.write_all(&bytes)?;
-                    block_bytes += bytes.len();
-                    if target_present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
-                        pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-                        directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
-                        block_bytes = 0;
-                    }
-                }
-                target_doc_id += 1;
-            }
-            pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-            if block_bytes != 0 {
-                directory.push(rows_w.written_bytes() - start, target_present.len() as u32);
-            }
-            directory.finish(rows_w)?;
-            assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
-            rows_w.flush()?;
-        }
-
-        debug_assert_eq!(target_doc_id, num_target_docs);
-
+        debug_assert_eq!(source_rows.len(), num_target_docs as usize);
+        composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+        let rows_w = composite.for_field_with_idx(field, VectorEntry::Data.index());
+        let target_present = write_flat_rows(
+            rows_w,
+            opts,
+            &source_rows,
+            &field_readers,
+            RowBytes::Stored,
+            ctx.cancel,
+        )?;
         id_maps.push((field, target_present));
     }
     for (field, present) in id_maps {
@@ -291,4 +296,74 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     }
     composite.close()?;
     Ok(())
+}
+
+/// The bytes [`write_flat_rows`] writes for each source row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowBytes {
+    /// The row as stored, for a flat merge.
+    Stored,
+    /// The row re-normalized under the field's rule, as the encode pass normalizes it before
+    /// encoding, so a quantized field's exact rows are the bytes its codes were built from.
+    Normalized,
+}
+
+/// Streams the rows of `source_rows`, in target document order, into `rows_w` as one flat entry:
+/// metadata, row groups of [`FLAT_ROWS_PER_BLOCK`] rows and the block offsets, each row's bytes as
+/// `row_bytes` says. Row groups stream without knowing the final vector count. Returns the target
+/// documents with a row, ascending.
+pub(crate) fn write_flat_rows<W: Write>(
+    rows_w: &mut CountingWriter<W>,
+    opts: &VectorOptions,
+    source_rows: &[Option<RowAddress>],
+    readers: &[Arc<VectorIndexReader>],
+    row_bytes: RowBytes,
+    cancel: &dyn CancelSentinel,
+) -> crate::Result<Vec<DocId>> {
+    let normalize = row_bytes == RowBytes::Normalized && opts.needs_normalization();
+    let mut normalized = Vec::new();
+    let meta = VectorColMetadata::build_flat(opts);
+    let align = block_align(&meta.slots());
+    let start = rows_w.written_bytes();
+    write_metadata(rows_w, &meta)?;
+    let mut block_offsets = BlockOffsetsWriter::new(rows_w.written_bytes() - start);
+    let mut block_bytes = 0;
+    let mut present: Vec<DocId> = Vec::new();
+    for (target_doc_id, source) in source_rows.iter().enumerate() {
+        if cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        let Some(source) = source else {
+            continue;
+        };
+        let bytes =
+            readers[source.segment_ord as usize].vector_bytes_for_row(source.block_address)?;
+        let row: &[u8] = if normalize {
+            normalized.clear();
+            normalized.extend_from_slice(&bytes);
+            maybe_normalize_bytes(opts, &mut normalized);
+            &normalized
+        } else {
+            &bytes
+        };
+        present.push(target_doc_id as DocId);
+        rows_w.write_all(row)?;
+        block_bytes += row.len();
+        if present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
+            pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
+            block_offsets.push(rows_w.written_bytes() - start, FLAT_ROWS_PER_BLOCK as usize);
+            block_bytes = 0;
+        }
+    }
+    pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
+    if block_bytes != 0 {
+        block_offsets.push(
+            rows_w.written_bytes() - start,
+            present.len() % FLAT_ROWS_PER_BLOCK as usize,
+        );
+    }
+    block_offsets.finish(rows_w)?;
+    assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
+    rows_w.flush()?;
+    Ok(present)
 }

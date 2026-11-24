@@ -6,42 +6,32 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::storage::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `DocLocations`). The composite has four slots per field:
+//! `DocLocations`). The composite has two slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
-//! [1] cluster_offsets (u64[N+1], prefix sum)
 //! [2] a router-kind byte followed by the selected router's payload, REQUIRED
-//! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte,
-//!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
-//!     cluster: max ||x - c|| over the cluster's members' stored rows against
-//!     the stored centroid (the merge documents the metric-uniform fold).
 //! ```
 //!
-//! Persisted IVF routers use the V3 layout. Earlier bare-router and
-//! router-less layouts are not supported.
+//! V5 stores block byte offsets and row counts only in `.vec`. Earlier layouts require rebuilding.
 use std::io::{self, Write};
 use std::mem;
-use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorOptions};
-use crate::vector::router::stacked::aps::RecallEstimator;
-use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RoutingParams};
-use crate::vector::storage::bounds::{BoundKind, BoundStore};
-use crate::vector::storage::header::VectorFileVersion;
+use crate::schema::VectorOptions;
+use crate::vector::router::{OpenedRouter, RouterKind};
+use crate::vector::storage::blocks::BlockOffsets;
 use crate::vector::storage::io::{VectorRead, VectorReadKind};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state is small and touched by every query: the cluster offsets, the bounds and the
-/// router's lists. The centroid vectors stay behind a [`FileSlice`] and are read one row at a
-/// time as routing visits them. Everything row-scale (the rows and id-map) lives on
+/// Router topology is pinned. Centroid vectors remain lazy in `.centroids`; block
+/// offsets and row counts remain lazy in `.vec`. Vector columns and the id-map live on
 /// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub(crate) struct ClusterIndex {
     num_centroids: usize,
@@ -51,15 +41,9 @@ pub(crate) struct ClusterIndex {
     centroids_slice: FileSlice,
     /// Bytes per centroid row: the field's vector stride.
     centroid_stride: usize,
-    /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
-    cluster_offsets: OwnedBytes,
-    metric: Metric,
+    /// The same lazy tuple table used by the vector-column reader.
+    block_offsets: BlockOffsets,
     router: OpenedRouter,
-    /// Slot `[3]`, pinned: the segment-level bound kind.
-    bound_kind: BoundKind,
-    /// Slot `[3]`, pinned: the per-cluster bound payload,
-    /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
-    bounds: Vec<f32>,
 }
 
 impl ClusterIndex {
@@ -92,52 +76,14 @@ impl ClusterIndex {
         out.write_all(centroid_bytes)
     }
 
-    /// Write slot `[1]` of the `.centroids` composite for a field.
-    pub(crate) fn serialize_offsets<W: Write + ?Sized>(
-        cluster_offsets: &[u64],
-        out: &mut W,
-    ) -> io::Result<()> {
-        for offset in cluster_offsets {
-            offset.serialize(out)?;
-        }
-        Ok(())
-    }
-
-    /// Write slot `[3]` of the `.centroids` composite for a field: the
-    /// segment-level kind byte, then the per-cluster payload.
-    ///
-    /// * `kind` (`BoundKind`) — the segment-level bound kind.
-    /// * `values` (`&[f32]`) — `num_centroids * kind.stride(dim)` values in cluster order; the
-    ///   caller's [`BoundsBuilder`] output.
-    /// * `out` (`&mut W`) — the slot writer.
-    ///
-    /// Returns (`io::Result<()>`): write errors only — the payload length
-    /// is validated at open, against the count words of slot `[0]`.
-    ///
-    /// [`BoundsBuilder`]: crate::vector::storage::bounds::BoundsBuilder
-    pub(crate) fn serialize_bounds<W: Write + ?Sized>(
-        kind: BoundKind,
-        values: &[f32],
-        out: &mut W,
-    ) -> io::Result<()> {
-        (kind as u8).serialize(out)?;
-        for value in values {
-            value.serialize(out)?;
-        }
-        Ok(())
-    }
-
-    /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// the bounds, and the router topology are materialized; the centroid
-    /// rows stay behind a [`FileSlice`] for lazy per-node reads.
+    /// Parse a field's `.centroids` slots. Count words and router topology are
+    /// materialized; centroid rows and block offsets remain lazy.
     /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
-        version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
-        offsets_slice: FileSlice,
+        block_offsets: BlockOffsets,
         router_slice: FileSlice,
-        bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -165,75 +111,23 @@ impl ClusterIndex {
             .into());
         }
 
-        let cluster_offsets = offsets_slice.read_bytes()?;
-        let expected_offsets = (num_centroids + 1)
-            .checked_mul(mem::size_of::<u64>())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "cluster offset length overflow")
-            })?;
-        if cluster_offsets.len() != expected_offsets {
+        if num_centroids != block_offsets.num_blocks() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "IVF cluster offset byte length mismatch",
+                "centroid count differs from vector block count",
             )
             .into());
         }
 
-        if version != VectorFileVersion::V3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("routers require vector file version V3, found {version:?}"),
-            )
-            .into());
-        }
         let router = RouterKind::open(router_slice, centroids_slice.clone(), options)?;
-
-        let bytes = bounds_slice.read_bytes()?;
-        let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF bounds slot is missing its kind byte",
-            )
-            .into());
-        };
-        let bound_kind = BoundKind::from_code(kind_code)?;
-        let expected = num_centroids
-            .checked_mul(bound_kind.stride(options.dim()))
-            .and_then(|values| values.checked_mul(mem::size_of::<f32>()))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "bounds byte length overflow")
-            })?;
-        if payload.len() != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF bounds byte length mismatch",
-            )
-            .into());
-        }
-        let mut reader = payload;
-        let bounds: Vec<f32> = (0..num_centroids * bound_kind.stride(options.dim()))
-            .map(|_| f32::deserialize(&mut reader))
-            .collect::<io::Result<_>>()?;
-        // A negative bound is corrupt, never produced: the fold is a max of
-        // norms seeded at 0.0. NaN / +inf fail open in margin comparisons.
-        if bounds.iter().any(|&value| value < 0.0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF bounds slot holds a negative bound",
-            )
-            .into());
-        }
 
         let index = ClusterIndex {
             num_centroids,
             num_docs,
             centroids_slice,
             centroid_stride: options.bytes_per_vector(),
-            cluster_offsets,
-            metric: options.metric(),
+            block_offsets,
             router,
-            bound_kind,
-            bounds,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -266,37 +160,31 @@ impl ClusterIndex {
 
     /// Total posting rows across all clusters.
     pub(crate) fn num_rows(&self) -> usize {
-        self.cluster_offset(self.num_centroids) as usize
+        self.block_offsets.num_rows()
     }
 
-    fn cluster_offset(&self, cluster: usize) -> u64 {
-        let start = cluster * mem::size_of::<u64>();
-        let end = start + mem::size_of::<u64>();
-        u64::from_le_bytes(self.cluster_offsets[start..end].try_into().unwrap())
-    }
-
-    /// The contiguous row range of `cluster` within the `.vec` rows.
-    #[inline]
-    pub(crate) fn cluster_range(&self, cluster: usize) -> Range<usize> {
-        debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
-        self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
-    }
-
-    /// The stored centroid bounds of this segment's clusters.
-    ///
-    /// Returns (`BoundStore`): a view over the pinned slot `[3]` payload —
-    /// segment-level kind plus per-cluster values; `f32::INFINITY` =
-    /// SATURATED (always probes).
-    #[inline]
-    pub(crate) fn bounds(&self) -> BoundStore<'_> {
-        BoundStore::new(self.bound_kind, &self.bounds)
+    pub(crate) fn cluster_num_rows(&self, cluster: usize) -> crate::Result<usize> {
+        self.block_offsets.num_rows_in(cluster)
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
-    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.num_centroids).map(|cluster| {
-            (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
+    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = crate::Result<usize>> + '_ {
+        let mut total = 0usize;
+        (0..self.num_centroids).map(move |cluster| {
+            let count = self.cluster_num_rows(cluster)?;
+            total = total.checked_add(count).ok_or_else(|| {
+                crate::error::DataCorruption::comment_only("cluster row total overflow")
+            })?;
+            if total > self.num_rows()
+                || (cluster + 1 == self.num_centroids && total != self.num_rows())
+            {
+                return Err(crate::error::DataCorruption::comment_only(
+                    "block counts differ from total row count",
+                )
+                .into());
+            }
+            Ok(count)
         })
     }
 
@@ -323,59 +211,80 @@ impl ClusterIndex {
     }
 
     /// The centroid rows, materialized in one read — for introspection and
-    /// tests only. Routing fetches per-node ranges through the lazy arena.
+    /// tests only. Routing fetches selected list ranges through the lazy arena.
     pub(crate) fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    /// Rank this segment's clusters for `query`, nearest first. `params`
-    /// steers the stacked router only (how many clusters the caller will
-    /// probe and its recall target); other routers ignore it.
-    pub(crate) fn rank_clusters(&self, query: &[f32], params: RoutingParams) -> RouterIter {
-        #[cfg(test)]
-        if let Some(clusters) = crate::vector::router::test_clusters() {
-            return clusters;
-        }
-        self.router.rank(query, self.metric, params)
-    }
-
-    /// The APS estimator for scanning `ranked` (from
-    /// [`Self::rank_clusters`], not yet pulled) toward `recall`. `None`
-    /// unless the stacked router ranked it and APS is on.
-    pub(crate) fn recall_estimator(
-        &self,
-        ranked: &RouterIter,
-        query: &[f32],
-        recall: f32,
-    ) -> Option<RecallEstimator<'_>> {
-        self.router
-            .recall_estimator(ranked, query, self.metric, recall)
+    pub(crate) fn opened_router(&self) -> &OpenedRouter {
+        &self.router
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Metric;
+    use crate::vector::storage::blocks::{
+        block_len, pad, write_metadata, BlockOffsetsWriter, Blocks,
+    };
+    use crate::vector::storage::metadata::VectorColMetadata;
 
-    /// A `.centroids` file older than V3 has no tagged router slot, so it fails to open.
-    #[test]
-    fn pre_v3_router_format_is_rejected() -> io::Result<()> {
+    fn blocks(
+        counts: &[usize],
+        total: Option<u64>,
+    ) -> crate::Result<crate::vector::storage::blocks::BlockOffsets> {
         let options = VectorOptions::new(1, Metric::L2);
-        let mut centroids = Vec::new();
-        ClusterIndex::serialize_centroids(0, 0, &[], &options, &mut centroids)?;
-        let mut offsets = Vec::new();
-        ClusterIndex::serialize_offsets(&[0], &mut offsets)?;
-        let error = ClusterIndex::open(
-            VectorFileVersion::V2,
+        let metadata = VectorColMetadata::build_ivf(&options, None)?;
+        let mut data = Vec::new();
+        write_metadata(&mut data, &metadata)?;
+        let mut offsets = BlockOffsetsWriter::new(data.len() as u64);
+        for &count in counts {
+            pad(&mut data, block_len(&metadata.slots(), count))?;
+            offsets.push(data.len() as u64, count);
+        }
+        offsets.finish(&mut data)?;
+        if let Some(total) = total {
+            let at = data.len() - 16;
+            data[at..at + 8].copy_from_slice(&total.to_le_bytes());
+        }
+        Ok(Blocks::open(FileSlice::from(data), &options, true)?.block_offsets())
+    }
+    #[test]
+    fn centroid_count_must_match_vector_blocks() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centers = Vec::new();
+        ClusterIndex::serialize_centroids(2, 0, &[0; 8], &options, &mut centers)?;
+        for count in [0, 1, 3] {
+            let error = ClusterIndex::open(
+                &options,
+                FileSlice::from(centers.clone()),
+                blocks(&vec![0; count], None)?,
+                FileSlice::empty(),
+            )
+            .err()
+            .expect("mismatched block count");
+            assert!(error
+                .to_string()
+                .contains("centroid count differs from vector block count"));
+        }
+        Ok(())
+    }
+    #[test]
+    fn cluster_counts_must_sum_to_the_footer_total() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centers = Vec::new();
+        ClusterIndex::serialize_centroids(2, 2, &[0; 8], &options, &mut centers)?;
+        let index = ClusterIndex::open(
             &options,
-            FileSlice::from(centroids),
-            FileSlice::from(offsets),
-            FileSlice::empty(),
-            FileSlice::empty(),
-        )
-        .err()
-        .expect("pre-V3 router formats must fail");
-        assert!(error.to_string().contains("require vector file version V3"));
+            FileSlice::from(centers),
+            blocks(&[1, 1], Some(3))?,
+            FileSlice::from(vec![2]),
+        )?;
+        assert!(index
+            .cluster_sizes()
+            .collect::<crate::Result<Vec<_>>>()
+            .is_err());
         Ok(())
     }
 }

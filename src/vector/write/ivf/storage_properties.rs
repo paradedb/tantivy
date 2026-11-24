@@ -3,6 +3,7 @@ use crate::schema::Value;
 use crate::vector::clustering::{for_each_batch, IvfTrainingVectors, VectorSource};
 use crate::vector::quantization::{corrected_quantized_estimate, ArithmeticError};
 use crate::vector::storage::io::test_support::{PagedDirectory, PAGE_BYTES};
+use crate::vector::BlockAddress;
 
 const DIM: usize = 64;
 const DOCS: usize = 1200;
@@ -33,8 +34,7 @@ impl IvfClusterer for FixedClusters {
         let mut assignments = Vec::with_capacity(num_rows);
         for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
             for row in batch.matrix.values.chunks_exact(DIM) {
-                assignments
-                    .push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
+                assignments.push((0..4).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap() as u32);
             }
         })?;
         Ok(assignments)
@@ -152,37 +152,47 @@ fn vector_read_kinds_follow_data_for_dense_and_sparse_access() -> crate::Result<
     let searcher = reader.searcher();
     let vectors =
         searcher.segment_readers()[0].vector_index(index.schema().get_field("embedding")?)?;
-    let rows = vectors.index().unwrap().cluster_range(2);
-    let layers = vectors.quantization().unwrap().layers();
+    let rows = 0..vectors.index().unwrap().cluster_num_rows(2)?;
+    let layers = vectors.quantization()?.unwrap().layers();
+    let mut docs = Vec::new();
+    vectors.read_doc_ids(2, &mut docs)?;
     directory.read_kinds.lock().unwrap().clear();
 
-    vectors.read_cluster_rows(2)?;
+    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
+    let exact = vectors.read_exact_docs(&docs, &mut scratch)?;
+    let exact_chunks = exact.iter().count().min(scratch.chunks.len());
     vectors.read_doc_ids(2, &mut Vec::new())?;
-    layers[0].read_batch(rows.clone())?;
-    layers[1].read_batch(rows.clone())?;
+    layers[0].read_batch(2, rows.clone())?;
+    layers[1].read_batch(2, rows.clone())?;
     let sparse = layers[1].cluster_in_block(2)?;
     sparse.read_codes(rows.start..rows.start + 1)?;
     sparse.read_sidecar()?;
     vectors
-        .quantization()
+        .quantization()?
         .unwrap()
-        .read_residual_norms(rows.start..rows.start + 1)?;
-    let mut scratch = crate::vector::storage::quantized::ReadScratch::default();
-    scratch.rows.push(rows.start);
-    vectors.read_vector_rows_planned(&mut scratch)?;
-    assert_eq!(
-        *directory.read_kinds.lock().unwrap(),
-        [
-            VectorReadKind::FullPrecision,
-            VectorReadKind::Other,
-            VectorReadKind::QuantizedLayer(0),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(1),
-            VectorReadKind::QuantizedLayer(0),
-            VectorReadKind::FullPrecision,
-        ]
-    );
+        .read_residual_norms(2, rows.start..rows.start + 1)?;
+    vectors.read_exact_docs(&docs[..1], &mut scratch)?;
+    // ExactRows are addressed within their contiguous entry: no offsets read precedes them.
+    let mut expected = Vec::new();
+    expected.extend(std::iter::repeat_n(
+        VectorReadKind::FullPrecision,
+        exact_chunks,
+    ));
+    expected.extend([
+        VectorReadKind::Other, // Block offsets before DocIds.
+        VectorReadKind::Other,
+        VectorReadKind::Other, // Block offsets before each band's payload.
+        VectorReadKind::QuantizedLayer(0),
+        VectorReadKind::Other,
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::Other, // The sparse reader reuses this block for codes and sidecars.
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::QuantizedLayer(1),
+        VectorReadKind::Other,
+        VectorReadKind::QuantizedLayer(0),
+        VectorReadKind::FullPrecision, // One document's row, addressed within ExactRows.
+    ]);
+    assert_eq!(*directory.read_kinds.lock().unwrap(), expected);
     assert_eq!(current_vector_read_kind(), VectorReadKind::Other);
     Ok(())
 }
@@ -217,7 +227,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let label = index.schema().get_field("label")?;
     let vectors = segment.vector_index(field)?;
     let ivf = vectors.index().unwrap();
-    let quantized = vectors.quantization().unwrap();
+    let quantized = vectors.quantization()?.unwrap();
     let ctx = quantized.index_ctx();
     let metadata = vectors.metadata().unwrap();
     let slots = metadata.slots();
@@ -232,20 +242,24 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     let mut row_docs = Vec::new();
     let mut expected_rows = vec![None; segment.max_doc() as usize];
     assert_eq!(
-        ivf.cluster_range(0).len(),
+        (0..ivf.cluster_num_rows(0)?).len(),
         0,
         "cluster=0 row=all column=Rows empty fixture"
     );
     assert_eq!(
-        ivf.cluster_range(1).len(),
+        (0..ivf.cluster_num_rows(1)?).len(),
         1,
         "cluster=1 row=all column=Rows singleton fixture"
     );
     for cluster in 0..ivf.num_clusters() {
-        let rows = ivf.cluster_range(cluster);
-        let row_bytes = vectors.read_cluster_rows(cluster)?;
+        let rows = 0..ivf.cluster_num_rows(cluster)?;
         let mut docs = Vec::new();
         vectors.read_doc_ids(cluster, &mut docs)?;
+        // The rows live in ExactRows, by document; the cluster block holds their codes.
+        let row_bytes: Vec<u8> = docs
+            .iter()
+            .flat_map(|&doc| vectors.vector_bytes(doc).unwrap().unwrap().to_vec())
+            .collect();
         let centroid = floats(&centroids[cluster * DIM * 4..(cluster + 1) * DIM * 4]);
         let prepared = quant::cascade::prepare_centroid(&centroid, &ctx.specs);
         let mut values = floats(&row_bytes);
@@ -269,19 +283,20 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         );
         for (local, &doc) in docs.iter().enumerate() {
             let row = rows.start + local;
-            expected_rows[doc as usize] = Some(row);
+            expected_rows[doc as usize] = Some(BlockAddress::new(cluster as u32, row as u32));
             assert_eq!(
-                vectors.row_id(doc)?,
-                Some(row),
+                vectors.row_location(doc)?,
+                Some(BlockAddress::new(cluster as u32, row as u32)),
                 "cluster={cluster} row={local} column=DocLocations"
             );
+            let exact = vectors.exact_location(doc)?.expect("exact row");
             assert_eq!(
-                vectors.vector_bytes(doc)?.unwrap().as_slice(),
+                vectors.vector_bytes_for_row(exact)?.as_slice(),
                 &row_bytes[local * DIM * 4..(local + 1) * DIM * 4],
                 "cluster={cluster} row={local} column=Rows locate"
             );
         }
-        row_docs.extend(docs.iter().copied());
+        row_docs.push(docs.clone());
         for (column, slot) in slots.iter().enumerate() {
             let expected = match slot.slot_type {
                 SlotType::Rows { .. } => row_bytes.to_vec(),
@@ -310,7 +325,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 );
                 continue;
             }
-            let actual = quantized.layers()[0].read_column(column, rows.clone())?;
+            let actual = quantized.layers()[0].read_column(cluster, column, rows.clone())?;
             assert_eq!(
                 actual.len(),
                 expected.len(),
@@ -324,8 +339,11 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     &expected[bytes.clone()],
                     "{metric:?} {schedule:?} cluster={cluster} row={local} column={column} encoder"
                 );
-                let single = quantized.layers()[0]
-                    .read_column(column, rows.start + local..rows.start + local + 1)?;
+                let single = quantized.layers()[0].read_column(
+                    cluster,
+                    column,
+                    rows.start + local..rows.start + local + 1,
+                )?;
                 assert_eq!(
                     single.as_slice(),
                     &expected[bytes],
@@ -336,7 +354,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         if !rows.is_empty() {
             for (layer_idx, layer) in quantized.layers().iter().enumerate() {
                 let band = layer.read_batch_in_block(cluster, rows.clone())?;
-                let sidecar_columns = layer.read_sidecar(rows.clone())?;
+                let sidecar_columns = layer.read_sidecar(cluster, rows.clone())?;
                 let sparse = layer.cluster_in_block(cluster)?;
                 let sidecars = sparse.read_sidecar()?;
                 let selected: Vec<_> = rows
@@ -346,7 +364,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 let mut selected_scales = vec![0.0; selected.len()];
                 let mut selected_gammas = vec![0.0; selected.len()];
                 let mut selected_errors = vec![0.0; selected.len()];
-                let mut selected_constants = if metric == Metric::L2 {
+                let mut selected_constants = if metric.scores_by_distance() {
                     vec![0.0; selected.len()]
                 } else {
                     Vec::new()
@@ -411,7 +429,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     );
                     assert_eq!(
                         band.code_bytes(row)?,
-                        layer.code_bytes(row)?.as_slice(),
+                        layer
+                            .code_bytes(BlockAddress::new(cluster as u32, row as u32))?
+                            .as_slice(),
                         "{context}.codes band"
                     );
                     for actual in [
@@ -421,7 +441,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.scale(row)?.to_bits(),
+                            layer
+                                .scale(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.scales"
                         );
                     }
@@ -432,7 +454,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.gamma(row)?.to_bits(),
+                            layer
+                                .gamma(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.gammas"
                         );
                     }
@@ -443,13 +467,17 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     ] {
                         assert_eq!(
                             actual.to_bits(),
-                            layer.error_ratio(row)?.to_bits(),
+                            layer
+                                .error_ratio(BlockAddress::new(cluster as u32, row as u32))?
+                                .to_bits(),
                             "{context}.errors"
                         );
                     }
                     assert_eq!(
                         band.constant(row)?.map(f32::to_bits),
-                        layer.constant(row)?.map(f32::to_bits),
+                        layer
+                            .constant(BlockAddress::new(cluster as u32, row as u32))?
+                            .map(f32::to_bits),
                         "{context}.constants"
                     );
                 }
@@ -466,7 +494,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     }
     for (doc, &original) in originals.iter().enumerate() {
         assert_eq!(
-            vectors.row_id(doc as u32)?,
+            vectors.row_location(doc as u32)?,
             expected_rows[doc],
             "cluster=none row=doc{doc} column=DocLocations"
         );
@@ -490,11 +518,12 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
         return Ok(());
     }
     let query = input_vector(42);
-    let exact_query = crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone()));
+    let exact_query =
+        crate::vector::search::prepared::VectorQuery::new(metric, Arc::new(query.clone())).unwrap();
     let prepared = QuantizedQueryCtx::new(Arc::clone(ctx), &exact_query);
     for clusters in [vec![0, 1, 2, 3], vec![0, 1, 3]] {
         for filtered in [false, true] {
-            let candidates = clusters
+            let candidates: Vec<_> = clusters
                 .iter()
                 .map(|&cluster| crate::vector::router::candidate::Candidate {
                     node: cluster as u32,
@@ -509,18 +538,36 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                 IndexRecordOption::Basic,
             );
             let filter: &dyn Query = if filtered { &keep } else { &AllQuery };
-            let collector = TopDocsByVectorSimilarity::new(field, query.clone(), DOCS + 1)
-                .with_probe_params(ProbeParams {
-                    max_probe_fraction: 1.0,
-                    min_probe_clusters: 4,
-                    exact_plan: false,
-                    located: LocatedPath::Off,
-                    ..Default::default()
-                });
-            let fruit = crate::vector::router::with_test_clusters(candidates, || {
-                searcher.search(filter, &collector)
-            })
-            .unwrap_or_else(|error| {
+            let params = ProbeParams {
+                max_probe: usize::MAX,
+                min_probe_clusters: 4,
+                exact_plan: false,
+                located: LocatedPath::Off,
+                ..Default::default()
+            };
+            let builder = TopDocsByVectorSimilarityBuilder::new(field, query.clone(), DOCS + 1)
+                .with_probe_params(params.clone());
+            let weight = filter.weight(crate::query::EnableScoring::disabled_from_searcher(
+                &searcher,
+            ))?;
+            let ordinal = searcher
+                .segment_readers()
+                .iter()
+                .position(|r| r.segment_id() == segment.segment_id())
+                .unwrap() as u32;
+            let segments = [crate::vector::VectorSegment::from((ordinal, segment))];
+            let budget =
+                crate::vector::VectorSearchBudget::for_segments(field, &params, &segments)?;
+            let scan_preparation = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+            let candidates: Vec<_> = candidates
+                .into_iter()
+                .map(|c| crate::vector::Candidate {
+                    sim: c.sim,
+                    node: (ordinal, c.node),
+                })
+                .collect();
+            let collector = builder.build(scan_preparation.with_candidates(candidates, None)?);
+            let fruit = searcher.search(filter, &collector).unwrap_or_else(|error| {
                 panic!(
                     "{metric:?} {schedule:?} cluster={clusters:?} row=all column=layer0 probe: \
                      {error}"
@@ -540,8 +587,8 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
             let mut pruned_dead = 0;
             let mut pruned_filter = 0;
             for &cluster in &clusters {
-                for row in ivf.cluster_range(cluster) {
-                    let doc = row_docs[row];
+                for row in 0..ivf.cluster_num_rows(cluster)? {
+                    let doc = row_docs[cluster][row];
                     let original = originals[doc as usize];
                     let live = segment
                         .alive_bitset()
@@ -578,12 +625,9 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                     "cluster={clusters:?} row=all column=layer{layer} coverage"
                 );
                 for &(row, doc, bits) in trace {
-                    let cluster = (0..4)
-                        .find(|&c| ivf.cluster_range(c).contains(&row))
-                        .unwrap();
-                    let local = row - ivf.cluster_range(cluster).start;
+                    let (cluster, local) = (row.block as usize, row.row as usize);
                     assert_eq!(
-                        doc, row_docs[row],
+                        doc, row_docs[cluster][local],
                         "cluster={cluster} row={local} column=DocIds layer{layer}"
                     );
                     let encoded = &encodings[cluster];
@@ -594,7 +638,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                         )
                         .score();
                     let norm = encoded.residual_norms_squared[local];
-                    let base = if metric == Metric::L2 {
+                    let base = if metric.scores_by_distance() {
                         score - norm
                     } else {
                         score
@@ -610,7 +654,7 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
                             l,
                             &e.codes[local * stride..(local + 1) * stride],
                             e.scales[local],
-                            (metric == Metric::L2).then(|| e.constants[local]),
+                            metric.scores_by_distance().then(|| e.constants[local]),
                             raw,
                             score,
                             norm,
@@ -669,11 +713,6 @@ fn verify_case(metric: Metric, schedule: &[u8], probe: bool) -> crate::Result<()
     Ok(())
 }
 
-
-
-
-
-
 #[test]
 fn diagnostic_schedules_ignore_rotation_seeds() -> crate::Result<()> {
     use crate::vector::diagnostics::{VectorEstimatorQuery, VectorEstimatorSource};
@@ -721,7 +760,7 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     let searcher = reader.searcher();
     let segment = &searcher.segment_readers()[0];
     let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    assert!(vectors.index().unwrap().cluster_range(0).is_empty());
+    assert!((0..vectors.index().unwrap().cluster_num_rows(0)?).is_empty());
     let queries = vectors
         .sample_estimator_pseudo_queries(3, segment.alive_bitset())?
         .unwrap();
@@ -765,16 +804,25 @@ fn diagnostics_skip_empty_clusters() -> crate::Result<()> {
     Ok(())
 }
 
+/// A plain source maps target documents through its cluster DocIds columns, reading nothing else;
+/// a quantized source maps them through its document-ordered rows and reads no cluster column.
 #[test]
 fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
+    for schedule in [&[][..], &[1, 4][..]] {
+        merge_source_addresses_case(schedule)?;
+    }
+    Ok(())
+}
+
+fn merge_source_addresses_case(schedule: &[u8]) -> crate::Result<()> {
     use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
-    let (index, directory) = fixture(Metric::Cosine, &[1, 4])?;
+    let (index, directory) = fixture(Metric::Cosine, schedule)?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let segments = searcher.segment_readers();
     let segment = &segments[0];
     let vectors = segment.vector_index(index.schema().get_field("embedding")?)?;
-    let ranges = doc_column_ranges(&vectors, &directory)?;
+    let (ranges, offsets) = doc_column_ranges(&vectors, &directory)?;
     let docs: Vec<_> = (0..segment.max_doc())
         .filter(|&doc| {
             segment
@@ -799,24 +847,45 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
     directory.reads.lock().unwrap().clear();
     let rows = crate::vector::write::merge_source_rows(&context, &[Arc::clone(&vectors)])?;
     let reads = directory.reads.lock().unwrap().clone();
-    let expected: Vec<_> = ranges.into_iter().flatten().collect();
+    let expected: Vec<_> = if schedule.is_empty() {
+        ranges.into_iter().flatten().collect()
+    } else {
+        Vec::new()
+    };
     assert_eq!(
         reads
             .iter()
             .map(|(_, range)| range.clone())
+            .filter(|range| !offsets.contains(range))
             .collect::<Vec<_>>(),
-        expected
+        expected,
+        "{schedule:?}"
     );
     assert_eq!(rows.len(), docs.len());
     for (source, target) in rows.into_iter().zip(docs) {
         match source {
             Some(source) => {
                 assert_eq!(source.segment_ord, 0);
+                if schedule.is_empty() {
+                    assert_eq!(
+                        vectors.doc_id_at(source.block_address)?,
+                        target.doc_id,
+                        "row={} column=DocIds",
+                        source.block_address.row
+                    );
+                } else {
+                    assert_eq!(
+                        vectors.exact_location(target.doc_id)?,
+                        Some(source.block_address),
+                        "doc={} ExactRows",
+                        target.doc_id
+                    );
+                }
                 assert_eq!(
-                    vectors.doc_id_at(source.row_id)?,
-                    target.doc_id,
-                    "row={} column=DocIds",
-                    source.row_id
+                    vectors.vector_bytes_for_row(source.block_address)?,
+                    vectors.vector_bytes(target.doc_id)?.unwrap(),
+                    "doc={}",
+                    target.doc_id
                 );
             }
             None => assert!(!vectors.contains(target.doc_id)?),
@@ -829,20 +898,26 @@ fn merge_source_addresses_read_only_document_columns() -> crate::Result<()> {
 fn doc_column_ranges(
     vectors: &crate::vector::VectorIndexReader,
     directory: &PagedDirectory,
-) -> crate::Result<Vec<Option<std::ops::Range<usize>>>> {
+) -> crate::Result<(
+    Vec<Option<std::ops::Range<usize>>>,
+    Vec<std::ops::Range<usize>>,
+)> {
     let mut docs = Vec::new();
     let mut ranges = Vec::new();
+    let mut offsets = Vec::new();
     for cluster in 0..vectors.index().unwrap().num_clusters() {
         directory.reads.lock().unwrap().clear();
         vectors.read_doc_ids(cluster, &mut docs)?;
-        let reads = directory.reads.lock().unwrap();
-        assert_eq!(
-            reads.len(),
-            usize::from(!docs.is_empty()),
-            "cluster={cluster} column=DocIds"
-        );
-        ranges.push(reads.first().map(|(_, range)| range.clone()));
+        let mut reads: Vec<_> = directory
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, range)| range.clone())
+            .collect();
+        ranges.push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
+        offsets.extend(reads);
     }
     directory.reads.lock().unwrap().clear();
-    Ok(ranges)
+    Ok((ranges, offsets))
 }

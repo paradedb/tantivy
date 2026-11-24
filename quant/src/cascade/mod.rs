@@ -1,10 +1,9 @@
 //! Residual quantization cascade and layer-boundary operations: the shared schedule types,
 //! encoding, query preparation and the error-model audits.
 
-use std::borrow::Cow;
-
 use crate::model::Grid;
 use crate::rotation::Rotation as FhtRotation;
+use crate::sign::words_from_le_bytes as aligned_le_words;
 
 mod audit;
 mod encode;
@@ -36,14 +35,14 @@ pub const GAMMA_MIN: f32 = 1.0;
 pub const GAMMA_MAX: f32 = 4.0;
 
 /// Tagged encoder/scorer contract, independent of the numeric code width.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LayerKind {
     Sign,
     Grid,
 }
 
 /// Pins the complete rotation construction; semantic changes require a new variant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Rotation {
     None,
     SeededFhtChaCha8 { seed: u64 },
@@ -59,7 +58,7 @@ impl Rotation {
 }
 
 /// Quantization parameters resolved from a segment's explicit tags.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LayerSpec {
     /// Encoder and scorer contract.
     pub kind: LayerKind,
@@ -128,40 +127,10 @@ fn words_to_bytes(words: &[u64]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-#[inline]
-fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
-    assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
-
-    #[cfg(target_endian = "little")]
-    {
-        // SAFETY: `align_to` validates alignment; empty prefix and suffix gate borrowing.
-        let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
-        if prefix.is_empty()
-            && suffix.is_empty()
-            && words.len() == bytes.len() / std::mem::size_of::<u64>()
-        {
-            return Cow::Borrowed(words);
-        }
-    }
-
-    Cow::Owned(decode_le_words(bytes))
-}
-
-fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
-    assert_eq!(bytes.len() % 8, 0);
-    bytes
-        .chunks(8)
-        .map(|chunk| {
-            let bytes: [u8; 8] = chunk
-                .try_into()
-                .expect("chunk size is fixed at eight bytes");
-            u64::from_le_bytes(bytes)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 

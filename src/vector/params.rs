@@ -1,4 +1,4 @@
-//! Query-time probe parameters: the work budget, the located path and the recall targets.
+//! Query-time probe parameters: the work budget and the located path.
 
 use crate::vector::search::source::controller::open_share;
 
@@ -17,17 +17,28 @@ pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
 /// provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct ProbeParams {
-    /// Work ceiling as a fraction of each segment's capacity. Default 0.01.
-    pub max_probe_fraction: f32,
-    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 16.
+    /// Stop probing when competitive-candidate admission has decayed.
+    pub adaptive_probing: Option<AdaptiveProbeParams>,
+    /// Global work ceiling in average-cluster units. Default 100.
+    pub max_probe: usize,
+    /// Approximate members retained per requested cluster by the quantized router.
+    /// Fractional values are rounded up to whole candidates and clamped to at
+    /// least 1.0. A factor of 1.0 still reranks exactly; it only removes padding.
+    /// Does not widen list selection. Default 1.0.
+    pub router_rerank_factor: f32,
+    /// Minimum fraction of each quantized router level's lists to open.
+    /// Clamped to [0, 1]; non-finite values use 0.25. Full-precision routing
+    /// keeps its existing beam. Default 0.5.
+    pub router_min_beam_fraction: f32,
+    /// Whether stacked routing may stop after lists cease improving its heap.
+    /// Quantized routing observes its approximate padded heap. Default true.
+    pub router_aps: bool,
+    /// Ranks every centroid of every routed segment exactly, from the segment's raw centroid
+    /// rows, in place of its stored router. A diagnostic for measuring a stored router against
+    /// the exhaustive ranking under the same `k` and budget. Default false.
+    pub router_flat: bool,
+    /// Floor on the resolved budget, in work units, applied before the capacity cap. Default 0.
     pub min_probe_clusters: usize,
-    /// Recall target for the stacked router's ranking, in `(0, 1]`; `1.0` routes with the fixed
-    /// nprobe fractions. Forced to `1.0` above 128 dimensions. Default [`DEFAULT_ROUTER_RECALL`].
-    pub router_recall_target: f32,
-    /// Recall target for each segment's cluster scan, in `(0, 1]`, estimated by the Quake APS;
-    /// `1.0` leaves the budget as the only bound. Stacked-router segments only; forced to `1.0`
-    /// above 128 dimensions. Default `1.0`.
-    pub recall_target: f32,
     /// Lets a quantized segment score a cluster's rows exactly before the exact phase when that
     /// reads strictly fewer storage blocks (bytes without block geometry) than the cheaper
     /// quantized read. Exact rows join the pruning bound as zero-width intervals. Default `true`.
@@ -40,6 +51,20 @@ pub struct ProbeParams {
     pub fixed_probe_cost_rows: f64,
 }
 
+/// Admission-rate stopping within the fixed routing and work budgets.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveProbeParams {
+    pub admission_fraction: f64,
+}
+
+impl Default for AdaptiveProbeParams {
+    fn default() -> Self {
+        Self {
+            admission_fraction: 0.0001,
+        }
+    }
+}
+
 /// Which segments take the located path: a segment whose filter matches at most a cap of
 /// documents, deleted ones included, skips routing and scores every match, located through the
 /// document location map.
@@ -50,9 +75,9 @@ pub enum LocatedPath {
     Off,
     /// The cap is `floor(selectivity * max_doc)`.
     MaxSelectivity(Selectivity),
-    /// The cap is the rows the segment's routed work budget buys with no cluster opened,
-    /// `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than routing may
-    /// score is located instead.
+    /// The cap is the rows the segment's size share of the global budget buys with no cluster
+    /// opened, `floor(budget * n_avg / (1 - x))`: a filter matching no more documents than
+    /// routing may score is located instead.
     Auto,
 }
 
@@ -75,21 +100,19 @@ impl Selectivity {
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
-            max_probe_fraction: 0.01,
-            min_probe_clusters: MIN_PROBE_CLUSTERS,
-            router_recall_target: DEFAULT_ROUTER_RECALL,
-            recall_target: 1.0,
+            adaptive_probing: None,
+            max_probe: 100,
+            router_rerank_factor: 1.0,
+            router_min_beam_fraction: 0.5,
+            router_aps: true,
+            router_flat: false,
+            min_probe_clusters: 0,
             exact_plan: true,
             located: LocatedPath::Auto,
             fixed_probe_cost_rows: DEFAULT_FIXED_PROBE_COST_ROWS,
         }
     }
 }
-
-pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
-
-/// Default [`ProbeParams::router_recall_target`].
-pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
 
 impl ProbeParams {
     /// The number of clusters the stacked router is asked to rank for a
@@ -101,7 +124,7 @@ impl ProbeParams {
     /// `budget / open_share` as the filter approaches empty. The count is
     /// floored at `min_probe_clusters` and capped at the segment's cluster
     /// count. There is no headroom: when ranked clusters run smaller than
-    /// average or the bounds gate skips some, the ranking can run out
+    /// average, the ranking can run out
     /// before the budget and the scan ends `Exhausted`.
     ///
     /// * `open_share` (`f64`) — the per-index open share `x`.
@@ -128,19 +151,27 @@ impl ProbeParams {
 impl ProbeParams {
     /// The segment's work budget with the pricing it was resolved under, `(budget, n_avg, x)`.
     ///
-    /// The budget is `max_probe_fraction` of the segment's capacity in work units, floored at
-    /// `min_probe_clusters` and capped at the capacity; `n_avg` is the docs per cluster and `x` the
-    /// open share. `native_docs_in_segment` counts distinct docs with a vector, as written. A
-    /// non-positive `max_probe_fraction` or a non-finite or non-positive `fixed_probe_cost_rows` is
-    /// an error.
+    /// The absolute `max_probe` budget is floored at `min_probe_clusters` and capped at the
+    /// capacity; `n_avg` is the rows per cluster and `x` the open share. `rows_in_segment` counts
+    /// the rows across the segment's clusters, a replicated segment's second copies included, so a
+    /// cluster's rows cost the same share of the capacity whether or not the segment replicates. A
+    /// zero
+    /// `max_probe` or a non-finite or non-positive `fixed_probe_cost_rows` is an error.
     pub(crate) fn resolved_work_budget(
         &self,
         clusters_in_segment: usize,
-        native_docs_in_segment: usize,
+        rows_in_segment: usize,
     ) -> crate::Result<(f64, f64, f64)> {
-        if !(self.max_probe_fraction > 0.0) {
+        if self.adaptive_probing.is_some_and(|p| {
+            !p.admission_fraction.is_finite() || !(0.0..=1.0).contains(&p.admission_fraction)
+        }) {
             return Err(crate::TantivyError::InvalidArgument(
-                "max_probe_fraction must be greater than 0".to_string(),
+                "adaptive admission fraction must be finite and between zero and one".into(),
+            ));
+        }
+        if self.max_probe == 0 {
+            return Err(crate::TantivyError::InvalidArgument(
+                "max_probe must be greater than 0".to_string(),
             ));
         }
         if !(self.fixed_probe_cost_rows.is_finite() && self.fixed_probe_cost_rows > 0.0) {
@@ -148,14 +179,12 @@ impl ProbeParams {
                 "fixed_probe_cost_rows must be finite and greater than 0".to_string(),
             ));
         }
-        let n_avg = native_docs_in_segment as f64 / clusters_in_segment.max(1) as f64;
+        let n_avg = rows_in_segment as f64 / clusters_in_segment.max(1) as f64;
         // The unit identity (1 unit = x + (1 - x); exhaustive scan = C units) holds for any x.
         let x = open_share(self.fixed_probe_cost_rows, n_avg);
         let segment_units = clusters_in_segment as f64 * x
-            + (1.0 - x) * native_docs_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
-        let budget = (self.max_probe_fraction as f64 * segment_units)
-            .max(self.min_probe_clusters as f64)
-            .min(segment_units);
+            + (1.0 - x) * rows_in_segment as f64 / n_avg.max(f64::MIN_POSITIVE);
+        let budget = (self.max_probe.max(self.min_probe_clusters) as f64).min(segment_units);
         Ok((budget, n_avg, x))
     }
 }
@@ -164,14 +193,39 @@ impl ProbeParams {
 mod tests {
     use super::ProbeParams;
 
-    /// Capacity is the cluster count, exactly, whatever the granularity:
-    /// `units_seg = C*x + (1 - x)*N/n_avg == C` for every x the open
-    /// share can resolve to. That identity is what lets `f` keep meaning
-    /// "this fraction of the index's work" at any granularity.
+    #[test]
+    fn adaptive_stopping_preserves_budget_and_routing() -> crate::Result<()> {
+        for budget in [1, 20, 250, 1000] {
+            for min_probe_clusters in [0, 10] {
+                let fixed = ProbeParams {
+                    max_probe: budget,
+                    min_probe_clusters,
+                    ..Default::default()
+                };
+                let adaptive = ProbeParams {
+                    adaptive_probing: Some(super::AdaptiveProbeParams::default()),
+                    ..fixed.clone()
+                };
+                for (clusters, rows) in [(2, 40), (1000, 20_000)] {
+                    let budget = fixed.resolved_work_budget(clusters, rows)?;
+                    assert_eq!(budget, adaptive.resolved_work_budget(clusters, rows)?);
+                    for selectivity in [0.0, 0.001, 0.01, 0.1, 1.0] {
+                        assert_eq!(
+                            fixed.router_k(budget.0, budget.2, selectivity, clusters),
+                            adaptive.router_k(budget.0, budget.2, selectivity, clusters),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Exhaustive work is the cluster count at every granularity.
     #[test]
     fn capacity_is_the_cluster_count() -> crate::Result<()> {
         let all = ProbeParams {
-            max_probe_fraction: 1.0,
+            max_probe: usize::MAX,
             min_probe_clusters: 1,
             ..Default::default()
         };
@@ -179,46 +233,32 @@ mod tests {
             let (budget, _n_avg, _x) = all.resolved_work_budget(clusters, docs)?;
             assert!(
                 (budget - clusters as f64).abs() <= 1e-9 * clusters as f64,
-                "f=1 must buy exactly C units at C={clusters}, N={docs}: {budget}"
+                "an exhaustive budget must buy exactly C units at C={clusters}, N={docs}: {budget}"
             );
         }
         Ok(())
     }
 
-    /// The fraction scales the capacity, the floor lifts small segments,
-    /// and the capacity caps both.
     #[test]
-    fn budget_resolves_against_capacity() -> crate::Result<()> {
+    fn budget_is_absolute_and_capped_by_capacity() -> crate::Result<()> {
         let params = ProbeParams {
-            max_probe_fraction: 0.25,
+            max_probe: 10,
             ..Default::default()
         };
-        // A quarter of the capacity - well above the floor.
-        let (budget, _, _) = params.resolved_work_budget(1000, 20_000)?;
-        assert!((budget - 250.0).abs() < 1e-6, "{budget}");
-        // A fraction resolving below MIN_PROBE_CLUSTERS is lifted to it...
-        let (budget, _, _) = params.resolved_work_budget(40, 800)?;
-        assert!(
-            (budget - super::MIN_PROBE_CLUSTERS as f64).abs() < 1e-6,
-            "{budget}"
-        );
-        // ...but the floor never exceeds the capacity.
-        let (budget, _, _) = params.resolved_work_budget(2, 40)?;
-        assert!((budget - 2.0).abs() < 1e-6, "{budget}");
-        // A fraction above 1.0 clamps to the capacity - small segments
-        // scan exhaustively.
-        let all = ProbeParams {
-            max_probe_fraction: 2.0,
-            ..Default::default()
+        for (clusters, rows, expected) in [(1000, 20_000, 10.0), (40, 800, 10.0), (2, 40, 2.0)] {
+            let (budget, _, _) = params.resolved_work_budget(clusters, rows)?;
+            assert!((budget - expected).abs() < 1e-9);
+        }
+        let minimum = ProbeParams {
+            max_probe: 1,
+            ..params
         };
-        let (budget, _, _) = all.resolved_work_budget(10, 200)?;
-        assert!((budget - 10.0).abs() < 1e-6, "{budget}");
+        assert_eq!(minimum.resolved_work_budget(1000, 20_000)?.0, 1.0);
         Ok(())
     }
 
     /// Unfiltered, the stacked router is asked for the budget; a selective
-    /// filter stretches it toward `budget / open_share`. Either way it is
-    /// lifted to the probe floor and capped at the segment's clusters.
+    /// filter stretches it toward `budget / open_share`, capped at the segment's clusters.
     #[test]
     fn router_k_tracks_budget_and_filter_selectivity() {
         let params = ProbeParams::default();
@@ -229,25 +269,21 @@ mod tests {
         assert_eq!(params.router_k(20.0, x, 0.5, 1000), 34);
         // Nothing matches: only opens charge.
         assert_eq!(params.router_k(20.0, x, 0.0, 1000), 100);
-        assert_eq!(
-            params.router_k(2.0, x, 1.0, 1000),
-            super::MIN_PROBE_CLUSTERS
-        );
+        assert_eq!(params.router_k(2.0, x, 1.0, 1000), 2);
+        assert_eq!(params.router_k(0.01, x, 1.0, 1000), 1);
         assert_eq!(params.router_k(20.0, x, 1.0, 18), 18);
         assert_eq!(params.router_k(20.0, 0.0, 0.0, 1000), 1000);
         assert_eq!(params.router_k(0.0, x, 1.0, 0), 1);
     }
 
-    /// A non-positive probe fraction or a non-finite or non-positive open cost is an error.
+    /// Budgets and open costs must be finite and positive.
     #[test]
     fn invalid_budget_params_error() {
-        for fraction in [0.0, -1.0] {
-            let params = ProbeParams {
-                max_probe_fraction: fraction,
-                ..Default::default()
-            };
-            assert!(params.resolved_work_budget(9, 180).is_err());
-        }
+        let params = ProbeParams {
+            max_probe: 0,
+            ..Default::default()
+        };
+        assert!(params.resolved_work_budget(9, 180).is_err());
         for cost in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let params = ProbeParams {
                 fixed_probe_cost_rows: cost,

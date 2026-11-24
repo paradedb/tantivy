@@ -3,11 +3,11 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::BitSet;
 
-use crate::collector::TopDocs;
+use crate::collector::{SharedThresholdArcOpt, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{
@@ -23,27 +23,40 @@ use crate::vector::clustering::{
 };
 use crate::vector::params::ProbeParams;
 use crate::vector::router::candidate::Candidate;
-use crate::vector::router::with_test_clusters;
+use crate::vector::router::RouterMetrics;
+use crate::vector::search::input::PreparedVectorSearch;
 use crate::vector::search::prepared::{QuantizedQueryCtx, VectorQuery};
+use crate::vector::search::scan::bound::TopK;
 use crate::vector::search::scan::plan::PlanOverride;
 use crate::vector::search::scan::ScanTrace;
-use crate::vector::search::segment::plan::SegmentPlan;
+use crate::vector::search::segment::plan::ScanInput;
 use crate::vector::search::SegmentSearcher;
+use crate::vector::stats::SegmentReport;
 use crate::vector::storage::centroids::ClusterIndex;
 use crate::vector::storage::io::test_support::{with_unarmed_log, PagedDirectory};
+use crate::vector::storage::quantized::ReadScratch;
+use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::tests::TestVectorIndex;
 use crate::vector::{
-    ProbeStats, RouterKind, VectorQuantizationConfig, VectorQuantizationLayer,
-    VectorSimilarityFruit, VectorStage,
+    BlockAddress, ProbeStats, RouterKind, TopClustersBySimilarityCollector,
+    VectorQuantizationConfig, VectorQuantizationLayer, VectorScanInputs, VectorSearchBudget,
+    VectorSegment, VectorSimilarityFruit, VectorStage,
 };
-use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument};
+use crate::{
+    DocAddress, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal, SegmentReader,
+    TantivyDocument,
+};
 
 // --- Segment searcher ---
 
-/// One segment's searcher and the arguments a search passes it.
+/// A segment and its source-test search parameters.
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentRun<'a> {
-    pub(crate) searcher: &'a SegmentSearcher<f32>,
+    pub(crate) field: Field,
+    pub(crate) ordinal: SegmentOrdinal,
+    pub(crate) reader: &'a VectorIndexReader,
+    pub(crate) params: &'a ProbeParams,
+    pub(crate) routing: Option<&'a TestRouting>,
     pub(crate) index: &'a ClusterIndex,
     pub(crate) weight: &'a dyn Weight,
     pub(crate) segment: &'a SegmentReader,
@@ -51,23 +64,47 @@ pub(crate) struct SegmentRun<'a> {
 }
 
 impl SegmentRun<'_> {
-    /// The segment's search plan.
-    pub(crate) fn plan(&self) -> crate::Result<SegmentPlan> {
-        SegmentPlan::build(
-            self.searcher.params(),
-            self.index,
-            self.weight,
-            self.segment,
+    pub(crate) fn input(&self) -> crate::Result<Option<ScanInput>> {
+        let segments = [VectorSegment::from((self.ordinal, self.segment))];
+        let budget = VectorSearchBudget::for_segments(self.field, self.params, &segments)?;
+        let prepared = PreparedVectorSearch::prepare(
+            self.field,
             self.top_n,
+            self.params,
+            self.weight,
+            &segments,
+            budget,
+            |_| {},
+        )?;
+        Ok(prepared.segments.into_iter().next().and_then(|s| s.scan))
+    }
+}
+
+impl<T: crate::vector::VectorElement> SegmentSearcher<T> {
+    pub(crate) fn with_test_candidates(self, inputs: &VectorScanInputs) -> Self {
+        let ordinal = self.segment_ord();
+        self.with_candidates(
+            inputs
+                .candidates
+                .iter()
+                .filter(|c| c.node.0 == ordinal)
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.1,
+                })
+                .collect(),
+            inputs.routing_stats.get(&ordinal).map(|s| s.metrics),
         )
     }
 }
 
 // --- Clusterer ---
 
-/// Trains exactly the given centroids and assigns each vector to its L2-nearest one, first wins.
+/// Trains exactly the given centroids and assigns each vector to its L2-nearest one, first wins;
+/// with `pairs`, also the SOAR secondary by brute force, else the trait's default pairs.
 pub(crate) struct NearestClusterer {
     pub(crate) centroids: Vec<Vec<f32>>,
+    pub(crate) pairs: bool,
 }
 
 impl IvfClusterer for NearestClusterer {
@@ -102,6 +139,73 @@ impl IvfClusterer for NearestClusterer {
             }
         })?;
         Ok(assignments)
+    }
+
+    /// The nearest centroid and the SOAR secondary over every centroid, by brute force; without
+    /// `pairs`, what the trait's default yields.
+    fn assign_pairs(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        centroids: &IvfCentroids,
+        lambda: f32,
+    ) -> crate::Result<Vec<(u32, Option<u32>)>> {
+        if !self.pairs {
+            return Ok(self
+                .assign(options, source, centroids)?
+                .into_iter()
+                .map(|cluster| (cluster, None))
+                .collect());
+        }
+        let dim = options.dim();
+        let num_rows = source.num_rows();
+        let IvfCentroids::F32(_) = centroids;
+        let mut pairs = Vec::with_capacity(num_rows);
+        for_each_batch(source, num_rows, |IvfTrainingVectors::F32(batch)| {
+            for vector in batch.matrix.values.chunks_exact(dim) {
+                let distances: Vec<f32> = self
+                    .centroids
+                    .iter()
+                    .map(|centroid| {
+                        vector
+                            .iter()
+                            .zip(centroid)
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum::<f32>()
+                    })
+                    .collect();
+                let primary = nearest(vector, &self.centroids);
+                if self.centroids.len() == 1 {
+                    pairs.push((primary as u32, None));
+                    continue;
+                }
+                // The unit residual to the primary, zero on the centroid itself.
+                let mut residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&self.centroids[primary])
+                    .map(|(a, b)| a - b)
+                    .collect();
+                let norm = residual.iter().map(|v| v * v).sum::<f32>().sqrt();
+                for v in &mut residual {
+                    *v = if norm > 0.0 { *v / norm } else { 0.0 };
+                }
+                let along: f32 = vector.iter().zip(&residual).map(|(a, b)| a * b).sum();
+                let mut best: Option<(f32, u32)> = None;
+                for (index, centroid) in self.centroids.iter().enumerate() {
+                    if index == primary {
+                        continue;
+                    }
+                    let projection: f32 = residual.iter().zip(centroid).map(|(a, b)| a * b).sum();
+                    let gap = along - projection;
+                    let cost = distances[index] + lambda * gap * gap;
+                    if best.is_none_or(|(least, _)| cost < least) {
+                        best = Some((cost, index as u32));
+                    }
+                }
+                pairs.push((primary as u32, best.map(|(_, second)| second)));
+            }
+        })?;
+        Ok(pairs)
     }
 }
 
@@ -167,6 +271,10 @@ pub(crate) struct FixtureSpec {
     /// Quantization layer bits; empty for full precision.
     pub(crate) schedule: Vec<u8>,
     pub(crate) paged: bool,
+    /// Whether quantized clustered segments assign every vector to a second cluster as well.
+    pub(crate) replicated: bool,
+    /// Whether the clusterer answers `assign_pairs` itself; otherwise the trait's default does.
+    pub(crate) pairs: bool,
     pub(crate) router: RouterKind,
     /// Segments after the build. IVF layouts write two flat segments per IVF segment and merge
     /// them pairwise.
@@ -187,7 +295,11 @@ impl FixtureSpec {
             layout: Layout::Ivf(centroids),
             schedule: Vec::new(),
             paged: false,
-            router: RouterKind::Stacked,
+            replicated: false,
+            pairs: true,
+            // Exact: small fixtures have few lists; Stacked's hard 25% top prune
+            // cannot open them all, so oracle/exhaustive tests would be invalid.
+            router: RouterKind::Exact,
             segments: 1,
             deletes: Vec::new(),
         }
@@ -204,10 +316,9 @@ impl FixtureSpec {
         let vectors = (0..docs)
             .map(|ordinal| {
                 let mut rng = Lcg(ordinal as u64 * 7919 + 13);
-                let scale = if metric == Metric::Dot {
-                    0.5 + (ordinal % 7) as f32 * 0.15
-                } else {
-                    1.0
+                let scale = match metric {
+                    Metric::Dot => 0.5 + (ordinal % 7) as f32 * 0.15,
+                    Metric::L2 | Metric::Cosine => 1.0,
                 };
                 centroid(ordinal % clusters)
                     .iter()
@@ -229,7 +340,9 @@ impl FixtureSpec {
             layout: Layout::Flat,
             schedule: Vec::new(),
             paged: false,
-            router: RouterKind::Stacked,
+            replicated: false,
+            pairs: true,
+            router: RouterKind::Exact,
             segments: 1,
             deletes: Vec::new(),
         }
@@ -242,6 +355,17 @@ impl FixtureSpec {
 
     pub(crate) fn paged(mut self) -> Self {
         self.paged = true;
+        self
+    }
+
+    pub(crate) fn replicated(mut self) -> Self {
+        self.replicated = true;
+        self
+    }
+
+    /// A clusterer without an `assign_pairs` of its own.
+    pub(crate) fn nearest_only(mut self) -> Self {
+        self.pairs = false;
         self
     }
 
@@ -325,6 +449,7 @@ impl FixtureSpec {
         let settings = IndexSettings {
             vector_clustering_threshold: if ivf { 1 } else { usize::MAX },
             vector_quantization: self.quantization(),
+            vector_replication: if self.replicated { 2 } else { 1 },
             ..IndexSettings::default()
         };
         let directory = self.paged.then(PagedDirectory::default);
@@ -333,6 +458,7 @@ impl FixtureSpec {
             builder = builder
                 .ivf_clusterer(Arc::new(NearestClusterer {
                     centroids: centroids.clone(),
+                    pairs: self.pairs,
                 }))
                 .ivf_router(self.router);
         }
@@ -407,6 +533,26 @@ impl From<TestVectorIndex> for Fixture {
 
 // --- Running ---
 
+pub(crate) struct TestRouting {
+    clusters: Vec<Candidate>,
+    metrics: RouterMetrics,
+}
+
+impl TestRouting {
+    pub(crate) fn ranked_clusters(&self) -> crate::vector::router::RouterIter {
+        crate::vector::router::RouterIter::new(
+            self.clusters
+                .iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.into(),
+                })
+                .collect(),
+            self.metrics,
+        )
+    }
+}
+
 impl Fixture {
     /// A filter on one label.
     pub(crate) fn filter(&self, label: &str) -> TermQuery {
@@ -424,10 +570,49 @@ impl Fixture {
         k: usize,
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
+        self.search_with(filter, query, k, 0, params, None)
+    }
+
+    /// Searches every segment through the collector, scanning at most `levels` quantized layers;
+    /// zero scores every admitted row exactly.
+    pub(crate) fn search_levels(
+        &self,
+        filter: &dyn Query,
+        query: &[f32],
+        k: usize,
+        params: ProbeParams,
+        levels: usize,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let searcher = self.index.reader()?.searcher();
         let collector = TopDocs::with_limit(k)
             .order_by_similarity(self.field, query.to_vec())
+            .with_probe_params(params)
+            .with_max_scan_levels(levels)
+            .build_for_searcher(&searcher, filter)?;
+        searcher.search(filter, &collector)
+    }
+
+    /// Searches every segment through the collector for the window `offset..offset + limit`,
+    /// sharing every scan's threshold through `slot` when given.
+    pub(crate) fn search_with(
+        &self,
+        filter: &dyn Query,
+        query: &[f32],
+        limit: usize,
+        offset: usize,
+        params: ProbeParams,
+        slot: SharedThresholdArcOpt<Score>,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        let mut builder = TopDocs::with_limit(limit)
+            .and_offset(offset)
+            .order_by_similarity(self.field, query.to_vec())
             .with_probe_params(params);
-        self.index.reader()?.searcher().search(filter, &collector)
+        if let Some(slot) = slot {
+            builder = builder.with_shared_threshold(slot);
+        }
+        let searcher = self.index.reader()?.searcher();
+        let collector = builder.build_for_searcher(&searcher, filter)?;
+        searcher.search(filter, &collector)
     }
 
     /// Searches, probing `clusters` in that order instead of the router's ranking.
@@ -439,8 +624,30 @@ impl Fixture {
         k: usize,
         params: ProbeParams,
     ) -> crate::Result<VectorSimilarityFruit> {
-        let candidates = self.candidates(clusters, query)?;
-        with_test_clusters(candidates, || self.search(filter, query, k, params))
+        let searcher = self.index.reader()?.searcher();
+        let (ordinal, segment) = first_segment(&searcher);
+        let segments = [VectorSegment::from((ordinal, segment))];
+        let budget = VectorSearchBudget::for_segments(self.field, &params, &segments)?;
+        let builder = TopDocs::with_limit(k)
+            .order_by_similarity(self.field, query.to_vec())
+            .with_probe_params(params);
+        let weight = self.weight(filter)?;
+        let prepared = builder.prepare(weight.as_ref(), &segments, budget, |_| {})?;
+        let candidates: Vec<_> = self
+            .candidates(clusters, query)?
+            .into_iter()
+            .map(|c| Candidate {
+                sim: c.sim,
+                node: (ordinal, c.node),
+            })
+            .collect();
+        let collector = builder.build(prepared.with_candidates(candidates, None)?);
+        use crate::collector::Collector;
+        collector.merge_fruits(vec![collector.collect_segment(
+            weight.as_ref(),
+            ordinal,
+            segment,
+        )?])
     }
 
     /// Router candidates for `clusters`, keyed by the exact centroid similarity.
@@ -450,7 +657,7 @@ impl Fixture {
         query: &[f32],
     ) -> crate::Result<Vec<Candidate>> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let ivf = vectors.index().expect("IVF segment");
         let centroids = ivf.centroid_bytes()?;
         let stride = vectors.options().bytes_per_vector();
@@ -466,6 +673,43 @@ impl Fixture {
             .collect())
     }
 
+    fn scan_inputs(
+        &self,
+        segment: VectorSegment,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: &ProbeParams,
+        candidates: Option<Vec<Candidate>>,
+    ) -> crate::Result<VectorScanInputs> {
+        let builder =
+            crate::vector::TopDocsByVectorSimilarityBuilder::new(self.field, query.to_vec(), top_n)
+                .with_probe_params(params.clone());
+        let budget =
+            VectorSearchBudget::for_segments(self.field, params, std::slice::from_ref(&segment))?;
+        let prepared = builder.prepare(weight, std::slice::from_ref(&segment), budget, |_| {})?;
+        let router = TopClustersBySimilarityCollector::new(
+            self.field,
+            query.to_vec(),
+            params.clone(),
+            prepared.match_fraction(),
+        )?
+        .with_budget(prepared.budget());
+        let candidates: Vec<_> = match candidates {
+            Some(candidates) => candidates
+                .into_iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: (segment.ordinal, c.node),
+                })
+                .collect(),
+            None => router.collect_segments(&prepared.routing_segments(), |_| {})?,
+        };
+        Ok(prepared
+            .with_candidates(candidates, None)?
+            .with_routing_statistics(router.take_statistics()))
+    }
+
     /// Runs one segment's search directly, with any `top_n`, under `weight`.
     pub(crate) fn run_segment(
         &self,
@@ -477,15 +721,30 @@ impl Fixture {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
+        let inputs = self.scan_inputs(
+            VectorSegment::from((segment as u32, segment_reader)),
+            weight,
+            query,
+            top_n,
+            &params,
+            None,
+        )?;
+        let Some(prepared) = inputs.segments().first() else {
+            let (_, cap, totals) = &inputs.prepared.scope[&(segment as u32)];
+            return Ok((
+                Vec::new(),
+                ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
+            ));
+        };
         let backend = SegmentSearcher::<f32>::for_segment(
-            segment_reader,
-            segment as u32,
+            prepared.clone(),
             self.field,
-            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
+            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap()),
             None,
             params,
-        )?;
-        backend.top_n(weight, segment_reader, top_n)
+        )?
+        .with_test_candidates(&inputs);
+        backend.top_n(top_n)
     }
 
     /// Searches segment `segment` directly with the quantized query a collector prepares, every
@@ -498,13 +757,56 @@ impl Fixture {
         top_n: usize,
         params: ProbeParams,
         plan: Option<PlanOverride>,
+        admission_pruning: bool,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        self.run_planned_with(
+            segment,
+            weight,
+            query,
+            top_n,
+            params,
+            plan,
+            admission_pruning,
+            None,
+            None,
+        )
+    }
+
+    /// [`Fixture::run_planned`], seeding the scan from `collector_topk` when given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_planned_with(
+        &self,
+        segment: usize,
+        weight: &dyn Weight,
+        query: &[f32],
+        top_n: usize,
+        params: ProbeParams,
+        plan: Option<PlanOverride>,
+        admission_pruning: bool,
+        collector_topk: Option<Arc<Mutex<TopK>>>,
+        routing: Option<Vec<Candidate>>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = self.index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[segment];
-        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())));
+        let inputs = self.scan_inputs(
+            VectorSegment::from((segment as u32, segment_reader)),
+            weight,
+            query,
+            top_n,
+            &params,
+            routing,
+        )?;
+        let Some(prepared) = inputs.segments().first() else {
+            let (_, cap, totals) = &inputs.prepared.scope[&(segment as u32)];
+            return Ok((
+                Vec::new(),
+                ProbeStats::new(SegmentReport::Empty { located_cap: *cap }, totals.clone()),
+            ));
+        };
+        let query = Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec())).unwrap());
         let quantized = segment_reader
             .vector_index(self.field)?
-            .quantization()
+            .quantization()?
             .map(|field| {
                 let index = field.index_ctx();
                 Arc::new(QuantizedQueryCtx::with_depth(
@@ -514,19 +816,20 @@ impl Fixture {
                 ))
             });
         let mut backend = SegmentSearcher::<f32>::for_segment(
-            segment_reader,
-            segment as u32,
+            prepared.clone(),
             self.field,
             query,
             quantized,
             params,
-        )?;
+        )?
+        .with_test_candidates(&inputs);
         backend.plan_override = plan;
-        backend.top_n(weight, segment_reader, top_n)
+        backend.admission_pruning_disabled = !admission_pruning;
+        backend.collector_topk = collector_topk;
+        backend.top_n(top_n)
     }
 
-    /// Runs `run` over segment 0's full-precision searcher for `query` and `params`, with the
-    /// search arguments `filter` and `top_n`.
+    /// Runs `run` over the first segment's prepared source for the supplied search arguments.
     pub(crate) fn with_segment<R>(
         &self,
         filter: &dyn Query,
@@ -536,20 +839,35 @@ impl Fixture {
         run: impl FnOnce(&SegmentRun<'_>) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let searcher = self.index.reader()?.searcher();
-        let segment = &searcher.segment_readers()[0];
+        let (ordinal, segment) = first_segment(&searcher);
         let reader = segment.vector_index(self.field)?;
         let index = reader.index().expect("IVF segment");
         let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let backend = SegmentSearcher::<f32>::for_segment(
-            segment,
-            0,
-            self.field,
-            Arc::new(VectorQuery::new(self.metric, Arc::new(query.to_vec()))),
+        let inputs = self.scan_inputs(
+            VectorSegment::from((ordinal, segment)),
+            weight.as_ref(),
+            query,
+            top_n,
+            params,
             None,
-            params.clone(),
         )?;
+        let routing = inputs.routing_stats.get(&ordinal).map(|stats| TestRouting {
+            clusters: inputs
+                .candidates
+                .iter()
+                .map(|c| Candidate {
+                    sim: c.sim,
+                    node: c.node.1,
+                })
+                .collect(),
+            metrics: stats.metrics,
+        });
         run(&SegmentRun {
-            searcher: &backend,
+            routing: routing.as_ref(),
+            field: self.field,
+            ordinal,
+            reader: &reader,
+            params,
             index,
             weight: weight.as_ref(),
             segment,
@@ -641,6 +959,7 @@ impl Fixture {
     /// Forgets every logged request.
     pub(crate) fn clear_reads(&self) {
         self.log().reads.lock().unwrap().clear();
+        self.log().centroid_reads.lock().unwrap().clear();
     }
 
     /// The requests logged since the last clear.
@@ -648,38 +967,88 @@ impl Fixture {
         self.log().reads.lock().unwrap().clone()
     }
 
-    /// Byte ranges of segment 0's DocIds column requests and full-precision cluster spans, by
-    /// cluster; `None` for an empty cluster.
+    /// Requests to `.centroids`, kept separate because offsets are relative to that file.
+    pub(crate) fn centroid_reads(&self) -> ReadLog {
+        self.log().centroid_reads.lock().unwrap().clone()
+    }
+
+    /// Byte ranges of the first segment's DocIds column requests, full-precision cluster spans and
+    /// band-0 spans, by cluster, `None` for an empty cluster; and, for quantized storage, the span
+    /// of every document-ordered row.
     pub(crate) fn column_ranges(&self) -> crate::Result<ColumnRanges> {
         let searcher = self.index.reader()?.searcher();
-        let vectors = searcher.segment_readers()[0].vector_index(self.field)?;
+        let vectors = first_segment(&searcher).1.vector_index(self.field)?;
         let clusters = vectors.index().expect("IVF segment").num_clusters();
         let mut ranges = ColumnRanges::default();
         let mut docs = Vec::new();
+        let mut all_docs = Vec::new();
+        let payload = |fixture: &Self, ranges: &ColumnRanges| {
+            fixture
+                .reads()
+                .into_iter()
+                .map(|(_, range)| range)
+                .find(|range| !ranges.block_offsets.contains(range))
+        };
         for cluster in 0..clusters {
             self.clear_reads();
             vectors.read_doc_ids(cluster, &mut docs)?;
+            all_docs.extend_from_slice(&docs);
+            let mut reads: Vec<_> = self.reads().into_iter().map(|(_, range)| range).collect();
+            // Block boundaries precede the DocIds payload, which is absent for empty clusters.
             ranges
                 .docs
-                .push(self.reads().first().map(|(_, range)| range.clone()));
+                .push((!docs.is_empty()).then(|| reads.pop().expect("DocIds read")));
+            ranges.block_offsets.extend(reads);
             self.clear_reads();
-            if !docs.is_empty() {
+            if !docs.is_empty() && !vectors.has_exact_rows() {
                 vectors.read_cluster_rows(cluster)?;
             }
-            ranges
-                .rows
-                .push(self.reads().first().map(|(_, range)| range.clone()));
+            ranges.rows.push(payload(self, &ranges));
+            self.clear_reads();
+            if let (false, Some(quantized)) = (docs.is_empty(), vectors.quantization()?) {
+                quantized.layers()[0].read_batch_in_block(cluster, 0..docs.len())?;
+            }
+            ranges.bands.push(payload(self, &ranges));
+        }
+        self.clear_reads();
+        if vectors.has_exact_rows() && !all_docs.is_empty() {
+            // A replicated segment lists a document under both of its clusters.
+            all_docs.sort_unstable();
+            all_docs.dedup();
+            let mut scratch = ReadScratch::default();
+            vectors.read_exact_docs(&all_docs, &mut scratch)?;
+            let reads: Vec<_> = self
+                .reads()
+                .into_iter()
+                .map(|(_, range)| range)
+                .filter(|range| !ranges.block_offsets.contains(range))
+                .collect();
+            let start = reads
+                .iter()
+                .map(|range| range.start)
+                .min()
+                .expect("exact rows read");
+            let end = reads
+                .iter()
+                .map(|range| range.end)
+                .max()
+                .expect("exact rows read");
+            ranges.exact = Some(start..end);
         }
         self.clear_reads();
         Ok(ranges)
     }
 }
 
-/// Per-cluster byte ranges of the DocIds column and the full-precision rows.
+/// Per-cluster byte ranges of the DocIds column, the full-precision rows and the band-0 payload,
+/// and the span of the document-ordered rows of quantized storage.
 #[derive(Debug, Default)]
 pub(crate) struct ColumnRanges {
+    pub(crate) block_offsets: Vec<Range<usize>>,
     pub(crate) docs: Vec<Option<Range<usize>>>,
     pub(crate) rows: Vec<Option<Range<usize>>>,
+    pub(crate) bands: Vec<Option<Range<usize>>>,
+    pub(crate) exact: Option<Range<usize>>,
 }
 
 // --- Trace ---
@@ -690,26 +1059,41 @@ pub(crate) struct DocTrace {
     pub(crate) scored_docs: Vec<DocId>,
     pub(crate) boundary_docs: Vec<Vec<DocId>>,
     /// `(row, doc, estimate bits)` after admission and after each refining layer.
-    pub(crate) estimates: Vec<Vec<(usize, DocId, u32)>>,
+    pub(crate) estimates: Vec<Vec<(BlockAddress, DocId, u32)>>,
     pub(crate) exact_phase_docs: Vec<DocId>,
+    /// Documents scored exactly ahead of the rest of the shortlist: the best estimates, or the
+    /// adaptive refinement's picks.
+    pub(crate) refined_docs: Vec<DocId>,
 }
 
-/// Translates segment 0's trace rows of `field` in `index` into doc ids.
+/// The first segment and its ordinal: the one with the lowest id, which the per-segment helpers
+/// read. The searcher lists segments in the segment register's hash-map order, which differs
+/// between processes; test segment ids count up, so the lowest id is the same segment every run.
+pub(crate) fn first_segment(searcher: &Searcher) -> (SegmentOrdinal, &SegmentReader) {
+    let (ordinal, segment) = searcher
+        .segment_readers()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, segment)| segment.segment_id())
+        .expect("the index has a segment");
+    (ordinal as SegmentOrdinal, segment)
+}
+
+/// Translates the first segment's trace rows of `field` in `index` into doc ids.
 pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate::Result<DocTrace> {
     let searcher = index.reader()?.searcher();
-    let vectors = searcher.segment_readers()[0].vector_index(field)?;
+    let vectors = first_segment(&searcher).1.vector_index(field)?;
     let clusters = vectors.index().expect("IVF segment").num_clusters();
-    let docs: Vec<DocId> = with_unarmed_log(|| {
-        let mut all = Vec::new();
-        let mut cluster_docs = Vec::new();
-        for cluster in 0..clusters {
-            vectors.read_doc_ids(cluster, &mut cluster_docs)?;
-            all.extend_from_slice(&cluster_docs);
-        }
-        Ok::<_, crate::TantivyError>(all)
+    let docs: Vec<Vec<DocId>> = with_unarmed_log(|| {
+        (0..clusters)
+            .map(|cluster| vectors.cluster_doc_ids(cluster).map(Option::unwrap))
+            .collect::<crate::Result<_>>()
     })?;
-    let sorted = |rows: &[usize]| {
-        let mut out: Vec<DocId> = rows.iter().map(|&row| docs[row]).collect();
+    let sorted = |rows: &[BlockAddress]| {
+        let mut out: Vec<DocId> = rows
+            .iter()
+            .map(|address| docs[address.block as usize][address.row as usize])
+            .collect();
         out.sort_unstable();
         out
     };
@@ -725,16 +1109,17 @@ pub(crate) fn doc_trace(index: &Index, field: Field, trace: &ScanTrace) -> crate
             .iter()
             .map(|rows| {
                 rows.iter()
-                    .map(|&(row, bits)| (row, docs[row], bits))
+                    .map(|&(row, bits)| (row, docs[row.block as usize][row.row as usize], bits))
                     .collect()
             })
             .collect(),
         exact_phase_docs: sorted(&trace.exact_phase_rows),
+        refined_docs: sorted(&trace.refined_topk_rows),
     })
 }
 
 impl Fixture {
-    /// Translates segment 0's trace rows into doc ids.
+    /// Translates the first segment's trace rows into doc ids.
     pub(crate) fn doc_trace(&self, trace: &ScanTrace) -> crate::Result<DocTrace> {
         doc_trace(&self.index, self.field, trace)
     }
