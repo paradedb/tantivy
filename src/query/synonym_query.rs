@@ -346,6 +346,18 @@ impl DocSet for SynonymScorer {
             .map(DocSet::size_hint)
             .fold(0u32, u32::saturating_add)
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(u64::from(self.size_hint())),
+            crate::ProbeCost::per_doc(
+                crate::ProbeCost::TERM
+                    .per_doc
+                    .0
+                    .saturating_mul(self.postings.len().max(1) as u64),
+            ),
+        )
+    }
 }
 
 impl Scorer for SynonymScorer {

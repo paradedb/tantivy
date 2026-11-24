@@ -1,10 +1,40 @@
 use common::TinySet;
 
 use super::size_hint::estimate_intersection;
-use crate::docset::{DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED};
+use crate::docset::{
+    DocSet, DocSetCost, DriveCost, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED,
+};
 use crate::query::term_query::TermScorer;
 use crate::query::{EmptyScorer, Scorer};
 use crate::{DocId, Score};
+
+/// Orders intersection participants so index `0` is the cheapest driver (`cost().drive`,
+/// tie-breaking by `size_hint()`), and followers `[1..]` are ordered by expected probe cost per
+/// eliminated candidate (`probe.scalar() / (1 - selectivity)`), tie-breaking by `drive`.
+fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_num_docs: u32) {
+    if docsets.len() <= 1 {
+        return;
+    }
+    let driver_idx = docsets
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, d)| (d.cost().drive, d.size_hint()))
+        .map(|(i, _)| i)
+        .unwrap();
+    docsets.swap(0, driver_idx);
+    let num_docs = f64::from(segment_num_docs.max(1));
+    docsets[1..].sort_by(|a, b| {
+        let rank = |d: &TDocSet| -> (f64, DriveCost) {
+            let cost = d.cost();
+            let selectivity = (f64::from(d.size_hint()) / num_docs).clamp(0.0, 1.0);
+            let elim = (1.0 - selectivity).max(1e-6);
+            (cost.probe.scalar() as f64 / elim, cost.drive)
+        };
+        let (ra, da) = rank(a);
+        let (rb, db) = rank(b);
+        ra.total_cmp(&rb).then_with(|| da.cmp(&db))
+    });
+}
 
 /// Returns the intersection scorer.
 ///
@@ -27,8 +57,7 @@ pub fn intersect_scorers(
     if scorers.len() == 1 {
         return scorers.pop().unwrap();
     }
-    // Order by estimated cost to drive each scorer.
-    scorers.sort_by_key(|scorer| scorer.cost());
+    order_intersection_docsets(&mut scorers, segment_num_docs);
     let doc = go_to_first_doc(&mut scorers[..]);
     if doc == TERMINATED {
         return Box::new(EmptyScorer);
@@ -114,7 +143,7 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
     ) -> Intersection<TDocSet, TDocSet> {
         let num_docsets = docsets.len();
         assert!(num_docsets >= 2);
-        docsets.sort_by_key(|docset| docset.cost());
+        order_intersection_docsets(&mut docsets, segment_num_docs);
         let left = docsets.remove(0);
         let right = docsets.remove(0);
         Intersection {
@@ -280,11 +309,42 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         )
     }
 
-    fn cost(&self) -> u64 {
-        // What's the best way to compute the cost of an intersection?
-        // For now we take the cost of the docset driver, which is the first docset.
-        // If there are docsets that are bad at skipping, they should also influence the cost.
-        self.left.cost()
+    fn cost(&self) -> DocSetCost {
+        let num_docs = f64::from(self.segment_num_docs.max(1));
+        let left_cost = self.left.cost();
+        let left_hint = self.left.size_hint();
+        let mut remaining_candidates = f64::from(left_hint);
+        let mut drive = left_cost.drive.0;
+
+        // `seek_danger` probes `left`, then `right`, then `others`, short-circuiting on the first
+        // miss. Weight each subsequent clause's per-doc probe by the probability that a candidate
+        // survives earlier clauses, while keeping fixed per-call setup intact.
+        let mut probe = left_cost.probe;
+        let selectivity_of = |hint: u32| -> f64 {
+            if hint == 0 {
+                // Unknown size_hint (e.g. `ExistsDocSet`): don't zero out downstream probe costs.
+                1.0
+            } else {
+                (f64::from(hint) / num_docs).clamp(0.0, 1.0)
+            }
+        };
+        let mut pass_prob = selectivity_of(left_hint);
+
+        let mut add_follower = |follower_cost: DocSetCost, follower_hint: u32| {
+            let probe_work = (remaining_candidates * follower_cost.probe.scalar() as f64) as u64;
+            drive = drive.saturating_add(probe_work);
+            probe = probe.saturating_add(follower_cost.probe.scale_per_doc(pass_prob));
+            let s = selectivity_of(follower_hint);
+            remaining_candidates *= s;
+            pass_prob *= s;
+        };
+
+        add_follower(self.right.cost(), self.right.size_hint());
+        for other in &self.others {
+            add_follower(other.cost(), other.size_hint());
+        }
+
+        DocSetCost::new(DriveCost(drive), probe)
     }
 
     fn count_including_deleted(&mut self) -> u32 {
@@ -401,11 +461,11 @@ mod tests {
 
     use super::Intersection;
     use crate::collector::Count;
-    use crate::docset::{DocSet, TERMINATED};
+    use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
     use crate::postings::tests::test_skip_against_unoptimized;
-    use crate::query::{QueryParser, VecDocSet};
+    use crate::query::{QueryParser, Scorer, VecDocSet};
     use crate::schema::{Schema, TEXT};
-    use crate::Index;
+    use crate::{DocId, Index, Score};
 
     #[test]
     fn test_intersection() {
@@ -676,5 +736,111 @@ mod tests {
         let searcher = index.reader().unwrap().searcher();
         let c = searcher.search(&*query, &Count).unwrap();
         assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn intersection_orders_followers_by_probe_cost_and_propagates_cost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use crate::docset::{DocSetCost, DriveCost, ProbeCost, ProbePerDocCost, ProbeSetupCost};
+
+        struct ProbeCountingScorer {
+            inner: VecDocSet,
+            cost: DocSetCost,
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl DocSet for ProbeCountingScorer {
+            fn advance(&mut self) -> DocId {
+                self.inner.advance()
+            }
+            fn seek(&mut self, target: DocId) -> DocId {
+                self.inner.seek(target)
+            }
+            fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+                self.probes.fetch_add(1, Ordering::Relaxed);
+                self.inner.seek_danger(target)
+            }
+            fn doc(&self) -> DocId {
+                self.inner.doc()
+            }
+            fn size_hint(&self) -> u32 {
+                self.inner.size_hint()
+            }
+            fn cost(&self) -> DocSetCost {
+                self.cost
+            }
+        }
+
+        impl Scorer for ProbeCountingScorer {
+            fn score(&mut self) -> Score {
+                1.0
+            }
+        }
+
+        // Driver yields 100 docs (0..100). Cheap follower matches only multiples of 10 (10% hit
+        // rate) with higher drive cost than expensive follower's low probe-setup test, while the
+        // expensive follower matches 50% of docs with high-setup probe cost.
+        // Regardless of input order, the cheap selective follower must be probed first so the
+        // expensive follower only sees the ~10 surviving candidates instead of all 100.
+        for reverse in [false, true] {
+            let cheap_probes = Arc::new(AtomicUsize::new(0));
+            let expensive_probes = Arc::new(AtomicUsize::new(0));
+
+            let driver = Box::new(ProbeCountingScorer {
+                inner: VecDocSet::from((0..100).collect::<Vec<_>>()),
+                cost: DocSetCost::new(DriveCost(100), ProbeCost::TERM),
+                probes: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn Scorer>;
+            let cheap = Box::new(ProbeCountingScorer {
+                inner: VecDocSet::from((0..100).step_by(10).collect::<Vec<_>>()),
+                cost: DocSetCost::new(DriveCost(5_000), ProbeCost::BITSET),
+                probes: Arc::clone(&cheap_probes),
+            }) as Box<dyn Scorer>;
+            let expensive = Box::new(ProbeCountingScorer {
+                inner: VecDocSet::from((0..100).step_by(2).collect::<Vec<_>>()),
+                cost: DocSetCost::new(
+                    DriveCost(1_500),
+                    ProbeCost::new(ProbeSetupCost(300), ProbePerDocCost(15)),
+                ),
+                probes: Arc::clone(&expensive_probes),
+            }) as Box<dyn Scorer>;
+
+            let scorers = if reverse {
+                vec![expensive, cheap, driver]
+            } else {
+                vec![driver, expensive, cheap]
+            };
+            let mut inter = crate::query::intersect_scorers(scorers, 1_000);
+
+            // Composite `Intersection::cost()` must retain the expensive follower's setup cost
+            // so outer WAND scorers still know probing this composite filter is expensive.
+            let composite_cost = inter.cost();
+            assert!(
+                composite_cost.probe.prefers_batching(),
+                "reverse={reverse}: expected setup cost to propagate, got {:?}",
+                composite_cost.probe
+            );
+            assert!(
+                composite_cost.probe.scalar() >= 300,
+                "reverse={reverse}: expected high scalar probe cost, got {:?}",
+                composite_cost.probe
+            );
+
+            let mut matched = Vec::new();
+            while inter.doc() != TERMINATED {
+                matched.push(inter.doc());
+                inter.advance();
+            }
+            assert_eq!(matched, (0..100).step_by(10).collect::<Vec<_>>());
+            assert!(
+                expensive_probes.load(Ordering::Relaxed) <= 15,
+                "reverse={reverse}: expensive follower should only probe cheap survivors, got {} \
+                 (cheap={})",
+                expensive_probes.load(Ordering::Relaxed),
+                cheap_probes.load(Ordering::Relaxed),
+            );
+        }
     }
 }

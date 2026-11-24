@@ -279,8 +279,15 @@ where
         estimate_union(self.docsets.iter().map(DocSet::size_hint), self.num_docs)
     }
 
-    fn cost(&self) -> u64 {
-        self.docsets.iter().map(|docset| docset.cost()).sum()
+    fn cost(&self) -> crate::DocSetCost {
+        let mut drive = crate::DriveCost::ZERO;
+        let mut probe = crate::ProbeCost::ZERO;
+        for docset in &self.docsets {
+            let cost = docset.cost();
+            drive = drive.saturating_add(cost.drive);
+            probe = probe.saturating_add(cost.probe);
+        }
+        crate::DocSetCost::new(drive, probe)
     }
 
     // TODO Also implement `count` with deletes efficiently.

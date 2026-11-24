@@ -5,6 +5,192 @@ use common::TinySet;
 use crate::fastfield::AliveBitSet;
 use crate::DocId;
 
+/// Estimated total cost to consume a [`DocSet`] via `advance()` until [`TERMINATED`],
+/// in units of one `TermScorer::advance()` (`1` per matching document).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DriveCost(pub u64);
+
+impl DriveCost {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_mul(self, factor: u64) -> Self {
+        Self(self.0.saturating_mul(factor))
+    }
+}
+
+/// Fixed per-call setup cost of a `seek_danger` (or batched probe) invocation,
+/// in units of one `TermScorer::advance()`.
+///
+/// Zero for in-memory docsets (`TermScorer`, `BitSetDocSet`, `RangeDocSet`, `PhraseScorer`);
+/// non-zero for lazy SSTable dictionary block decoding (`CachedDictPredicateDocSet`) or
+/// cross-boundary vectorized predicates (`PredicateColumnDocSet`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProbeSetupCost(pub u64);
+
+impl ProbeSetupCost {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+}
+
+/// Marginal per-document cost of testing membership in a [`DocSet`],
+/// in units of one `TermScorer::advance()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProbePerDocCost(pub u64);
+
+impl ProbePerDocCost {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_mul(self, factor: u64) -> Self {
+        Self(self.0.saturating_mul(factor))
+    }
+}
+
+/// Estimated cost of probing membership of externally supplied documents (`seek_danger`).
+///
+/// Modeled as `setup + batch_len * per_doc`, separating fixed per-call overhead (amortized across
+/// a candidate batch) from marginal per-document work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ProbeCost {
+    /// Fixed per-call overhead (`0` for in-memory docsets).
+    pub setup: ProbeSetupCost,
+    /// Marginal cost per probed document.
+    pub per_doc: ProbePerDocCost,
+}
+
+impl ProbeCost {
+    pub const ZERO: Self = Self {
+        setup: ProbeSetupCost::ZERO,
+        per_doc: ProbePerDocCost::ZERO,
+    };
+
+    /// Bitset or contiguous range membership test (`O(1)` in-memory lookup).
+    pub const BITSET: Self = Self::per_doc(1);
+
+    /// Default postings seek/probe cost (`TermScorer` block skip + search).
+    pub const TERM: Self = Self::per_doc(3);
+
+    /// In-memory fast-field value decode + comparison (`RangeDocSet`).
+    pub const FAST_FIELD: Self = Self::per_doc(5);
+
+    /// Binary search / gallop on a sorted fast-field column (`TermSetGallopDocSet`).
+    pub const GALLOP: Self = Self::per_doc(8);
+
+    /// In-memory fast-field decode + hash/ordinal set lookup (`TermSetDocSet`,
+    /// populated `CachedDictPredicateDocSet`).
+    pub const FAST_FIELD_LOOKUP: Self = Self::per_doc(10);
+
+    /// Lazy SSTable dictionary block decode + lookup (unpopulated `CachedDictPredicateDocSet`):
+    /// fixed block read/decompression setup plus ordinal lookup per probed document.
+    pub const DICT_BLOCK: Self = Self {
+        setup: ProbeSetupCost(64),
+        per_doc: ProbePerDocCost(10),
+    };
+
+    /// Minimum `setup` above which amortizing over a candidate batch beats buffering overhead
+    /// in streaming operators (`Intersection`, `Exclude`).
+    pub const BATCH_SETUP_THRESHOLD: ProbeSetupCost = ProbeSetupCost(32);
+
+    /// Creates a `ProbeCost` with zero fixed setup overhead.
+    #[inline]
+    pub const fn per_doc(per_doc: u64) -> Self {
+        Self {
+            setup: ProbeSetupCost::ZERO,
+            per_doc: ProbePerDocCost(per_doc),
+        }
+    }
+
+    /// Creates a `ProbeCost` with both fixed per-call setup and marginal per-doc cost.
+    #[inline]
+    pub const fn new(setup: ProbeSetupCost, per_doc: ProbePerDocCost) -> Self {
+        Self { setup, per_doc }
+    }
+
+    /// Cost of a single scalar `seek_danger(target)` probe.
+    #[inline]
+    pub const fn scalar(self) -> u64 {
+        self.setup.0.saturating_add(self.per_doc.0)
+    }
+
+    /// Total cost of probing `batch_len` candidates in a single batched call.
+    #[inline]
+    pub const fn for_batch(self, batch_len: u64) -> u64 {
+        if batch_len == 0 {
+            return 0;
+        }
+        self.setup
+            .0
+            .saturating_add(self.per_doc.0.saturating_mul(batch_len))
+    }
+
+    /// Whether amortizing fixed per-call setup across a candidate batch beats buffering overhead.
+    #[inline]
+    pub const fn prefers_batching(self) -> bool {
+        self.setup.0 >= Self::BATCH_SETUP_THRESHOLD.0
+    }
+
+    /// Combines two sequentially evaluated probes conservatively.
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            setup: self.setup.saturating_add(rhs.setup),
+            per_doc: self.per_doc.saturating_add(rhs.per_doc),
+        }
+    }
+
+    /// Scales marginal per-doc cost by a selectivity fraction in `[0.0, 1.0]` while preserving
+    /// fixed per-call setup (which is paid whenever at least one candidate reaches this probe).
+    #[inline]
+    pub fn scale_per_doc(self, selectivity: f64) -> Self {
+        let scaled = (self.per_doc.0 as f64 * selectivity.clamp(0.0, 1.0)).ceil() as u64;
+        Self {
+            setup: self.setup,
+            per_doc: ProbePerDocCost(scaled),
+        }
+    }
+}
+
+/// Estimated execution costs for a [`DocSet`], in units of one `TermScorer::advance()`.
+///
+/// Separates full-scan drive work ([`DriveCost`]) from point/batched membership probing
+/// ([`ProbeCost`]), which are largely independent: for example, a dense bitset has high drive
+/// cost with cheap `O(1)` probes, whereas a rare phrase or vectorized predicate has low drive
+/// cost or an unbounded `size_hint()` with expensive probes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DocSetCost {
+    /// Total cost to consume the entire `DocSet` via `advance()` until [`TERMINATED`].
+    pub drive: DriveCost,
+    /// Cost to test membership of externally supplied documents (`seek_danger`).
+    pub probe: ProbeCost,
+}
+
+impl DocSetCost {
+    pub const ZERO: Self = Self {
+        drive: DriveCost::ZERO,
+        probe: ProbeCost::ZERO,
+    };
+
+    #[inline]
+    pub const fn new(drive: DriveCost, probe: ProbeCost) -> Self {
+        Self { drive, probe }
+    }
+}
+
 /// Sentinel value returned when a [`DocSet`] has been entirely consumed.
 ///
 /// This is not `u32::MAX` as one would have expected, due to the lack of SSE2 instructions
@@ -229,24 +415,12 @@ pub trait DocSet: Send {
     /// length of the docset.
     fn size_hint(&self) -> u32;
 
-    /// Returns a best-effort hint of the cost to consume the entire docset.
+    /// Returns best-effort cost estimates for driving (`advance()`) and probing (`seek_danger()`)
+    /// this `DocSet`, in units of one `TermScorer::advance()`.
     ///
-    /// Consuming means calling advance until [`TERMINATED`] is returned.
-    /// The cost should be relative to the cost of driving a Term query,
-    /// which would be the number of documents in the DocSet.
-    ///
-    /// By default this returns `size_hint()`.
-    ///
-    /// DocSets may have vastly different cost depending on their type,
-    /// e.g. an intersection with 10 hits is much cheaper than
-    /// a phrase search with 10 hits, since it needs to load positions.
-    ///
-    /// ### Future Work
-    /// We may want to differentiate `DocSet` costs more more granular, e.g.
-    /// creation_cost, advance_cost, seek_cost on to get a good estimation
-    /// what query types to choose.
-    fn cost(&self) -> u64 {
-        self.size_hint() as u64
+    /// By default `drive` is `size_hint()` and `probe` is [`ProbeCost::TERM`].
+    fn cost(&self) -> DocSetCost {
+        DocSetCost::new(DriveCost(self.size_hint() as u64), ProbeCost::TERM)
     }
 
     /// Whether this docset can produce membership masks without enumerating each match.
@@ -384,7 +558,7 @@ impl DocSet for &mut dyn DocSet {
         (**self).size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> DocSetCost {
         (**self).cost()
     }
 
@@ -446,7 +620,7 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
         unboxed.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> DocSetCost {
         let unboxed: &TDocSet = self.borrow();
         unboxed.cost()
     }

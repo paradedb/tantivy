@@ -1,4 +1,4 @@
-use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
+use crate::docset::{DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult, TERMINATED};
 use crate::query::Scorer;
 use crate::{DocId, Score};
 
@@ -9,6 +9,11 @@ use crate::{DocId, Score};
 pub trait ExclusionSet: Send {
     /// Returns `true` if the given `doc` is in the exclusion set.
     fn contains(&mut self, doc: DocId) -> bool;
+
+    /// Estimated cost to probe membership in this exclusion set.
+    fn probe_cost(&self) -> ProbeCost {
+        ProbeCost::TERM
+    }
 }
 
 /// A `DocSet` used as an exclusion set.
@@ -46,12 +51,24 @@ impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
             }
         }
     }
+
+    fn probe_cost(&self) -> ProbeCost {
+        self.docset.cost().probe
+    }
 }
 
 impl<TDocSet: DocSet> ExclusionSet for Vec<ExcludedDocSet<TDocSet>> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
         self.iter_mut().any(|docset| docset.contains(doc))
+    }
+
+    fn probe_cost(&self) -> ProbeCost {
+        let mut probe = ProbeCost::ZERO;
+        for docset in self {
+            probe = probe.saturating_add(docset.probe_cost());
+        }
+        probe
     }
 }
 
@@ -148,6 +165,18 @@ where
     /// the fact that docs might be deleted.
     fn size_hint(&self) -> u32 {
         self.underlying_docset.size_hint()
+    }
+
+    fn cost(&self) -> DocSetCost {
+        let underlying = self.underlying_docset.cost();
+        let excl_probe = self.exclusion_set.probe_cost();
+        let probe_work = DriveCost(
+            u64::from(self.underlying_docset.size_hint()).saturating_mul(excl_probe.scalar()),
+        );
+        DocSetCost::new(
+            underlying.drive.saturating_add(probe_work),
+            underlying.probe.saturating_add(excl_probe),
+        )
     }
 }
 

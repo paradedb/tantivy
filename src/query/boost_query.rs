@@ -175,7 +175,7 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.underlying.cost()
     }
 

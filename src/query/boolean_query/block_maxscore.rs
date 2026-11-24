@@ -1,4 +1,4 @@
-use crate::docset::SeekDangerResult;
+use crate::docset::{ProbeCost, SeekDangerResult};
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -46,6 +46,21 @@ pub(super) fn block_maxscore(
     );
 }
 
+/// When the optional filter is evaluated relative to strong/weak term scoring in a window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowFilterStage {
+    /// No filter is attached.
+    None,
+    /// Probe the filter before computing single-strong scores and before weak terms
+    /// (`O(1)` filters such as bitsets).
+    BeforeScore,
+    /// Check strong-term score bounds first, then probe the filter before weak terms.
+    AfterStrongBound,
+    /// Score all strong and weak terms and confirm `final_score > threshold` before probing
+    /// the filter.
+    AfterWeakAndThreshold,
+}
+
 pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
     scorers: Vec<TermScorer>,
     mut threshold: Score,
@@ -80,6 +95,7 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
         .min()
         .unwrap_or(TERMINATED);
     // See `seek_to_filter_start`.
+    let filter_probe = filter.as_ref().map(|f| f.cost().probe);
     if let Some(ref f) = filter {
         start = start.max(f.doc());
     }
@@ -122,6 +138,17 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
         // The weak prefix cannot beat the threshold alone, so every hit must match a strong term.
         let (weak, strong) = terms.split_at_mut(weak_count);
         let weak_bound = weak.iter().map(|t| t.bound).sum::<f64>();
+        let weak_probe_cost = (weak.len() as u64).saturating_mul(ProbeCost::TERM.scalar());
+        let filter_stage = match filter_probe {
+            None => WindowFilterStage::None,
+            Some(p) if p.scalar() > weak_probe_cost.max(ProbeCost::BITSET.scalar()) => {
+                WindowFilterStage::AfterWeakAndThreshold
+            }
+            Some(p) if p.scalar() > ProbeCost::BITSET.scalar() => {
+                WindowFilterStage::AfterStrongBound
+            }
+            Some(_) => WindowFilterStage::BeforeScore,
+        };
         for term in strong.iter_mut() {
             if term.scorer.doc() < start {
                 term.scorer.seek(start);
@@ -138,15 +165,35 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                 let scorer = &mut strong[0].scorer;
                 while scorer.doc() < window_end {
                     let doc = scorer.doc();
-                    let in_filter = match filter {
-                        Some(ref mut f) => f.seek_danger(doc) == SeekDangerResult::Found,
-                        None => true,
-                    };
-                    if in_filter {
-                        let score = scorer.score();
-                        let keep = score as f64 * rounding + weak_bound > inner_threshold;
-                        matches[matches_len] = (doc, score);
-                        matches_len += keep as usize;
+                    match filter_stage {
+                        WindowFilterStage::None | WindowFilterStage::AfterWeakAndThreshold => {
+                            let score = scorer.score();
+                            let keep = score as f64 * rounding + weak_bound > inner_threshold;
+                            matches[matches_len] = (doc, score);
+                            matches_len += keep as usize;
+                        }
+                        WindowFilterStage::AfterStrongBound => {
+                            let score = scorer.score();
+                            if score as f64 * rounding + weak_bound > inner_threshold
+                                && filter
+                                    .as_deref_mut()
+                                    .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
+                            {
+                                matches[matches_len] = (doc, score);
+                                matches_len += 1;
+                            }
+                        }
+                        WindowFilterStage::BeforeScore => {
+                            if filter
+                                .as_deref_mut()
+                                .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found)
+                            {
+                                let score = scorer.score();
+                                let keep = score as f64 * rounding + weak_bound > inner_threshold;
+                                matches[matches_len] = (doc, score);
+                                matches_len += keep as usize;
+                            }
+                        }
                     }
                     scorer.advance();
                 }
@@ -172,9 +219,14 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
                         if score as f64 * rounding + weak_bound <= inner_threshold {
                             continue;
                         }
-                        let in_filter = match filter {
-                            Some(ref mut f) => f.seek_danger(doc) == SeekDangerResult::Found,
-                            None => true,
+                        let in_filter = match filter_stage {
+                            WindowFilterStage::None | WindowFilterStage::AfterWeakAndThreshold => {
+                                true
+                            }
+                            WindowFilterStage::BeforeScore
+                            | WindowFilterStage::AfterStrongBound => filter
+                                .as_deref_mut()
+                                .is_none_or(|f| f.seek_danger(doc) == SeekDangerResult::Found),
                         };
                         if in_filter {
                             matches[matches_len] = (doc, score);
@@ -206,6 +258,13 @@ pub(super) fn block_maxscore_filtered<F: DocSet + ?Sized>(
             for &(doc, score) in &matches[..matches_len] {
                 let final_score = score + filter_boost;
                 if final_score > threshold {
+                    if filter_stage == WindowFilterStage::AfterWeakAndThreshold
+                        && filter
+                            .as_deref_mut()
+                            .is_some_and(|f| f.seek_danger(doc) != SeekDangerResult::Found)
+                    {
+                        continue;
+                    }
                     threshold = callback(doc, final_score);
                     inner_threshold = if threshold == Score::MIN {
                         Score::MIN as f64

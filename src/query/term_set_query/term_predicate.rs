@@ -14,7 +14,7 @@ use common::{BitSet, TinySet};
 
 use super::term_set_strategy::TermSetStrategyConfig;
 use super::term_set_weight::TermSetWeight;
-use crate::docset::SeekDangerResult;
+use crate::docset::{ProbeCost, SeekDangerResult};
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Term, TERMINATED};
@@ -77,6 +77,24 @@ pub trait TermPredicate: fmt::Debug + Send + Sync + 'static {
     fn estimated_distinct_keys(&self) -> Option<u64> {
         None
     }
+
+    /// Estimated cost of evaluating this predicate on a batch of candidate values, in units of
+    /// one `TermScorer::advance()`.
+    ///
+    /// Modeled as `setup + batch_len * per_doc`, covering only this predicate's own evaluation
+    /// work (excluding Tantivy's fast-field column or dictionary-block decode cost, which
+    /// `PredicateColumnDocSet` and `CachedDictPredicateDocSet` add on top):
+    ///
+    /// - `setup` is the fixed per-call overhead of invoking `filter_bytes` or
+    ///   `filter_monotonic_u64s` (amortized across a batch). Use `ProbeSetupCost::ZERO` for
+    ///   in-process Rust lookups (for example `ProbeCost::per_doc(5)` for a `HashSet`), or a value
+    ///   `>= ProbeCost::BATCH_SETUP_THRESHOLD` for cross-boundary / FFI / I/O-backed predicates so
+    ///   streaming operators batch probes and WAND/MaxScore defer filter evaluation past score
+    ///   pruning.
+    /// - `per_doc` is the marginal cost per value evaluated in the batch (relative to `1` for a
+    ///   `TermScorer::advance()`, `3` for a term postings seek, and `5` for a fast-field column
+    ///   read).
+    fn probe_cost(&self) -> ProbeCost;
 }
 
 /// A Tantivy `Query` that filters a single `Field` through a [`TermPredicate`],
@@ -664,6 +682,17 @@ impl SegmentDictEntry {
     }
 }
 
+#[inline]
+fn scale_size_hint(remaining: u32, matching_keys: u64, distinct_keys: u64) -> u32 {
+    if remaining == 0 || matching_keys == 0 {
+        return 0;
+    }
+    let denom = distinct_keys.max(1);
+    let numer = matching_keys.min(denom);
+    let est = (u128::from(remaining) * u128::from(numer)).div_ceil(u128::from(denom));
+    est.min(u128::from(remaining)) as u32
+}
+
 pub(crate) struct CachedDictPredicateDocSet {
     bytes_col: BytesColumn,
     ord_range: Range<u64>,
@@ -889,14 +918,43 @@ impl DocSet for CachedDictPredicateDocSet {
     }
 
     fn size_hint(&self) -> u32 {
-        self.bytes_col
-            .num_rows()
-            .saturating_sub(self.doc_id.saturating_add(1))
+        if self.doc_id == TERMINATED {
+            return 0;
+        }
+        let remaining = if self.positioned {
+            self.bytes_col.num_rows().saturating_sub(self.doc_id)
+        } else {
+            self.bytes_col.num_rows()
+        };
+        let distinct = self.bytes_col.num_terms() as u64;
+        let range_ords = self.ord_range.end.saturating_sub(self.ord_range.start);
+        let matching_ords = if let Some(matched) = &self.populated {
+            matched.len() as u64
+        } else {
+            match &self.probe {
+                DictKeyProbe::SortedTerms(terms) => (terms.len() as u64).min(range_ords),
+                DictKeyProbe::Predicate(pred) => pred
+                    .estimated_distinct_keys()
+                    .map_or(range_ords, |k| k.min(range_ords)),
+            }
+        };
+        scale_size_hint(remaining, matching_ords, distinct)
     }
 
-    fn cost(&self) -> u64 {
-        // High enough to sort last in `Intersection` without overflowing `u64` sums in unions.
-        1u64 << 48
+    fn cost(&self) -> crate::DocSetCost {
+        let probe = if self.populated.is_some() {
+            crate::ProbeCost::FAST_FIELD_LOOKUP
+        } else {
+            match &self.probe {
+                DictKeyProbe::SortedTerms(_) => crate::ProbeCost::DICT_BLOCK,
+                DictKeyProbe::Predicate(pred) => {
+                    crate::ProbeCost::DICT_BLOCK.saturating_add(pred.probe_cost())
+                }
+            }
+        };
+        let drive =
+            crate::DriveCost(u64::from(self.bytes_col.num_rows()).saturating_mul(probe.per_doc.0));
+        crate::DocSetCost::new(drive, probe)
     }
 }
 
@@ -1229,14 +1287,40 @@ impl DocSet for PredicateColumnDocSet {
     }
 
     fn size_hint(&self) -> u32 {
-        self.doc_bounds
-            .end
-            .saturating_sub(self.doc_id.max(self.doc_bounds.start).saturating_add(1))
+        if self.doc_id == TERMINATED {
+            return 0;
+        }
+        let remaining = if self.positioned {
+            self.doc_bounds
+                .end
+                .saturating_sub(self.doc_id.max(self.doc_bounds.start))
+        } else {
+            self.doc_bounds.end.saturating_sub(self.doc_bounds.start)
+        };
+        let Some(est_keys) = self.predicate.estimated_distinct_keys() else {
+            return remaining;
+        };
+        let window_docs = u64::from(self.doc_bounds.end.saturating_sub(self.doc_bounds.start));
+        let distinct_upper = if self.col_type == ColumnType::F64 {
+            window_docs
+        } else {
+            let span = self
+                .value_range
+                .end()
+                .saturating_sub(*self.value_range.start())
+                .saturating_add(1);
+            window_docs.min(span)
+        };
+        scale_size_hint(remaining, est_keys, distinct_upper)
     }
 
-    fn cost(&self) -> u64 {
-        // High enough to sort last in `Intersection` without overflowing `u64` sums in unions.
-        1u64 << 48
+    fn cost(&self) -> crate::DocSetCost {
+        let window_docs = u64::from(self.doc_bounds.end.saturating_sub(self.doc_bounds.start));
+        let probe = crate::ProbeCost::FAST_FIELD.saturating_add(self.predicate.probe_cost());
+        crate::DocSetCost::new(
+            crate::DriveCost(window_docs.saturating_mul(probe.per_doc.0)),
+            probe,
+        )
     }
 }
 
@@ -1269,7 +1353,7 @@ mod tests {
         IndexRecordOption, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions, FAST,
         STRING, TEXT,
     };
-    use crate::{Index, IndexSettings, IndexSortByField, Order, Term, TERMINATED};
+    use crate::{DocId, Index, IndexSettings, IndexSortByField, Order, Term, TERMINATED};
 
     #[derive(Debug, Default)]
     struct EvalTelemetry {
@@ -1281,6 +1365,8 @@ mod tests {
     struct SetPredicate {
         bytes_set: FxHashSet<Vec<u8>>,
         i64_set: FxHashSet<i64>,
+        estimated_keys: Option<u64>,
+        probe_cost: crate::ProbeCost,
         bytes_telemetry: EvalTelemetry,
         u64_telemetry: EvalTelemetry,
     }
@@ -1290,6 +1376,8 @@ mod tests {
             Self {
                 bytes_set: items.into_iter().map(|s| s.as_bytes().to_vec()).collect(),
                 i64_set: FxHashSet::default(),
+                estimated_keys: None,
+                probe_cost: crate::ProbeCost::per_doc(5),
                 bytes_telemetry: EvalTelemetry::default(),
                 u64_telemetry: EvalTelemetry::default(),
             }
@@ -1299,9 +1387,26 @@ mod tests {
             Self {
                 bytes_set: FxHashSet::default(),
                 i64_set: items.into_iter().collect(),
+                estimated_keys: None,
+                probe_cost: crate::ProbeCost::per_doc(5),
                 bytes_telemetry: EvalTelemetry::default(),
                 u64_telemetry: EvalTelemetry::default(),
             }
+        }
+
+        fn with_estimated_distinct_keys(mut self, count: u64) -> Self {
+            self.estimated_keys = Some(count);
+            self
+        }
+
+        fn with_probe_cost(mut self, probe_cost: crate::ProbeCost) -> Self {
+            self.probe_cost = probe_cost;
+            self
+        }
+
+        fn total_calls(&self) -> usize {
+            self.bytes_telemetry.calls.load(Ordering::Relaxed)
+                + self.u64_telemetry.calls.load(Ordering::Relaxed)
         }
     }
 
@@ -1344,6 +1449,55 @@ mod tests {
             }
             Ok(())
         }
+
+        fn estimated_distinct_keys(&self) -> Option<u64> {
+            self.estimated_keys
+        }
+
+        fn probe_cost(&self) -> crate::ProbeCost {
+            self.probe_cost
+        }
+    }
+
+    fn assert_narrow_runs_before_broad(
+        searcher: &crate::Searcher,
+        field: crate::schema::Field,
+        driver_docs: &[DocId],
+        make_pair: impl Fn() -> (Arc<SetPredicate>, Arc<SetPredicate>),
+        expected_matches: &[DocId],
+    ) -> crate::Result<()> {
+        let segment = searcher.segment_reader(0);
+        let scoring = EnableScoring::disabled_from_searcher(searcher);
+        let hint = CandidateHint::Estimated(driver_docs.len().max(1) as u32);
+        let build = |pred: Arc<SetPredicate>| {
+            TermPredicateQuery::new(field, pred)
+                .with_exact_postings(ExactPostings::Unavailable)
+                .weight(scoring)?
+                .scorer_for_candidates_unpositioned(segment, 1.0, hint)
+        };
+        for reverse in [false, true] {
+            let (narrow, broad) = make_pair();
+            let (narrow_s, broad_s) = (build(narrow)?, build(broad.clone())?);
+            assert!(narrow_s.size_hint() < broad_s.size_hint());
+            let driver: Box<dyn crate::query::Scorer> = Box::new(crate::query::ConstScorer::new(
+                crate::query::VecDocSet::from(driver_docs.to_vec()),
+                1.0,
+            ));
+            let scorers = if reverse {
+                vec![broad_s, narrow_s, driver]
+            } else {
+                vec![driver, narrow_s, broad_s]
+            };
+            let mut inter = crate::query::intersect_scorers(scorers, segment.num_docs());
+            let mut matched = Vec::new();
+            while inter.doc() != TERMINATED {
+                matched.push(inter.doc());
+                inter.advance();
+            }
+            assert_eq!(matched, expected_matches);
+            assert!(broad.total_calls() <= expected_matches.len());
+        }
+        Ok(())
     }
 
     #[test]
@@ -1455,6 +1609,31 @@ mod tests {
         assert_eq!(searcher.search(&bool_q, &DocSetCollector)?.len(), 1);
         assert!(selective_pred.bytes_telemetry.calls.load(Ordering::Relaxed) <= 2);
         assert!(selective_pred.bytes_telemetry.items.load(Ordering::Relaxed) < 1_000);
+
+        // 4. Selective dictionary predicate sorts ahead of a broad one regardless of order.
+        let broad_keys: Vec<String> = (0..2_400u32)
+            .map(|i| format!("key-{i:06}-padding-to-grow-dictionary-blocks"))
+            .collect();
+        assert_narrow_runs_before_broad(
+            &searcher,
+            str_fast_only,
+            &[42, 777],
+            || {
+                (
+                    Arc::new(
+                        SetPredicate::from_strings([
+                            "key-000777-padding-to-grow-dictionary-blocks",
+                        ])
+                        .with_estimated_distinct_keys(1),
+                    ),
+                    Arc::new(
+                        SetPredicate::from_strings(broad_keys.iter().map(String::as_str))
+                            .with_estimated_distinct_keys(2_400),
+                    ),
+                )
+            },
+            &[777],
+        )?;
         Ok(())
     }
 
@@ -1610,6 +1789,23 @@ mod tests {
         let got_top = wsearcher.search(&nested_pred, &TopDocs::with_limit(15).order_by_score())?;
         let exp_top = wsearcher.search(&nested_set, &TopDocs::with_limit(15).order_by_score())?;
         assert_eq!(got_top, exp_top);
+
+        // Selective numeric predicate sorts ahead of a broad one regardless of clause order.
+        let driver_docs: Vec<DocId> = (0..100).collect();
+        assert_narrow_runs_before_broad(
+            &wsearcher,
+            owner,
+            &driver_docs,
+            || {
+                (
+                    Arc::new(SetPredicate::from_i64s([0, 4, 8]).with_estimated_distinct_keys(3)),
+                    Arc::new(
+                        SetPredicate::from_i64s(0..6_000i64).with_estimated_distinct_keys(6_000),
+                    ),
+                )
+            },
+            &[0, 4, 8],
+        )?;
         Ok(())
     }
 
@@ -1623,6 +1819,8 @@ mod tests {
             query_vals in prop::collection::vec(0i64..50, 0..30),
             bound_pair in prop::option::of((0i64..50, 0i64..50)),
             with_rare_filter in any::<bool>(),
+            hint_keys in any::<bool>(),
+            high_setup in any::<bool>(),
         ) {
             let mut sb = SchemaBuilder::new();
             let rare_tag = sb.add_text_field("rare_tag", STRING);
@@ -1730,9 +1928,16 @@ mod tests {
                 .iter()
                 .map(|&v| format!("val-{v:04}-block-pad-0123456789abcdef"))
                 .collect();
+            let i64_set: FxHashSet<i64> = query_vals.iter().copied().collect();
             let pred = Arc::new(SetPredicate {
                 bytes_set: str_strings.iter().map(|s| s.as_bytes().to_vec()).collect(),
-                i64_set: query_vals.iter().copied().collect(),
+                estimated_keys: hint_keys.then_some(i64_set.len() as u64),
+                i64_set,
+                probe_cost: if high_setup {
+                    crate::ProbeCost::new(crate::ProbeSetupCost(300), crate::ProbePerDocCost(10))
+                } else {
+                    crate::ProbeCost::per_doc(5)
+                },
                 bytes_telemetry: EvalTelemetry::default(),
                 u64_telemetry: EvalTelemetry::default(),
             });
@@ -1776,6 +1981,26 @@ mod tests {
                     .search(&wrap_rare(Box::new(candidate_q)), &DocSetCollector)
                     .unwrap();
                 prop_assert_eq!(got, expected.clone());
+            }
+
+            // Verify `PredicateColumnDocSet` propagates `probe_cost()` and bounds `size_hint()`.
+            let num_s = TermPredicateQuery::new(num_fast_only, pred.clone())
+                .with_bounds(num_bounds(num_fast_only))
+                .with_exact_postings(ExactPostings::Unavailable)
+                .weight(EnableScoring::disabled_from_searcher(&searcher))
+                .unwrap()
+                .scorer_for_candidates_unpositioned(
+                    searcher.segment_reader(0),
+                    1.0,
+                    CandidateHint::Estimated(1),
+                )
+                .unwrap();
+            if num_s.doc() != TERMINATED {
+                prop_assert_eq!(
+                    num_s.cost().probe,
+                    crate::ProbeCost::FAST_FIELD.saturating_add(pred.probe_cost())
+                );
+                prop_assert!(num_s.size_hint() <= searcher.segment_reader(0).num_docs());
             }
         }
     }
@@ -2048,6 +2273,8 @@ mod tests {
             bounded in any::<bool>(),
             explicit_terms in any::<bool>(),
             paged in any::<bool>(),
+            hint_keys in any::<bool>(),
+            high_setup in any::<bool>(),
         ) {
             let f = dict_cache_fixture();
             let searcher = if paged {
@@ -2105,9 +2332,18 @@ mod tests {
                 )
             };
 
-            let pred = Arc::new(SetPredicate::from_strings(
-                f.matching_strings.iter().map(String::as_str),
-            ));
+            let mut pred_val =
+                SetPredicate::from_strings(f.matching_strings.iter().map(String::as_str));
+            if hint_keys {
+                pred_val = pred_val.with_estimated_distinct_keys(f.matching_strings.len() as u64);
+            }
+            if high_setup {
+                pred_val = pred_val.with_probe_cost(crate::ProbeCost::new(
+                    crate::ProbeSetupCost(300),
+                    crate::ProbePerDocCost(10),
+                ));
+            }
+            let pred = Arc::new(pred_val);
             let weight = if explicit_terms && !bounded {
                 super::TermSetWeight::from_terms(
                     f.field,
@@ -2159,6 +2395,29 @@ mod tests {
                     CandidateHint::Estimated(docs.len() as u32),
                 )
                 .unwrap();
+
+                if chunk_idx == 0 && docs.len() < bounded_num_blocks {
+                    let expected_probe = if explicit_terms && !bounded {
+                        crate::ProbeCost::DICT_BLOCK
+                    } else {
+                        crate::ProbeCost::DICT_BLOCK.saturating_add(pred.probe_cost())
+                    };
+                    prop_assert_eq!(scorer.cost().probe, expected_probe);
+                    let est_ords = if explicit_terms && !bounded {
+                        (f.matching_terms.len() as u64).min(bounded_num_terms as u64)
+                    } else {
+                        pred.estimated_distinct_keys()
+                            .map_or(bounded_num_terms as u64, |k| k.min(bounded_num_terms as u64))
+                    };
+                    prop_assert_eq!(
+                        scorer.size_hint(),
+                        super::scale_size_hint(
+                            bytes_col.num_rows(),
+                            est_ords,
+                            bytes_col.num_terms() as u64,
+                        )
+                    );
+                }
 
                 for &doc_id in &docs {
                     let key = f.doc_keys[doc_id as usize].as_str();
