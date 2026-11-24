@@ -203,7 +203,7 @@ fn index_documents<D: Document>(
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
 ) -> crate::Result<()> {
-    let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
+    let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone(), false)?;
     for document_group in grouped_document_iterator {
         for doc in document_group {
             segment_writer.add_document(doc)?;
@@ -560,7 +560,9 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// `segment_ids` is required to be non-empty.
     pub fn merge(&mut self, segment_ids: &[SegmentId]) -> FutureResult<Option<SegmentMeta>> {
-        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+        let merge_operation = self
+            .segment_updater
+            .make_merge_operation(segment_ids, false);
         let segment_updater = self.segment_updater.clone();
         segment_updater.start_merge(merge_operation)
     }
@@ -574,8 +576,11 @@ impl<D: Document> IndexWriter<D> {
     pub fn merge_foreground(
         &mut self,
         segment_ids: &[SegmentId],
+        ignore_store: bool,
     ) -> crate::Result<Option<SegmentMeta>> {
-        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+        let merge_operation = self
+            .segment_updater
+            .make_merge_operation(segment_ids, ignore_store);
         self.segment_updater.merge_foreground(merge_operation)
     }
 
