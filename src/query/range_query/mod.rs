@@ -1,8 +1,10 @@
 use crate::schema::Type;
 
+mod contiguous_doc_set;
 mod fast_field_range_doc_set;
 mod range_query;
 mod range_query_fastfield;
+pub(crate) mod sorted_internals;
 
 pub use common::bounds::BoundsRange;
 
