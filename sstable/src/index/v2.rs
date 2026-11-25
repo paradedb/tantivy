@@ -32,6 +32,23 @@ impl SSTableIndex {
             .map(|block_meta| block_meta.block_addr.clone())
     }
 
+    pub(crate) fn visit_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<usize>,
+        mut cb: impl FnMut(BlockAddr),
+    ) {
+        if range.is_empty() || self.blocks.is_empty() {
+            return;
+        }
+        let start = *range.start();
+        let end = (*range.end()).min(self.blocks.len() - 1);
+        if start <= end {
+            for block_meta in &self.blocks[start..=end] {
+                cb(block_meta.block_addr.clone());
+            }
+        }
+    }
+
     /// Get the block id of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.

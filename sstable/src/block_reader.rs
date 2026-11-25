@@ -30,6 +30,14 @@ impl BlockReader {
         }
     }
 
+    pub(crate) fn reset(&mut self, reader: OwnedBytes) {
+        self.buffer.clear();
+        self.reader = reader;
+        self.next_readers = Vec::new().into_iter();
+        self.offset = 0;
+        self.pending_first_ordinal = None;
+    }
+
     /// Build a reader over non-contiguous slices, each labelled with the term ordinal of its
     /// first term. See [`BlockReader::take_first_ordinal`].
     pub fn from_multiple_blocks(readers: Vec<(OwnedBytes, u64)>) -> BlockReader {
@@ -110,6 +118,8 @@ impl BlockReader {
                     let required_capacity =
                         Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
                     self.buffer.reserve(required_capacity);
+                    // TODO: reuse a `Decompressor` (ZSTD_DCtx) on `BlockReader` across blocks
+                    // instead of allocating and freeing one per compressed block.
                     Decompressor::new()?
                         .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
 

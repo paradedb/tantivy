@@ -40,6 +40,7 @@ use std::ops::Range;
 
 use merge::ValueMerger;
 
+mod batch;
 mod block_match_automaton;
 mod delta;
 mod dictionary;
@@ -48,6 +49,7 @@ mod streamer;
 pub mod value;
 
 mod index;
+pub use batch::{BatchedTermInfoIter, SortedTermSlice, sort_and_dedupe_terms};
 pub use index::{BlockAddr, SSTableIndex, SSTableIndexBuilder};
 pub(crate) mod vint;
 pub use dictionary::{Dictionary, TermOrdHit};

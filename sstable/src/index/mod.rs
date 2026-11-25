@@ -59,6 +59,32 @@ impl SSTableIndex {
         }
     }
 
+    pub(crate) fn visit_blocks_in_range(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+        cb: impl FnMut(BlockAddr),
+    ) -> io::Result<()> {
+        match self {
+            SSTableIndex::V2(index) => {
+                if !range.is_empty() {
+                    index.visit_blocks_in_range(
+                        (*range.start() as usize)..=(*range.end() as usize),
+                        cb,
+                    );
+                }
+                Ok(())
+            }
+            SSTableIndex::V3(index) => {
+                index.visit_blocks_in_range(range, cb);
+                Ok(())
+            }
+            SSTableIndex::V3Empty(index) => {
+                index.visit_blocks_in_range(range, cb);
+                Ok(())
+            }
+        }
+    }
+
     /// Get the block id of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
@@ -90,7 +116,7 @@ impl SSTableIndex {
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub(crate) fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
+    pub fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
         match self {
             SSTableIndex::V2(v2_index) => v2_index.get_block_with_ord(ord),
             SSTableIndex::V3(v3_index) => v3_index.get_block_with_ord(ord),
