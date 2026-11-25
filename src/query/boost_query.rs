@@ -1,5 +1,7 @@
 use std::fmt;
 
+use common::TinySet;
+
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{
@@ -122,6 +124,10 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
     }
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         self.underlying.seek_danger(target)
+    }
+
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        self.underlying.seek_danger_batch(docs, mask)
     }
 
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {

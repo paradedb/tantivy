@@ -2,6 +2,7 @@ use crate::docset::{DriveCost, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
+use crate::query::exclude::BatchExcludeScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::intersection::intersect_candidate_scorers;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
@@ -9,7 +10,8 @@ use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, CandidateHint, EmptyScorer, Exclude,
-    ExcludedDocSet, Explanation, Occur, RequiredOptionalScorer, Scorer, UnpositionedScorer, Weight,
+    ExcludedDocSet, ExclusionSet, Explanation, Occur, RequiredOptionalScorer, Scorer,
+    UnpositionedScorer, Weight,
 };
 use crate::{DocId, Score};
 
@@ -556,17 +558,26 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     ExcludedDocSet::new(term_scorer),
                 ))
             } else {
-                Box::new(Exclude::new(
-                    include_scorer_boxed,
-                    ExcludedDocSet::from_unpositioned(exclude_scorer),
-                ))
+                let excl = ExcludedDocSet::from_unpositioned(exclude_scorer);
+                if excl.probe_cost().prefers_batching() {
+                    Box::new(BatchExcludeScorer::new(include_scorer_boxed, excl))
+                } else {
+                    Box::new(Exclude::new(include_scorer_boxed, excl))
+                }
             }
         } else {
             let exclude_scorers: Vec<_> = exclude_scorers
                 .into_iter()
                 .map(ExcludedDocSet::from_unpositioned)
                 .collect();
-            Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+            if exclude_scorers.probe_cost().prefers_batching() {
+                Box::new(BatchExcludeScorer::new(
+                    include_scorer_boxed,
+                    exclude_scorers,
+                ))
+            } else {
+                Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+            }
         };
         Ok(SpecializedScorer::Other(scorer))
     }

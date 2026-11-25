@@ -1,5 +1,6 @@
 use std::ops::DerefMut;
 
+use common::TinySet;
 use downcast_rs::impl_downcast;
 
 use crate::docset::{DocSet, DocSetCost, SeekDangerResult};
@@ -44,7 +45,8 @@ impl<TScorer: Scorer + ?Sized> Scorer for Box<TScorer> {
 ///
 /// Unlike [`Scorer`] / [`DocSet`], `UnpositionedScorer` does not expose `doc()`, `score()`, or
 /// `advance()`, preventing callers from treating an unpositioned doc ID as a match. Callers can
-/// probe it directly via [`Self::seek_danger`] / [`Self::is_empty_in_range`], wrap it in
+/// probe it directly via [`Self::seek_danger`] / [`Self::seek_danger_batch`] /
+/// [`Self::is_empty_in_range`], wrap it in
 /// [`ExcludedDocSet::from_unpositioned`](crate::query::ExcludedDocSet::from_unpositioned), or
 /// explicitly position it via [`Self::into_positioned`].
 pub struct UnpositionedScorer {
@@ -112,6 +114,16 @@ impl UnpositionedScorer {
         result
     }
 
+    /// Probes a sorted batch of candidates in place, following the [`DocSet::seek_danger_batch`]
+    /// contract.
+    #[inline]
+    pub fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        if !docs.is_empty() {
+            self.positioned = false;
+        }
+        self.scorer.seek_danger_batch(docs, mask)
+    }
+
     /// Returns `true` if the scorer is known to have no matches in `[start, end]`, following the
     /// [`DocSet::is_empty_in_range`] contract.
     #[inline]
@@ -120,25 +132,21 @@ impl UnpositionedScorer {
         self.scorer.is_empty_in_range(start, end)
     }
 
-    /// Returns a best-effort hint of the length of the underlying docset.
     #[inline]
     pub fn size_hint(&self) -> u32 {
         self.scorer.size_hint()
     }
 
-    /// Returns the drive and probe cost estimate of the underlying docset.
     #[inline]
     pub fn cost(&self) -> DocSetCost {
         self.scorer.cost()
     }
 
-    /// Returns the constant score produced for every document, if any.
     #[inline]
     pub fn constant_score(&self) -> Option<Score> {
         self.scorer.constant_score()
     }
 
-    /// Returns `true` if the underlying scorer has concrete type `T`.
     #[inline]
     pub fn is<T: Scorer>(&self) -> bool {
         self.scorer.is::<T>()
@@ -147,7 +155,8 @@ impl UnpositionedScorer {
     /// Positions the underlying scorer on its first matching document (or [`TERMINATED`]) if not
     /// already positioned, and returns it as a [`Scorer`].
     ///
-    /// Must not be called after a `seek_danger` call that left the scorer in the danger zone.
+    /// Must not be called after a `seek_danger` / `seek_danger_batch` call that left the scorer
+    /// in the danger zone.
     #[inline]
     pub fn into_positioned(mut self) -> Box<dyn Scorer> {
         self.position_at(0);
@@ -172,7 +181,6 @@ impl UnpositionedScorer {
     }
 
     /// Returns a mutable reference to the underlying scorer once positioned.
-    #[allow(dead_code)]
     #[inline]
     pub(crate) fn positioned_mut(&mut self) -> &mut dyn Scorer {
         debug_assert!(self.positioned);
@@ -191,9 +199,8 @@ impl UnpositionedScorer {
     /// Unwraps the inner `Box<dyn Scorer>` without positioning it.
     ///
     /// Callers must only invoke probe-safe methods (`doc()` as lower bound, `seek_danger`,
-    /// `is_empty_in_range`, `cost`, `size_hint`, `constant_score`) or `seek(target >= doc())` on
-    /// the returned scorer.
-    #[allow(dead_code)]
+    /// `seek_danger_batch`, `is_empty_in_range`, `cost`, `size_hint`, `constant_score`) or
+    /// `seek(target >= doc())` on the returned scorer.
     #[inline]
     pub(crate) fn into_raw_unpositioned(self) -> Box<dyn Scorer> {
         self.scorer

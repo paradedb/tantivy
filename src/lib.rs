@@ -224,8 +224,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{
-    DocSet, DocSetCost, DriveCost, ProbeCost, ProbePerDocCost, ProbeSetupCost, SeekDangerResult,
-    COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
+    fill_all_candidates_mask, DocSet, DocSetCost, DriveCost, ProbeCost, ProbePerDocCost,
+    ProbeSetupCost, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED,
 };
 pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;

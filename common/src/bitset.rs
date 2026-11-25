@@ -191,6 +191,19 @@ impl TinySet {
     pub fn range_greater_or_equal(from_included: u32) -> TinySet {
         TinySet::range_lower(from_included).complement()
     }
+
+    /// Converts the `TinySet` into its underlying `u64` representation.
+    #[inline]
+    pub fn into_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<TinySet> for u64 {
+    #[inline]
+    fn from(tinyset: TinySet) -> Self {
+        tinyset.into_u64()
+    }
 }
 
 #[derive(Clone)]

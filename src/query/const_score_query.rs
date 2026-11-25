@@ -1,5 +1,7 @@
 use std::fmt;
 
+use common::TinySet;
+
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::query::{
     CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
@@ -139,6 +141,10 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         self.docset.seek_danger(target)
+    }
+
+    fn seek_danger_batch(&mut self, docs: &[DocId], mask: &mut [TinySet]) -> DocId {
+        self.docset.seek_danger_batch(docs, mask)
     }
 
     fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
