@@ -9,6 +9,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use common::HasLen;
 
@@ -18,6 +19,7 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::schema::document::ErasedDocument;
 use crate::schema::Schema;
 use crate::space_usage::ComponentSpaceUsage;
+use crate::vector::VectorRowsWriter;
 use crate::{DocId, Segment};
 
 /// A pluggable segment component that participates in writing and merging.
@@ -144,6 +146,8 @@ pub struct PluginMergeContext<'a> {
     pub settings: &'a IndexSettings,
     pub ignore_store: bool,
     pub cancel: &'a dyn CancelSentinel,
+    /// The rows a build streamed into the target's `.vec`, for the vector plugin to take.
+    pub(crate) vector_rows: Option<&'a Mutex<Option<VectorRowsWriter>>>,
 }
 
 #[cfg(test)]

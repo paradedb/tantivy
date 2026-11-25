@@ -145,6 +145,10 @@ impl<W: TerminatingWrite> TerminatingWrite for FooterProxy<W> {
         footer.append_footer(&mut writer)?;
         writer.terminate()
     }
+
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.writer.as_mut().unwrap().checkpoint()
+    }
 }
 
 #[cfg(test)]

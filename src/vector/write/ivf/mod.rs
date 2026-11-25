@@ -12,6 +12,10 @@
 //! 4. The ExactRows entry of a quantized field, then the IdMap entries and `.centroids` slots
 //!    (`write`).
 //!
+//! A merge handed [`StreamedRows`] runs the same stages over one source, a flat reader over the
+//! rows entry at the head of the target's `.vec`. That entry is the field's ExactRows, so stage 4
+//! writes none.
+//!
 //! Dependencies run one way: `data` reads what `assign` returns, `assign` drives `encode`, and
 //! both write or read `records`, which knows only the block slots and the directory's temporary
 //! files.
@@ -46,6 +50,7 @@ use crate::vector::storage::metadata::Assignment;
 use crate::vector::storage::metadata::VectorColMetadata;
 use crate::vector::storage::reader::VectorIndexReader;
 use crate::vector::write::flat::{write_flat_rows, RowBytes};
+use crate::vector::write::rows::StreamedRows;
 use crate::vector::write::{merge_source_rows, RowAddress};
 use crate::vector::{VectorQuantizationConfig, ENTRY_ALIGN};
 use crate::{DocId, TantivyError};
@@ -128,11 +133,24 @@ struct FieldMerge<'a> {
     name: &'a str,
     opts: &'a VectorOptions,
     quantization: Option<&'a VectorQuantizationConfig>,
-    /// The field's reader in each source segment.
+    /// The field's reader in each source segment. Streamed rows are the field's one source, read
+    /// from the target's unfinished `.vec`.
     readers: Vec<Arc<VectorIndexReader>>,
+    /// Whether the field's rows were streamed into the target's `.vec`.
+    streamed: bool,
     num_target_docs: u32,
     /// IVF clusters each vector is assigned to: 1, or 2 with a replica row in a second cluster.
     replication: u8,
+}
+
+impl FieldMerge<'_> {
+    /// Closes the reader over streamed rows, after the field's last read and before the field's
+    /// first write: no read of the unfinished `.vec` overlaps a write to it.
+    fn close_streamed_reader(&mut self) {
+        if self.streamed {
+            self.readers.clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,11 +162,13 @@ fn quantization_runtime(
 }
 
 /// Writes `ctx`'s target segment as IVF: centroids trained by `clusterer`, every vector assigned,
-/// and a new `router` over the centroids.
+/// and a new `router` over the centroids. With `streamed` rows, the target's `.vec` already holds
+/// the field's ExactRows entry, and its rows stand in for the sources' vectors.
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: &dyn IvfClusterer,
     router: RouterKind,
+    streamed: Option<(CompositeWrite, StreamedRows)>,
 ) -> crate::Result<()> {
     let build_start = Instant::now();
     let mut stage_start = build_start;
@@ -167,7 +187,8 @@ pub(crate) fn merge_ivf(
     ctx.settings.validate_vector_replication()?;
 
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
-    if num_target_docs == 0 {
+    // An open `.vec` is finished even for a segment without documents.
+    if num_target_docs == 0 && streamed.is_none() {
         return Ok(());
     }
 
@@ -178,9 +199,22 @@ pub(crate) fn merge_ivf(
     let centroids_path = ctx
         .target_segment
         .relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
-    let mut vec_file = directory.open_write(&vec_path)?;
-    write_vector_header(&mut vec_file)?;
-    let mut vec_write = CompositeWrite::wrap(vec_file);
+    let (mut vec_write, streamed) = match streamed {
+        Some((vec_write, rows)) => {
+            if rows.path != vec_path {
+                return Err(TantivyError::InternalError(format!(
+                    "vector rows streamed into {:?} cannot finish {vec_path:?}",
+                    rows.path
+                )));
+            }
+            (vec_write, Some(rows))
+        }
+        None => {
+            let mut vec_file = directory.open_write(&vec_path)?;
+            write_vector_header(&mut vec_file)?;
+            (CompositeWrite::wrap(vec_file), None)
+        }
+    };
     let mut centroids_file = directory.open_write(&centroids_path)?;
     write_centroid_header(&mut centroids_file)?;
     let mut centroids_write = CompositeWrite::wrap(centroids_file);
@@ -203,24 +237,45 @@ pub(crate) fn merge_ivf(
         if let Some(config) = quantization {
             config.validate(opts)?;
         }
-        let field_readers: Vec<_> = ctx
-            .readers
-            .iter()
-            .map(|reader| reader.vector_index(field))
-            .collect::<crate::Result<Vec<_>>>()?;
-        let source_rows = merge_source_rows(ctx, &field_readers)?;
+        // The field's rows: the sources' vectors, or the streamed entry read back as one source.
+        // The documents with a streamed row are kept for the field's ExactIdMap.
+        let (field_readers, source_rows, streamed_present) = match &streamed {
+            Some(rows) => {
+                if rows.field != field || quantization.is_none() {
+                    return Err(TantivyError::InternalError(format!(
+                        "streamed vector rows do not belong to quantized field '{}'",
+                        entry.name()
+                    )));
+                }
+                let present = rows.present_docs();
+                let reader =
+                    rows.open_reader(&mut vec_write, directory, opts, num_target_docs, &present)?;
+                let source_rows = StreamedRows::source_rows(&reader, num_target_docs, &present);
+                (vec![Arc::new(reader)], source_rows, Some(present))
+            }
+            None => {
+                let field_readers: Vec<_> = ctx
+                    .readers
+                    .iter()
+                    .map(|reader| reader.vector_index(field))
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let source_rows = merge_source_rows(ctx, &field_readers)?;
+                (field_readers, source_rows, None)
+            }
+        };
         let vector_count = field_readers
             .iter()
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         vectors += vector_count;
-        let merge = FieldMerge {
+        let mut merge = FieldMerge {
             ctx,
             field,
             name: entry.name(),
             opts,
             quantization,
             readers: field_readers,
+            streamed: streamed.is_some(),
             num_target_docs,
             // Replica rows carry codes alone, so only a quantized field can hold them.
             replication: if quantization.is_some() {
@@ -230,6 +285,7 @@ pub(crate) fn merge_ivf(
             },
         };
         if vector_count == 0 {
+            merge.close_streamed_reader();
             write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
             id_maps.push(write::FieldIdMaps::empty(&merge));
             continue;
@@ -245,6 +301,7 @@ pub(crate) fn merge_ivf(
                     // Every vector-bearing doc was deleted. Write the same empty slots as the
                     // no-vectors path: the reader errors on slots missing from composites the
                     // other fields still write.
+                    merge.close_streamed_reader();
                     write::empty_field(&mut vec_write, &mut centroids_write, &merge, router)?;
                     id_maps.push(write::FieldIdMaps::empty(&merge));
                     continue;
@@ -268,6 +325,9 @@ pub(crate) fn merge_ivf(
                     &mut timings,
                 )?;
                 timings.end_assign(finish_stage(&mut stage_start), assigned.encode_and_write);
+                // The assign pass encoded a quantized field's rows, so the entries written from
+                // here read no streamed row.
+                merge.close_streamed_reader();
                 // The `.centroids` doc count: one primary row per document.
                 debug_assert_eq!(assigned.primaries, trained.present_vectors);
                 // The stored assignment says what the blocks hold: replica rows, or one row per
@@ -287,28 +347,34 @@ pub(crate) fn merge_ivf(
                 )?;
                 // A quantized field keeps its full-precision rows in document order, in their own
                 // entry, normalized as the encode pass normalizes the rows it codes; the cluster
-                // blocks carry codes and document ids only.
-                let exact_present = if quantization.is_some() {
-                    let exact_start = Instant::now();
-                    timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
-                    let entry_start = vec_write.written_bytes();
-                    let rows_w =
-                        vec_write.for_field_with_idx(field, VectorEntry::ExactRows.index());
-                    let present = write_flat_rows(
-                        rows_w,
-                        opts,
-                        &source_rows,
-                        &merge.readers,
-                        RowBytes::Normalized,
-                        ctx.cancel,
-                    )?;
-                    timings.exact_reads += present.len();
-                    timings.vec_bytes += vec_write.written_bytes() - entry_start;
-                    timings.exact += exact_start.elapsed();
-                    Some(present)
-                } else {
-                    None
-                };
+                // blocks carry codes and document ids only. Streamed rows are that entry, counted
+                // here with the padding ahead of it.
+                let exact_present =
+                    if let (Some(rows), Some(present)) = (&streamed, streamed_present) {
+                        timings.pad_bytes += rows.lead_pad;
+                        timings.vec_bytes += rows.entry_len();
+                        Some(present)
+                    } else if quantization.is_some() {
+                        let exact_start = Instant::now();
+                        timings.pad_bytes += vec_write.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
+                        let entry_start = vec_write.written_bytes();
+                        let rows_w =
+                            vec_write.for_field_with_idx(field, VectorEntry::ExactRows.index());
+                        let present = write_flat_rows(
+                            rows_w,
+                            opts,
+                            &source_rows,
+                            &merge.readers,
+                            RowBytes::Normalized,
+                            ctx.cancel,
+                        )?;
+                        timings.exact_reads += present.len();
+                        timings.vec_bytes += vec_write.written_bytes() - entry_start;
+                        timings.exact += exact_start.elapsed();
+                        Some(present)
+                    } else {
+                        None
+                    };
                 id_maps.push(write::FieldIdMaps {
                     field,
                     locations,

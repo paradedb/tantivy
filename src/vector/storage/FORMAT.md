@@ -89,7 +89,10 @@ full-precision vectors sit in ExactRows, a flat entry in document order,
 addressed through ExactIdMap exactly as a flat field's rows are addressed
 through its IdMap. Each row holds the bytes its codes were encoded from: the
 source row, normalized under the field's metric as the encode pass normalizes
-it. No full-precision vector is stored twice.
+it. A row streamed into the entry ahead of the merge holds the same bytes: the
+row as indexing admits it, normalized under the field's metric once more; its
+codes are encoded from the stored row passed through that normalization again.
+No full-precision vector is stored twice.
 
 ```text
 <segment-id>.vec: logical contents of one quantized clustered field
@@ -131,7 +134,9 @@ No cumulative row-offset array is stored in either file.
 
 ### File framing and field entries
 
-The diagram above groups entries by field. The physical writer places **every
+The diagram above groups entries by field. The physical order of entries is not
+part of the format: the composite directory locates each entry by field and
+entry index, and readers open entries only through it. A merge places **every
 field's Data entry, each followed by its ExactRows entry when the field has one,
 before every field's IdMap entry, each followed by its ExactIdMap entry**, then
 the composite directory:
@@ -156,6 +161,34 @@ the composite directory:
 +----------------------------------------------------------------------+
 | IdMap(field B)                                                       |
 | ... remaining IdMap and ExactIdMap entries                           |
++----------------------------------------------------------------------+
+| Composite directory: (field, entry index) -> entry location          |
++----------------------------------------------------------------------+
+| Composite directory length: u32                                      |
++----------------------------------------------------------------------+
+| Standard Tantivy checksum/version footer: 24 bytes                   |
++----------------------------------------------------------------------+
+```
+
+A build that streams a quantized field's full-precision rows into the segment
+ahead of its merge writes the same entries with the rows first: ExactRows, Data,
+IdMap, ExactIdMap. When that segment ends below the clustering threshold the
+streamed rows are its Data entry and the file is a flat field's: Data, IdMap.
+
+```text
+<segment-id>.vec with streamed rows: bytes from start to end
++----------------------------------------------------------------------+
+| Version: u32 = 6                                                     |
++----------------------------------------------------------------------+
+| Zero padding to an absolute 8-byte boundary                          |
++----------------------------------------------------------------------+
+| ExactRows(field A)                                                   |
++----------------------------------------------------------------------+
+| Data(field A)                                                        |
++----------------------------------------------------------------------+
+| IdMap(field A)                                                       |
++----------------------------------------------------------------------+
+| ExactIdMap(field A)                                                  |
 +----------------------------------------------------------------------+
 | Composite directory: (field, entry index) -> entry location          |
 +----------------------------------------------------------------------+
@@ -810,7 +843,7 @@ boundaries; sorted row requests are split into their containing blocks.
 The writer streams a plain cluster's full vector rows immediately and buffers
 encoded columns for one cluster, then flushes them in layout order; a quantized
 field's full vectors stream in document order into ExactRows in a pass of their
-own. The reader materializes
+own, or ahead of the merge when the build streams them. The reader materializes
 field metadata, count words, and router topology. Block tuples and centroid
 vectors at every routing level remain available through lazy range reads. Each
 local `Block` reuses its resolved boundaries while reading columns; the shared

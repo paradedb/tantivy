@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use columnar::{compute_merged_term_ord_mapping, BytesColumn, Column};
 use common::ReadOnlyBitSet;
@@ -11,6 +11,7 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
 use crate::termdict::TermOrdinal;
+use crate::vector::VectorRowsWriter;
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
 
 /// Per-segment accessor for Str/Bytes sort fields during index merging.
@@ -525,6 +526,26 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, target_segment: &Segment) -> crate::Result<u32> {
+        self.write_plugins(target_segment, None)
+    }
+
+    /// [`write`](Self::write) for a target whose vector rows were streamed: the vector plugin reads
+    /// `rows` in place of the sources' vectors and finishes the `.vec` they opened.
+    ///
+    /// The sources must stack in the order the rows' documents were numbered, without deletes.
+    pub fn write_with_vector_rows(
+        &self,
+        target_segment: &Segment,
+        rows: VectorRowsWriter,
+    ) -> crate::Result<u32> {
+        self.write_plugins(target_segment, Some(rows))
+    }
+
+    fn write_plugins(
+        &self,
+        target_segment: &Segment,
+        vector_rows: Option<VectorRowsWriter>,
+    ) -> crate::Result<u32> {
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
@@ -535,6 +556,16 @@ impl IndexMerger {
         } else {
             self.get_doc_id_from_concatenated_data()?
         };
+
+        // Streamed rows sit in target document order, which the sources reproduce only when they
+        // stack whole.
+        if vector_rows.is_some() && doc_id_mapping.mapping_type() != MappingType::Stacked {
+            return Err(crate::TantivyError::InternalError(
+                "streamed vector rows need sources that stack in document order without deletes"
+                    .to_string(),
+            ));
+        }
+        let vector_rows = vector_rows.map(|rows| Mutex::new(Some(rows)));
 
         // Merge plugins in write order (matching `Index::all_plugins`):
         // inverted index, then fast_fields, store, and custom plugins.
@@ -551,7 +582,13 @@ impl IndexMerger {
                 settings: &self.index_settings,
                 ignore_store: self.ignore_store,
                 cancel: &*self.cancel,
+                vector_rows: vector_rows.as_ref(),
             })?;
+        }
+        if vector_rows.is_some_and(|rows| rows.into_inner().unwrap().is_some()) {
+            return Err(crate::TantivyError::InternalError(
+                "no plugin merged the streamed vector rows".to_string(),
+            ));
         }
 
         Ok(self.max_doc)

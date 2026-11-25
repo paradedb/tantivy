@@ -69,6 +69,28 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         &mut self.write
     }
 
+    /// The writer for the bytes of an entry declared through [`Self::declare_field_at`] once its
+    /// index is known.
+    pub(crate) fn undeclared(&mut self) -> &mut CountingWriter<W> {
+        &mut self.write
+    }
+
+    /// Declares `field`'s entry `idx` as starting at `offset`, bytes already written through
+    /// [`Self::undeclared`]. No declared entry starts after `offset`.
+    pub(crate) fn declare_field_at(&mut self, field: Field, idx: usize, offset: u64) {
+        let file_addr = FileAddr::new(field, idx);
+        assert!(!self.offsets.iter().any(|el| el.0 == file_addr));
+        assert!(self.offsets.last().is_none_or(|el| el.1 <= offset));
+        assert!(offset <= self.write.written_bytes());
+        self.offsets.push((file_addr, offset));
+    }
+
+    /// Makes the bytes written so far readable while the file stays open for writing; see
+    /// [`TerminatingWrite::checkpoint`].
+    pub(crate) fn checkpoint(&mut self) -> io::Result<()> {
+        self.write.checkpoint()
+    }
+
     /// Pad the underlying file so the next field begins at an aligned
     /// absolute file offset.
     ///

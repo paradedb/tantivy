@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use common::CountingWriter;
@@ -26,11 +26,12 @@ use crate::vector::storage::header::{write_vector_header, VectorEntry, HEADER_LE
 use crate::vector::storage::id_map::IdMap;
 use crate::vector::storage::metadata::{VectorColMetadata, FLAT_ROWS_PER_BLOCK};
 use crate::vector::storage::reader::VectorIndexReader;
+use crate::vector::write::rows::StreamedRows;
 use crate::vector::write::RowAddress;
 use crate::vector::ENTRY_ALIGN;
 use crate::{DocId, TantivyError};
 
-// --- Writer ---
+// --- Admission ---
 
 /// The error for a document whose vector the admission rule refuses.
 fn refused_row(invalid: InvalidVector, field: &str, doc_id: DocId) -> TantivyError {
@@ -46,38 +47,143 @@ fn refused_row(invalid: InvalidVector, field: &str, doc_id: DocId) -> TantivyErr
     })
 }
 
-/// Buffers one vector field before serialization.
-struct FieldBuffer {
-    present_doc_ids: Vec<DocId>,
-    row_bytes: Vec<u8>,
+/// The rule every row of a field passes on its way into storage: its byte length, the admission
+/// of its squared norm, and unit normalization when the field stores unit rows.
+pub(crate) struct RowAdmission {
     opts: VectorOptions,
     norm_policy: VectorNormPolicy,
 }
 
-impl FieldBuffer {
-    /// Admits a document's row and buffers it, normalized when the field stores unit rows. The
-    /// row's one norm pass serves both the admission and the normalization; a refused row leaves
-    /// the buffer unchanged.
-    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> Result<(), InvalidVector> {
-        debug_assert_eq!(bytes.len(), self.opts.bytes_per_vector());
+impl RowAdmission {
+    pub(crate) fn new(opts: &VectorOptions) -> Self {
+        Self {
+            opts: opts.clone(),
+            norm_policy: VectorNormPolicy::for_options(opts),
+        }
+    }
+
+    pub(crate) fn options(&self) -> &VectorOptions {
+        &self.opts
+    }
+
+    /// Admits `doc_id`'s row of the field named `field` and appends it to `out`, normalized when
+    /// the field stores unit rows. The row's one norm pass serves both the admission and the
+    /// normalization; a refused row leaves `out` unchanged.
+    pub(crate) fn admit(
+        &self,
+        field: &str,
+        doc_id: DocId,
+        bytes: &[u8],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        let stride = self.opts.bytes_per_vector();
+        if bytes.len() != stride {
+            return Err(TantivyError::SchemaError(format!(
+                "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
+                field,
+                stride,
+                bytes.len(),
+            )));
+        }
         let norm_squared = row_norm_squared(self.opts.dtype(), bytes);
-        admit(norm_squared, self.norm_policy)?;
-        self.present_doc_ids.push(doc_id);
-        let start = self.row_bytes.len();
-        self.row_bytes.extend_from_slice(bytes);
+        admit(norm_squared, self.norm_policy)
+            .map_err(|invalid| refused_row(invalid, field, doc_id))?;
+        let start = out.len();
+        out.extend_from_slice(bytes);
         match self.norm_policy {
             VectorNormPolicy::UnitL2 => {
-                normalize_row_with_norm_squared(
-                    self.opts.dtype(),
-                    &mut self.row_bytes[start..],
-                    norm_squared,
-                );
+                normalize_row_with_norm_squared(self.opts.dtype(), &mut out[start..], norm_squared);
             }
             VectorNormPolicy::None => {}
         }
         Ok(())
     }
+}
 
+// --- Flat entry ---
+
+/// Writes one flat entry: the metadata, the rows in groups of [`FLAT_ROWS_PER_BLOCK`], each group
+/// padded to the block alignment, and the block offsets. Rows stream without the final count.
+pub(crate) struct FlatEntryWriter {
+    stride: usize,
+    align: usize,
+    block_offsets: BlockOffsetsWriter,
+    /// Bytes of the entry written so far.
+    written: u64,
+    num_rows: usize,
+}
+
+impl FlatEntryWriter {
+    /// Starts an entry of `opts` rows on `out` with its metadata.
+    pub(crate) fn start(out: &mut impl Write, opts: &VectorOptions) -> io::Result<Self> {
+        let meta = VectorColMetadata::build_flat(opts);
+        let align = block_align(&meta.slots());
+        let written = write_metadata(out, &meta)? as u64;
+        Ok(Self {
+            stride: opts.bytes_per_vector(),
+            align,
+            block_offsets: BlockOffsetsWriter::new(written),
+            written,
+            num_rows: 0,
+        })
+    }
+
+    /// Rows appended so far.
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Appends `rows`, a whole number of rows, closing each group it fills.
+    pub(crate) fn push_rows(&mut self, out: &mut impl Write, mut rows: &[u8]) -> io::Result<()> {
+        debug_assert_eq!(rows.len() % self.stride, 0);
+        let group = FLAT_ROWS_PER_BLOCK as usize;
+        while !rows.is_empty() {
+            let room = group - self.num_rows % group;
+            let (head, tail) = rows.split_at(room.min(rows.len() / self.stride) * self.stride);
+            out.write_all(head)?;
+            self.written += head.len() as u64;
+            self.num_rows += head.len() / self.stride;
+            if self.num_rows % group == 0 {
+                self.end_group(out, group)?;
+            }
+            rows = tail;
+        }
+        Ok(())
+    }
+
+    /// Pads a group of `rows` rows to the block alignment and records its end.
+    fn end_group(&mut self, out: &mut impl Write, rows: usize) -> io::Result<()> {
+        let bytes = rows * self.stride;
+        let padding = align_up(bytes, self.align) - bytes;
+        pad(out, padding)?;
+        self.written += padding as u64;
+        self.block_offsets.push(self.written, rows);
+        Ok(())
+    }
+
+    /// Closes the last, partial group and writes the block offsets. Returns the entry's length, a
+    /// multiple of [`ENTRY_ALIGN`].
+    pub(crate) fn finish(mut self, out: &mut impl Write) -> io::Result<u64> {
+        let partial = self.num_rows % FLAT_ROWS_PER_BLOCK as usize;
+        if partial != 0 {
+            self.end_group(out, partial)?;
+        }
+        let len = self.block_offsets.finish(out)?;
+        assert_eq!(len % ENTRY_ALIGN, 0);
+        Ok(len as u64)
+    }
+}
+
+// --- Writer ---
+
+/// Buffers one vector field before serialization.
+struct FieldBuffer {
+    present_doc_ids: Vec<DocId>,
+    row_bytes: Vec<u8>,
+    admission: RowAdmission,
+}
+
+impl FieldBuffer {
     fn mem_usage(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.present_doc_ids.capacity() * std::mem::size_of::<DocId>()
@@ -103,8 +209,7 @@ impl FlatVecWriter {
                     FieldBuffer {
                         present_doc_ids: Vec::new(),
                         row_bytes: Vec::new(),
-                        opts: opts.clone(),
-                        norm_policy: VectorNormPolicy::for_options(opts),
+                        admission: RowAdmission::new(opts),
                     },
                 );
             }
@@ -140,18 +245,10 @@ impl PluginWriter for FlatVecWriter {
                     schema.get_field_entry(field).name()
                 )));
             };
-            let stride = buf.opts.bytes_per_vector();
-            if bytes.len() != stride {
-                return Err(TantivyError::SchemaError(format!(
-                    "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
-                    schema.get_field_entry(field).name(),
-                    stride,
-                    bytes.len(),
-                )));
-            }
-            buf.push_bytes(doc_id, bytes).map_err(|invalid| {
-                refused_row(invalid, schema.get_field_entry(field).name(), doc_id)
-            })?;
+            let name = schema.get_field_entry(field).name();
+            buf.admission
+                .admit(name, doc_id, bytes, &mut buf.row_bytes)?;
+            buf.present_doc_ids.push(doc_id);
         }
         Ok(())
     }
@@ -173,7 +270,8 @@ impl PluginWriter for FlatVecWriter {
             // Compute (present, row_bytes) in target doc-id order. For
             // the no-remap case the writer already accumulates in
             // ascending insertion (= target) order.
-            let stride = buf.opts.bytes_per_vector();
+            let opts = buf.admission.options();
+            let stride = opts.bytes_per_vector();
             let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
                 let mut p = Vec::new();
                 let mut r = Vec::new();
@@ -191,21 +289,11 @@ impl PluginWriter for FlatVecWriter {
 
             // Data entries precede IdMaps so their exact lengths exclude alignment padding.
             id_maps.push((field, present));
-            let meta = VectorColMetadata::build_flat(&buf.opts);
-            let align = block_align(&meta.slots());
             composite.align_next_field(ENTRY_ALIGN, HEADER_LEN)?;
             let data = composite.for_field_with_idx(field, VectorEntry::Data.index());
-            let start = data.written_bytes();
-            write_metadata(data, &meta)?;
-            let mut block_offsets = BlockOffsetsWriter::new(data.written_bytes() - start);
-            // A full row group or the final partial group forms one aligned Rows column.
-            for block in row_bytes.chunks(FLAT_ROWS_PER_BLOCK as usize * stride) {
-                data.write_all(block)?;
-                pad(data, align_up(block.len(), align) - block.len())?;
-                block_offsets.push(data.written_bytes() - start, block.len() / stride);
-            }
-            block_offsets.finish(data)?;
-            assert_eq!((data.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
+            let mut entry = FlatEntryWriter::start(data, opts)?;
+            entry.push_rows(data, &row_bytes)?;
+            entry.finish(data)?;
             data.flush()?;
         }
         for (field, present) in id_maps {
@@ -239,8 +327,12 @@ impl PluginWriter for FlatVecWriter {
 
 // --- Merge ---
 
-/// Merges source vectors into a flat target segment.
-pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
+/// Merges source vectors into a flat target segment. With `streamed` rows, the target's `.vec`
+/// already holds them as its Data entry and only the IdMap is written.
+pub(crate) fn merge_flat(
+    ctx: &PluginMergeContext,
+    streamed: Option<(CompositeWrite, StreamedRows)>,
+) -> crate::Result<()> {
     let has_vector_field = ctx
         .schema
         .fields()
@@ -250,6 +342,16 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     }
     if ctx.cancel.wants_cancel() {
         return Err(crate::TantivyError::Cancelled);
+    }
+    if let Some((mut composite, rows)) = streamed {
+        let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum::<u32>();
+        IdMap::serialize(
+            &rows.present_docs(),
+            num_target_docs,
+            composite.for_field_with_idx(rows.field, VectorEntry::IdMap.index()),
+        )?;
+        composite.close()?;
+        return Ok(());
     }
     let path = ctx
         .target_segment
@@ -322,12 +424,7 @@ pub(crate) fn write_flat_rows<W: Write>(
 ) -> crate::Result<Vec<DocId>> {
     let normalize = row_bytes == RowBytes::Normalized && opts.needs_normalization();
     let mut normalized = Vec::new();
-    let meta = VectorColMetadata::build_flat(opts);
-    let align = block_align(&meta.slots());
-    let start = rows_w.written_bytes();
-    write_metadata(rows_w, &meta)?;
-    let mut block_offsets = BlockOffsetsWriter::new(rows_w.written_bytes() - start);
-    let mut block_bytes = 0;
+    let mut entry = FlatEntryWriter::start(rows_w, opts)?;
     let mut present: Vec<DocId> = Vec::new();
     for (target_doc_id, source) in source_rows.iter().enumerate() {
         if cancel.wants_cancel() {
@@ -347,23 +444,86 @@ pub(crate) fn write_flat_rows<W: Write>(
             &bytes
         };
         present.push(target_doc_id as DocId);
-        rows_w.write_all(row)?;
-        block_bytes += row.len();
-        if present.len() % FLAT_ROWS_PER_BLOCK as usize == 0 {
-            pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-            block_offsets.push(rows_w.written_bytes() - start, FLAT_ROWS_PER_BLOCK as usize);
-            block_bytes = 0;
-        }
+        entry.push_rows(rows_w, row)?;
     }
-    pad(rows_w, align_up(block_bytes, align) - block_bytes)?;
-    if block_bytes != 0 {
-        block_offsets.push(
-            rows_w.written_bytes() - start,
-            present.len() % FLAT_ROWS_PER_BLOCK as usize,
-        );
-    }
-    block_offsets.finish(rows_w)?;
-    assert_eq!((rows_w.written_bytes() - start) as usize % ENTRY_ALIGN, 0);
+    entry.finish(rows_w)?;
     rows_w.flush()?;
     Ok(present)
+}
+
+#[cfg(test)]
+mod tests {
+    use common::CountingWriter;
+
+    use super::*;
+    use crate::directory::FileSlice;
+    use crate::schema::Metric;
+    use crate::vector::storage::blocks::Blocks;
+    use crate::vector::test_support::FixtureSpec;
+    use crate::vector::BlockAddress;
+
+    /// Rows pushed one at a time form the entry [`write_flat_rows`] writes from a source segment
+    /// holding the same rows, and the entry reads back as those rows.
+    #[test]
+    fn flat_entry_writer_matches_write_flat_rows() -> crate::Result<()> {
+        let opts = VectorOptions::new(2, Metric::L2);
+        let group = FLAT_ROWS_PER_BLOCK as usize;
+        for num_rows in [0, 1, group, group + 1] {
+            let vectors: Vec<Vec<f32>> = (0..num_rows)
+                .map(|row| vec![row as f32, -(row as f32)])
+                .collect();
+            let rows: Vec<u8> = vectors
+                .iter()
+                .flatten()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+
+            let mut pushed = Vec::new();
+            let mut entry = FlatEntryWriter::start(&mut pushed, &opts)?;
+            for row in rows.chunks_exact(opts.bytes_per_vector()) {
+                entry.push_rows(&mut pushed, row)?;
+            }
+            assert_eq!(entry.finish(&mut pushed)? as usize, pushed.len());
+
+            let fixture = FixtureSpec::flat(Metric::L2, 2, vectors.into_iter().map(Some).collect())
+                .build()?;
+            let searcher = fixture.index.reader()?.searcher();
+            let readers = searcher
+                .segment_readers()
+                .iter()
+                .map(|reader| reader.vector_index(fixture.field))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let source_rows: Vec<Option<RowAddress>> = (0..num_rows as u32)
+                .map(|row| {
+                    Some(RowAddress {
+                        segment_ord: 0,
+                        block_address: BlockAddress::new(
+                            row / FLAT_ROWS_PER_BLOCK,
+                            row % FLAT_ROWS_PER_BLOCK,
+                        ),
+                    })
+                })
+                .collect();
+            let mut merged = CountingWriter::wrap(Vec::new());
+            let present = write_flat_rows(
+                &mut merged,
+                &opts,
+                &source_rows,
+                &readers,
+                RowBytes::Stored,
+                &(|| false),
+            )?;
+            assert_eq!(present.len(), num_rows);
+            assert_eq!(pushed, merged.finish(), "{num_rows} rows");
+
+            let blocks = Blocks::open(FileSlice::from(pushed), &opts, false)?;
+            assert_eq!(blocks.num_rows(), num_rows);
+            assert_eq!(blocks.num_blocks(), num_rows.div_ceil(group));
+            assert_eq!(
+                blocks.flat_rows().unwrap().read_bytes()?.as_slice(),
+                rows.as_slice()
+            );
+        }
+        Ok(())
+    }
 }
