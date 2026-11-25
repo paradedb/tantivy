@@ -144,3 +144,4 @@ pub use storage::io::{current_vector_read_kind, VectorReadKind};
 pub use storage::{VectorIndexReader, VectorIoStats};
 pub use telemetry::{current_vector_stage, VectorStage};
 pub use tie_break::NoTieBreak;
+pub use write::rows::VectorRowsWriter;

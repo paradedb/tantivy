@@ -848,6 +848,7 @@ fn merge_source_addresses_case(schedule: &[u8]) -> crate::Result<()> {
         settings: index.settings(),
         ignore_store: false,
         cancel: &|| false,
+        vector_rows: None,
     };
     directory.reads.lock().unwrap().clear();
     let rows = crate::vector::write::merge_source_rows(&context, &[Arc::clone(&vectors)])?;

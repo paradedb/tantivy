@@ -70,7 +70,8 @@ pub(super) fn centroid_slots(
 }
 
 /// Writes an empty IVF field to both vector composites, with a `router` built over no centroids:
-/// a Data entry of metadata and no blocks and, for a quantized field, an ExactRows entry alike.
+/// a Data entry of metadata and no blocks and, for a quantized field whose rows were not streamed
+/// into an ExactRows entry, an ExactRows entry alike.
 pub(super) fn empty_field(
     vec_write: &mut CompositeWrite,
     centroids_write: &mut CompositeWrite,
@@ -81,7 +82,7 @@ pub(super) fn empty_field(
     let router = train::build_router(router, opts, &mut no_centroids(opts))?;
     let meta = VectorColMetadata::build_ivf(opts, merge.quantization)?;
     let mut entries = vec![(VectorEntry::Data, meta)];
-    if merge.quantization.is_some() {
+    if merge.quantization.is_some() && !merge.streamed {
         entries.push((VectorEntry::ExactRows, VectorColMetadata::build_flat(opts)));
     }
     for (entry, meta) in entries {

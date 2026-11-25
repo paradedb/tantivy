@@ -52,6 +52,11 @@ impl<W: TerminatingWrite> TerminatingWrite for CountingWriter<W> {
     fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
         self.underlying.terminate_ref(token)
     }
+
+    #[inline]
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.underlying.checkpoint()
+    }
 }
 
 /// Struct used to prevent from calling
@@ -74,11 +79,24 @@ pub trait TerminatingWrite: Write {
     /// You should implement this function to define custom behavior.
     /// This function should flush any buffer it may hold.
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()>;
+
+    /// Makes every byte written so far readable through `Directory::open_unfinished` while the
+    /// file stays open for writing. A file is checkpointed at most once.
+    fn checkpoint(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "writer does not support checkpoints",
+        ))
+    }
 }
 
 impl<W: TerminatingWrite + ?Sized> TerminatingWrite for Box<W> {
     fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
         self.as_mut().terminate_ref(token)
+    }
+
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.as_mut().checkpoint()
     }
 }
 
@@ -86,6 +104,11 @@ impl<W: TerminatingWrite> TerminatingWrite for BufWriter<W> {
     fn terminate_ref(&mut self, a: AntiCallToken) -> io::Result<()> {
         self.flush()?;
         self.get_mut().terminate_ref(a)
+    }
+
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.get_mut().checkpoint()
     }
 }
 

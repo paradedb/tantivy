@@ -7,6 +7,11 @@
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
 //!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF
 //!   `.vec` (with `IdMap::DocLocations`) plus a `.centroids` file.
+//! - A build may hand a merge the target's full-precision rows instead of leaving them in the
+//!   sources: a [`VectorRowsWriter`](rows::VectorRowsWriter) appends them to the target's `.vec` in
+//!   document order, and the merge declares that entry as the flat target's Data or the clustered
+//!   target's ExactRows, reads its rows back for training and assignment, and writes the remaining
+//!   entries after it.
 //! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec` slots
 //!   (and the `.centroids` sidecar when present) via
 //!   [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).
@@ -17,12 +22,13 @@
 
 pub(crate) mod flat;
 pub(crate) mod ivf;
+pub(crate) mod rows;
 
 use std::sync::Arc;
 
 use crate::error::DataCorruption;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
-use crate::vector::storage::header::{CENTROIDS_EXT, VEC_EXT};
+use crate::vector::storage::header::{VectorEntry, CENTROIDS_EXT, VEC_EXT};
 use crate::vector::write::flat::{merge_flat, FlatVecWriter};
 use crate::vector::write::ivf::merge_ivf;
 use crate::vector::{BlockAddress, VectorIndexReader};
@@ -52,13 +58,28 @@ impl SegmentPlugin for VectorPlugin {
         // Target cardinality selects uniform or clustered storage.
         let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
         let threshold = ctx.settings.vector_clustering_threshold();
-        if (target_docs as usize) < threshold {
-            merge_flat(&ctx)
+        let flat = (target_docs as usize) < threshold;
+        // Streamed rows are the target's first entry: a flat target's Data, a clustered target's
+        // ExactRows.
+        let streamed = match ctx.vector_rows.and_then(|rows| rows.lock().unwrap().take()) {
+            Some(rows) => {
+                let kind = if flat {
+                    VectorEntry::Data
+                } else {
+                    VectorEntry::ExactRows
+                };
+                Some(rows.finish(kind, target_docs)?)
+            }
+            None => None,
+        };
+        if flat {
+            merge_flat(&ctx, streamed)
         } else {
             merge_ivf(
                 &ctx,
                 ctx.target_segment.index().ivf_clusterer(),
                 ctx.target_segment.index().ivf_router(),
+                streamed,
             )
         }
     }

@@ -894,3 +894,213 @@ fn routed_build_preserves_documents_replicas_and_exhaustive_results() -> Result<
     }
     Ok(())
 }
+
+// --- Streamed rows ---
+
+/// One build's vector files: the whole `.vec`, its four entries by index, and `.centroids`.
+struct BuiltVectorFiles {
+    vec: Vec<u8>,
+    entries: [Option<Vec<u8>>; 4],
+    centroids: Option<Vec<u8>>,
+    /// The merge's `ivf_build` line, when it clustered.
+    build_line: Option<String>,
+}
+
+/// Row `doc` of the streamed-rows fixture: four entries of one magnitude, so cosine normalization
+/// gives exactly `+-0.5` and leaves a normalized row's bytes unchanged.
+fn rows_once_vector(doc: usize) -> Vec<f32> {
+    const DIM: usize = 64;
+    let magnitude = 1.0 + (doc % 5) as f32;
+    let mut vector = vec![0.0; DIM];
+    for position in 0..4 {
+        let sign = if (doc >> position) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        vector[(doc + position * (1 + doc % 3)) % DIM] += sign * magnitude;
+    }
+    if vector.iter().filter(|value| **value != 0.0).count() != 4 {
+        vector.fill(0.0);
+        vector[..4].fill(magnitude);
+    }
+    vector
+}
+
+/// Builds 157 documents, the vectors of 135 of them when `missing`, as two staged segments merged
+/// into one target, clustered or flat. `streamed` hands the rows to a [`VectorRowsWriter`] and
+/// stages the documents without them.
+fn rows_once_build(
+    streamed: bool,
+    clustered: bool,
+    missing: bool,
+) -> crate::Result<BuiltVectorFiles> {
+    use crate::directory::{CompositeFile, Directory};
+    use crate::index::SegmentComponent;
+    use crate::indexer::merger::IndexMerger;
+    use crate::indexer::{AddOperation, SegmentWriter};
+    use crate::vector::storage::header::{read_vector_header, CENTROIDS_EXT, VEC_EXT};
+    use crate::vector::VectorRowsWriter;
+
+    const DOCS: usize = 157;
+    let options = VectorOptions::new(64, Metric::Cosine);
+    let mut schema = Schema::builder();
+    let field = schema.add_vector_field("embedding", options.clone());
+    let label = schema.add_text_field("label", STRING);
+    let centroids: Vec<Vec<f32>> = (0..4).map(rows_once_vector).collect();
+    let index = Index::builder()
+        .schema(schema.build())
+        .settings(IndexSettings {
+            vector_clustering_threshold: if clustered { 1 } else { usize::MAX },
+            vector_replication: 2,
+            vector_quantization: vec![VectorQuantizationConfig::materialize(
+                "embedding".to_string(),
+                &options,
+                vec![
+                    VectorQuantizationLayer { bits: 1, seed: 7 },
+                    VectorQuantizationLayer { bits: 1, seed: 11 },
+                ],
+            )?],
+            ..IndexSettings::default()
+        })
+        .ivf_clusterer(Arc::new(NearestClusterer {
+            centroids,
+            pairs: true,
+        }))
+        .ivf_router(RouterKind::Exact)
+        .create_in_ram()?;
+    assert_eq!(VectorRowsWriter::field_for(&index), Some(field));
+
+    let target = index.new_segment();
+    let mut rows = streamed
+        .then(|| VectorRowsWriter::create(&target, field))
+        .transpose()?;
+    let mut sources = Vec::new();
+    for docs in [0..DOCS / 2, DOCS / 2..DOCS] {
+        let segment = index.new_segment();
+        let mut writer = SegmentWriter::for_segment(15_000_000, segment.clone(), true)?;
+        for doc in docs {
+            let mut document = TantivyDocument::new();
+            document.add_text(label, format!("d{doc}"));
+            if !missing || doc % 7 != 3 {
+                let vector = rows_once_vector(doc);
+                match rows.as_mut() {
+                    Some(rows) => {
+                        let bytes: Vec<u8> = vector
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        rows.push(doc as u32, &bytes)?;
+                    }
+                    None => document.add_vector(field, &vector),
+                }
+            }
+            writer.add_document(AddOperation {
+                opstamp: doc as u64,
+                document,
+            })?;
+        }
+        let max_doc = writer.max_doc();
+        writer.finalize()?;
+        sources.push(segment.with_max_doc(max_doc));
+    }
+
+    let _ = log::set_logger(&CAPTURE_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+    let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+    let merger = IndexMerger::open(
+        index.schema(),
+        index.settings().clone(),
+        &sources,
+        Box::new(|| false),
+        true,
+    )?;
+    let num_docs = match rows {
+        Some(rows) => merger.write_with_vector_rows(&target, rows)?,
+        None => merger.write(&target)?,
+    };
+    assert_eq!(num_docs as usize, DOCS);
+    let vectors = if missing { 135 } else { DOCS };
+    let build_line = CAPTURED_IVF_BUILD.lock().unwrap()[before..]
+        .iter()
+        .find(|line| line.contains(&format!(" vectors={vectors} ")))
+        .cloned();
+
+    let read = |extension: &str| {
+        let path = target.relative_path(SegmentComponent::Custom(extension.to_string()));
+        index.directory().open_read(&path).ok()
+    };
+    let vec = read(VEC_EXT).expect("a .vec file");
+    let (_, body) = read_vector_header(&vec)?;
+    let composite = CompositeFile::open(&body)?;
+    let entry = |idx: usize| -> crate::Result<Option<Vec<u8>>> {
+        let Some(entry) = composite.open_read_with_idx(field, idx) else {
+            return Ok(None);
+        };
+        Ok(Some(entry.read_bytes()?.as_slice().to_vec()))
+    };
+    let entries = [entry(0)?, entry(1)?, entry(2)?, entry(3)?];
+    let centroids = match read(CENTROIDS_EXT) {
+        Some(file) => Some(file.read_bytes()?.as_slice().to_vec()),
+        None => None,
+    };
+
+    // The target opens as a segment and holds a row per document with a vector.
+    let reader = crate::SegmentReader::open(&target.clone().with_max_doc(num_docs))?;
+    assert_eq!(reader.vector_index(field)?.num_vectors(), vectors);
+    Ok(BuiltVectorFiles {
+        vec: vec.read_bytes()?.as_slice().to_vec(),
+        entries,
+        centroids,
+        build_line,
+    })
+}
+
+/// A build that streams its rows writes, entry for entry, the bytes of a build that stages them:
+/// a clustered target's four `.vec` entries and its `.centroids`, and a flat target's whole
+/// `.vec`. The streamed merge reads no row for an exact-rows pass and counts the same bytes.
+#[test]
+fn streamed_rows_write_the_bytes_of_staged_rows() -> crate::Result<()> {
+    let key = |line: &str, key: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .parse()
+            .unwrap()
+    };
+    for clustered in [true, false] {
+        for missing in [false, true] {
+            let case = format!("clustered {clustered}, missing {missing}");
+            let staged = rows_once_build(false, clustered, missing)?;
+            let streamed = rows_once_build(true, clustered, missing)?;
+            assert_eq!(staged.entries, streamed.entries, "{case}: entries");
+            assert_eq!(staged.centroids, streamed.centroids, "{case}: .centroids");
+            assert_eq!(staged.centroids.is_some(), clustered, "{case}");
+            assert_eq!(staged.entries[3].is_some(), clustered, "{case}");
+            if !clustered {
+                assert_eq!(staged.vec, streamed.vec, "{case}: .vec");
+                continue;
+            }
+            assert_ne!(staged.vec, streamed.vec, "{case}: entry order");
+            let (staged, streamed) = (
+                staged.build_line.expect("staged ivf_build line"),
+                streamed.build_line.expect("streamed ivf_build line"),
+            );
+            assert_eq!(
+                key(&staged, "exact_reads"),
+                key(&staged, "vectors"),
+                "{staged}"
+            );
+            assert_eq!(key(&streamed, "exact_reads"), 0, "{streamed}");
+            assert_eq!(key(&streamed, "exact_ms"), 0, "{streamed}");
+            for bytes in ["vec_bytes", "pad_bytes"] {
+                assert_eq!(
+                    key(&staged, bytes),
+                    key(&streamed, bytes),
+                    "{case}: {bytes}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
