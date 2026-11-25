@@ -15,8 +15,6 @@ use std::sync::OnceLock;
 use common::TinySet;
 use proptest::prelude::*;
 
-use super::exclude::BatchExcludeScorer;
-use super::intersection::BatchFilteredScorer;
 use super::*;
 use crate::docset::{fill_all_candidates_mask, SeekDangerResult};
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
@@ -35,6 +33,8 @@ enum Kind {
     Phrase,
     PhrasePrefix,
     FastFieldRange,
+    PredicateColumn,
+    CachedDictPredicate,
     ScorerWrapper,
 }
 
@@ -82,11 +82,13 @@ implementations! {
     ("phrase_query/phrase_scorer.rs", Phrase, query_seek_danger_phrase),
     ("phrase_prefix_query/phrase_prefix_scorer.rs", PhrasePrefix, query_seek_danger_phrase_prefix),
     ("range_query/fast_field_range_doc_set.rs", FastFieldRange, query_seek_danger_fast_field_range),
+    ("term_set_query/term_predicate.rs", PredicateColumn, query_seek_danger_predicate_column),
+    ("term_set_query/term_predicate.rs", CachedDictPredicate, query_seek_danger_cached_dict_predicate),
     ("disjunction.rs", ScorerWrapper, query_seek_danger_scorer_wrapper),
 }
 
 // Overrides not yet covered by the expression generator above.
-const EXTRA_INVENTORY: &[(&str, usize)] = &[];
+const FORK_INVENTORY: &[(&str, usize)] = &[("query/term_set_query/term_set_weight.rs", 1)];
 
 #[derive(Clone, Debug)]
 enum Expr {
@@ -94,8 +96,39 @@ enum Expr {
     Node(Kind, Box<Expr>, Box<Expr>),
 }
 
+#[derive(Debug)]
+struct ModuloPredicate;
+
+impl TermPredicate for ModuloPredicate {
+    fn filter_bytes(&self, data: &[u8], offsets: &[u32], out: &mut [common::TinySet]) {
+        for i in 0..offsets.len().saturating_sub(1) {
+            let slice = &data[offsets[i] as usize..offsets[i + 1] as usize];
+            if slice.last().is_some_and(|b| b % 2 == 0) {
+                out[i / 64].insert_mut((i % 64) as u32);
+            }
+        }
+    }
+
+    fn filter_monotonic_u64s(
+        &self,
+        _col_type: columnar::ColumnType,
+        values: &[u64],
+        out: &mut [common::TinySet],
+    ) {
+        for (i, &v) in values.iter().enumerate() {
+            if (3..8).contains(&v) {
+                out[i / 64].insert_mut((i % 64) as u32);
+            }
+        }
+    }
+
+    fn probe_cost(&self) -> crate::ProbeCost {
+        crate::ProbeCost::new(crate::ProbeSetupCost(300), crate::ProbePerDocCost(10))
+    }
+}
+
 impl Expr {
-    fn query(&self, fields: &[Field; 3], number: Field) -> Box<dyn Query> {
+    fn query(&self, fields: &[Field; 3], number: Field, dict_str: Field) -> Box<dyn Query> {
         let term =
             |field, order| Term::from_field_text(field, if order { "order" } else { "service" });
         let Expr::Node(kind, left, right) = self else {
@@ -107,10 +140,17 @@ impl Expr {
                 IndexRecordOption::WithFreqs,
             ));
         };
-        let left = left.query(fields, number);
-        let right = right.query(fields, number);
+        let left = left.query(fields, number, dict_str);
+        let right = right.query(fields, number, dict_str);
         match kind {
             Kind::Intersection => Box::new(BooleanQuery::intersection(vec![left, right])),
+            Kind::BatchFiltered => Box::new(BooleanQuery::intersection(vec![
+                left,
+                Box::new(TermPredicateQuery::new(
+                    number,
+                    std::sync::Arc::new(ModuloPredicate),
+                )),
+            ])),
             Kind::BufferedUnion => Box::new(DisjunctionMaxQuery::with_tie_breaker(
                 vec![left, right],
                 0.3,
@@ -125,9 +165,16 @@ impl Expr {
                 (Occur::Must, left),
                 (Occur::MustNot, right),
             ])),
-            // BatchFiltered / BatchExclude / ScorerWrapper are constructed directly in `scorer`
-            // until a high-setup-cost query (TermPredicateQuery) is added.
-            Kind::BatchFiltered | Kind::BatchExclude | Kind::ScorerWrapper => left,
+            Kind::BatchExclude => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, left),
+                (
+                    Occur::MustNot,
+                    Box::new(TermPredicateQuery::new(
+                        number,
+                        std::sync::Arc::new(ModuloPredicate),
+                    )),
+                ),
+            ])),
             Kind::Phrase => Box::new(PhraseQuery::new(vec![
                 term(fields[2], false),
                 term(fields[2], true),
@@ -140,6 +187,26 @@ impl Expr {
                 Bound::Included(Term::from_field_u64(number, 3)),
                 Bound::Excluded(Term::from_field_u64(number, 8)),
             )),
+            Kind::PredicateColumn => Box::new(TermPredicateQuery::new(
+                number,
+                std::sync::Arc::new(ModuloPredicate),
+            )),
+            Kind::CachedDictPredicate => {
+                // Intersect with the selective `fields[1]: "order"` term (2 matches out of 11,102)
+                // so `BooleanWeight` routes `dict_str` onto `CachedDictPredicateDocSet`.
+                let rare = Box::new(TermQuery::new(
+                    term(fields[1], true),
+                    IndexRecordOption::WithFreqs,
+                ));
+                let pred = Box::new(
+                    TermPredicateQuery::new(dict_str, std::sync::Arc::new(ModuloPredicate))
+                        .with_exact_postings(ExactPostings::Unavailable),
+                );
+                Box::new(BooleanQuery::intersection(vec![rare, pred]))
+            }
+            // ScorerWrapper is private to Disjunction and its override is not
+            // called by Disjunction's normal traversal. Exercise it directly.
+            Kind::ScorerWrapper => left,
         }
     }
 }
@@ -148,16 +215,11 @@ fn expressions() -> impl Strategy<Value = Expr> {
     (0usize..3, any::<bool>())
         .prop_map(|(field, order)| Expr::Term(field, order))
         .prop_recursive(3, 16, 2, |inner| {
-            // ScorerWrapper, BatchFiltered, and BatchExclude are exercised directly as roots.
+            // ScorerWrapper is exercised directly as a root, not a Query.
             let kinds: Vec<_> = IMPLEMENTATIONS
                 .iter()
                 .map(|&(_, kind)| kind)
-                .filter(|kind| {
-                    !matches!(
-                        kind,
-                        Kind::ScorerWrapper | Kind::BatchFiltered | Kind::BatchExclude
-                    )
-                })
+                .filter(|kind| !matches!(kind, Kind::ScorerWrapper))
                 .collect();
             (prop::sample::select(kinds), inner.clone(), inner)
                 .prop_map(|(kind, left, right)| Expr::Node(kind, Box::new(left), Box::new(right)))
@@ -168,6 +230,7 @@ struct Fixture {
     searcher: Searcher,
     fields: [Field; 3],
     number: Field,
+    dict_str: Field,
 }
 
 fn fixture() -> &'static Fixture {
@@ -180,6 +243,7 @@ fn fixture() -> &'static Fixture {
             schema.add_text_field("mixed", TEXT),
         ];
         let number = schema.add_u64_field("number", FAST);
+        let dict_str = schema.add_text_field("dict_str", crate::schema::STRING | FAST);
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
         for id in 0..11102u64 {
@@ -199,12 +263,14 @@ fn fixture() -> &'static Fixture {
                 "order",
                 "nothing",
             ][(id % 6) as usize];
+            let s = format!("entry-{id:06}-padding-block");
             writer
                 .add_document(doc!(
                     fields[0] => content,
                     fields[1] => title,
                     fields[2] => mixed,
                     number => id % 17,
+                    dict_str => s,
                 ))
                 .unwrap();
         }
@@ -215,28 +281,14 @@ fn fixture() -> &'static Fixture {
             searcher,
             fields,
             number,
+            dict_str,
         }
     })
 }
 
 fn scorer(expr: &Expr, scoring: bool) -> Box<dyn Scorer> {
     let fixture = fixture();
-    let reader = fixture.searcher.segment_reader(0);
-    if let Expr::Node(Kind::BatchFiltered, left, right) = expr {
-        let driver = scorer(left, scoring);
-        let filter: Box<dyn Scorer> = Box::new(ConstScorer::new(scorer(right, false), 1.0));
-        return Box::new(BatchFilteredScorer::new(
-            driver,
-            vec![UnpositionedScorer::from_positioned(filter)],
-            reader.num_docs(),
-        ));
-    }
-    if let Expr::Node(Kind::BatchExclude, left, right) = expr {
-        let driver = scorer(left, scoring);
-        let excl = ExcludedDocSet::new(scorer(right, false));
-        return Box::new(BatchExcludeScorer::new(driver, excl));
-    }
-    let query = expr.query(&fixture.fields, fixture.number);
+    let query = expr.query(&fixture.fields, fixture.number, fixture.dict_str);
     let enable = if scoring {
         EnableScoring::enabled_from_searcher(&fixture.searcher)
     } else {
@@ -245,7 +297,7 @@ fn scorer(expr: &Expr, scoring: bool) -> Box<dyn Scorer> {
     let scorer = query
         .weight(enable)
         .unwrap()
-        .scorer(reader, 1.0)
+        .scorer(fixture.searcher.segment_reader(0), 1.0)
         .unwrap();
     if matches!(expr, Expr::Node(Kind::ScorerWrapper, _, _)) {
         Box::new(ConstScorer::new(
@@ -481,7 +533,7 @@ fn seek_danger_implementation_inventory() {
             *covered.entry(format!("query/{path}")).or_insert(0) += 1;
         }
     }
-    for &(path, count) in EXTRA_INVENTORY {
+    for &(path, count) in FORK_INVENTORY {
         covered.insert(path.to_string(), count);
     }
     // Trait default (used by TermScorer) and the Box / &mut / UnpositionedScorer forwarding impls.
@@ -534,6 +586,7 @@ fn seek_danger_batch_implementation_inventory() {
         ("query/reqopt_scorer.rs", 1),
         // Forwarding wrapper `UnpositionedScorer`.
         ("query/scorer.rs", 1),
+        ("query/term_set_query/term_predicate.rs", 2),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

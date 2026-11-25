@@ -121,6 +121,29 @@ impl DocSet for BitSetDocSet {
     }
 }
 
+/// Open the posting list for `term_info` and OR every matched doc into `bitset`.
+pub(crate) fn or_term_info_into_bitset(
+    inverted_index: &crate::index::InvertedIndexReader,
+    term_info: &crate::postings::TermInfo,
+    bitset: &mut common::BitSet,
+) -> crate::Result<()> {
+    let mut block_postings = inverted_index.read_block_postings_from_terminfo(
+        term_info,
+        crate::schema::IndexRecordOption::Basic,
+    )?;
+    loop {
+        let docs = block_postings.docs();
+        if docs.is_empty() {
+            break;
+        }
+        for &doc in docs {
+            bitset.insert(doc);
+        }
+        block_postings.advance();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
