@@ -222,8 +222,8 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     }
 
     /// Returns a best-effort hint of the
-    /// cost to drive the docset.
-    fn cost(&self) -> u64 {
+    /// cost to drive and probe the docset.
+    fn cost(&self) -> crate::DocSetCost {
         // Advancing the docset is pretty expensive since it scans the whole column, there is no
         // index currently (will change with an kd-tree)
         // Since we use SIMD to scan the fast field range query we lower the cost a little bit,
@@ -235,7 +235,10 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         // query has not.
         //
         // Ideally this would take the fast field codec into account
-        (self.column.num_docs() as f64 * 0.8) as u64
+        crate::DocSetCost::new(
+            crate::DriveCost((self.column.num_docs() as f64 * 0.8) as u64),
+            crate::ProbeCost::FAST_FIELD,
+        )
     }
 }
 

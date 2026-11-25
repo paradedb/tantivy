@@ -82,8 +82,11 @@ impl DocSet for ContiguousDocSet {
         self.end.saturating_sub(self.start)
     }
 
-    fn cost(&self) -> u64 {
-        self.size_hint() as u64
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::new(
+            crate::DriveCost(self.size_hint() as u64),
+            crate::ProbeCost::BITSET,
+        )
     }
 }
 
@@ -224,7 +227,7 @@ mod tests {
         ];
         for (name, start, end, expected_cost) in cases {
             let ds = ContiguousDocSet::new(start, end);
-            assert_eq!(ds.cost(), expected_cost, "{name}");
+            assert_eq!(ds.cost().drive, crate::DriveCost(expected_cost), "{name}");
         }
     }
 

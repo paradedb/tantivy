@@ -29,6 +29,8 @@ mod union;
 mod weight;
 
 #[cfg(test)]
+mod seek_danger_tests;
+#[cfg(test)]
 mod vec_docset;
 
 pub(crate) mod score_combiner;
@@ -43,7 +45,7 @@ pub use self::boost_query::{BoostQuery, BoostWeight};
 pub use self::const_score_query::{ConstScoreQuery, ConstScorer};
 pub use self::disjunction_max_query::DisjunctionMaxQuery;
 pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};
-pub use self::exclude::{Exclude, ExclusionSet};
+pub use self::exclude::{Exclude, ExcludedDocSet, ExclusionSet};
 pub use self::exist_query::ExistsQuery;
 pub use self::explanation::Explanation;
 #[cfg(test)]

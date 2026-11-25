@@ -120,7 +120,7 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.underlying.cost()
     }
 
@@ -137,6 +137,11 @@ impl<S: Scorer> Scorer for BoostScorer<S> {
     #[inline]
     fn score(&mut self) -> Score {
         self.underlying.score() * self.boost
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        self.underlying.constant_score().map(|s| s * self.boost)
     }
 }
 

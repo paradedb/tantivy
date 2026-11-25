@@ -1867,17 +1867,19 @@ mod sorted_range_tests {
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
             let seg = searcher.segment_reader(0);
-            let sorted_cost = make_scorer(seg, field, 20, 40).cost();
+            let sorted_cost = make_scorer(seg, field, 20, 40).cost().drive;
 
             let (unsorted_index, unsorted_field) = create_unsorted_index_u64(&[10, 20, 30, 40, 50]);
             let unsorted_reader = unsorted_index.reader().unwrap();
             let unsorted_searcher = unsorted_reader.searcher();
             let unsorted_seg = unsorted_searcher.segment_reader(0);
-            let unsorted_cost = make_scorer(unsorted_seg, unsorted_field, 20, 40).cost();
+            let unsorted_cost = make_scorer(unsorted_seg, unsorted_field, 20, 40)
+                .cost()
+                .drive;
             assert!(
                 sorted_cost < unsorted_cost,
-                "order={order:?}: sorted path cost ({sorted_cost}) should be less than fallback \
-                 ({unsorted_cost})"
+                "order={order:?}: sorted path cost ({sorted_cost:?}) should be less than fallback \
+                 ({unsorted_cost:?})"
             );
         }
     }
@@ -1897,8 +1899,11 @@ mod sorted_range_tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let seg = searcher.segment_reader(0);
-        let no_sort_cost = make_scorer(seg, field, 20, 40).cost();
-        assert!(no_sort_cost > 0, "Expected nonzero cost from RangeDocSet");
+        let no_sort_cost = make_scorer(seg, field, 20, 40).cost().drive;
+        assert!(
+            no_sort_cost > crate::DriveCost::ZERO,
+            "Expected nonzero cost from RangeDocSet"
+        );
         // And the result is correct.
         assert_eq!(
             count_range(&index, field, Bound::Included(20), Bound::Included(40)),

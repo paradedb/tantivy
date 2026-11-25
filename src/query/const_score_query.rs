@@ -123,6 +123,10 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek_danger(target)
     }
 
+    fn is_empty_in_range(&mut self, start: DocId, end: DocId) -> bool {
+        self.docset.is_empty_in_range(start, end)
+    }
+
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         self.docset.fill_buffer(buffer)
     }
@@ -135,7 +139,7 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.docset.cost()
     }
 }
@@ -144,6 +148,11 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
     #[inline]
     fn score(&mut self) -> Score {
         self.score
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(self.score)
     }
 }
 

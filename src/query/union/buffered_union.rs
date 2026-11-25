@@ -1,6 +1,6 @@
 use common::TinySet;
 
-use crate::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::size_hint::estimate_union;
 use crate::query::Scorer;
@@ -149,12 +149,6 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> BufferedUnionScorer<TScorer
         }
         false
     }
-
-    fn is_in_horizon(&self, target: DocId) -> bool {
-        // wrapping_sub, because target may be < window_start_doc
-        let gap = target.wrapping_sub(self.window_start_doc);
-        gap < HORIZON
-    }
 }
 
 impl<TScorer, TScoreCombiner> DocSet for BufferedUnionScorer<TScorer, TScoreCombiner>
@@ -270,49 +264,8 @@ where
         }
     }
 
-    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        if target >= TERMINATED {
-            return SeekDangerResult::SeekLowerBound(TERMINATED);
-        }
-        if self.is_in_horizon(target) {
-            // Our value is within the buffered horizon and the docset may already have been
-            // processed and removed, so we need to use seek, which uses the regular advance.
-            let seek_doc = self.seek(target);
-            if seek_doc == target {
-                return SeekDangerResult::Found;
-            } else {
-                return SeekDangerResult::SeekLowerBound(seek_doc);
-            };
-        }
-
-        // The docsets are not in the buffered range, so we can use seek_into_the_danger_zone
-        // of the underlying docsets
-        let mut is_hit = false;
-        let mut min_new_target = TERMINATED;
-
-        for docset in self.docsets.iter_mut() {
-            match docset.seek_danger(target) {
-                SeekDangerResult::Found => {
-                    is_hit = true;
-                    break;
-                }
-                SeekDangerResult::SeekLowerBound(new_target) => {
-                    min_new_target = min_new_target.min(new_target);
-                }
-            }
-        }
-
-        // The API requires the DocSet to be in a valid state when `seek_into_the_danger_zone`
-        // returns Found.
-        if is_hit {
-            // The doc is found. Let's make sure we position the union on the target
-            // to bring it back to a valid state.
-            self.seek(target);
-            SeekDangerResult::Found
-        } else {
-            SeekDangerResult::SeekLowerBound(min_new_target)
-        }
-    }
+    // Use the default seek_danger: forwarding to children can leave them invalid
+    // when another child matches, making an ordinary seek/refill unsafe (#3086).
 
     #[inline]
     fn doc(&self) -> DocId {
@@ -323,8 +276,15 @@ where
         estimate_union(self.docsets.iter().map(DocSet::size_hint), self.num_docs)
     }
 
-    fn cost(&self) -> u64 {
-        self.docsets.iter().map(|docset| docset.cost()).sum()
+    fn cost(&self) -> crate::DocSetCost {
+        let mut drive = crate::DriveCost::ZERO;
+        let mut probe = crate::ProbeCost::ZERO;
+        for docset in &self.docsets {
+            let cost = docset.cost();
+            drive = drive.saturating_add(cost.drive);
+            probe = probe.saturating_add(cost.probe);
+        }
+        crate::DocSetCost::new(drive, probe)
     }
 
     // TODO Also implement `count` with deletes efficiently.
@@ -359,5 +319,10 @@ where
     #[inline]
     fn score(&mut self) -> Score {
         self.score
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        TScoreCombiner::constant_score()
     }
 }

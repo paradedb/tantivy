@@ -52,12 +52,21 @@ impl DocSet for EmptyScorer {
     fn size_hint(&self) -> u32 {
         0
     }
+
+    fn cost(&self) -> crate::DocSetCost {
+        crate::DocSetCost::ZERO
+    }
 }
 
 impl Scorer for EmptyScorer {
     #[inline]
     fn score(&mut self) -> Score {
         0.0
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        Some(0.0)
     }
 }
 

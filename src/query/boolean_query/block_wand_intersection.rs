@@ -252,7 +252,7 @@ mod tests {
         let mut limit = Score::MIN;
 
         // Sort by cost to use the cheapest as driver.
-        term_scorers.sort_by_key(|s| s.cost());
+        term_scorers.sort_by_key(|s| s.cost().drive);
 
         let (leader, secondaries) = term_scorers.split_first_mut().unwrap();
 

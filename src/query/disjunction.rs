@@ -27,6 +27,11 @@ struct ScorerWrapper<T> {
     current_doc: DocId,
 }
 
+#[cfg(test)]
+pub(super) fn seek_danger_test_wrapper(scorer: Box<dyn Scorer>) -> impl DocSet {
+    ScorerWrapper::new(scorer)
+}
+
 impl<T: Scorer> ScorerWrapper<T> {
     fn new(scorer: T) -> Self {
         let current_doc = scorer.doc();
@@ -84,7 +89,7 @@ impl<T: Scorer> DocSet for ScorerWrapper<T> {
         self.scorer.size_hint()
     }
 
-    fn cost(&self) -> u64 {
+    fn cost(&self) -> crate::DocSetCost {
         self.scorer.cost()
     }
 }
@@ -164,12 +169,15 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
             .unwrap_or(0u32)
     }
 
-    fn cost(&self) -> u64 {
-        self.chains
-            .iter()
-            .map(|docset| docset.cost())
-            .max()
-            .unwrap_or(0u64)
+    fn cost(&self) -> crate::DocSetCost {
+        let mut drive = crate::DriveCost::ZERO;
+        let mut probe = crate::ProbeCost::ZERO;
+        for docset in &self.chains {
+            let cost = docset.cost();
+            drive = drive.max(cost.drive);
+            probe = probe.saturating_add(cost.probe);
+        }
+        crate::DocSetCost::new(drive, probe)
     }
 }
 
@@ -179,6 +187,11 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Scorer
     #[inline]
     fn score(&mut self) -> Score {
         self.current_score
+    }
+
+    #[inline]
+    fn constant_score(&self) -> Option<Score> {
+        TScoreCombiner::constant_score()
     }
 }
 

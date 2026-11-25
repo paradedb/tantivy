@@ -24,6 +24,12 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
 
     /// Returns the aggregate score.
     fn score(&self) -> Score;
+
+    /// If this score combiner produces an invariant constant score for all documents
+    /// (regardless of which or how many scorers match), returns `Some(score)`.
+    fn constant_score() -> Option<Score> {
+        None
+    }
 }
 
 /// Just ignores scores. The `DoNothingCombiner` does not
@@ -41,6 +47,11 @@ impl ScoreCombiner for DoNothingCombiner {
     #[inline]
     fn score(&self) -> Score {
         1.0
+    }
+
+    #[inline]
+    fn constant_score() -> Option<Score> {
+        Some(1.0)
     }
 }
 

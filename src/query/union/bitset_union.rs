@@ -83,6 +83,10 @@ impl<TDocSet: DocSet> DocSet for BitSetPostingUnion<TDocSet> {
         self.bitset.size_hint()
     }
 
+    fn cost(&self) -> crate::DocSetCost {
+        self.bitset.cost()
+    }
+
     fn count_including_deleted(&mut self) -> u32 {
         self.bitset.count_including_deleted()
     }

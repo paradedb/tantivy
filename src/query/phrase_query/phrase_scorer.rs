@@ -562,14 +562,20 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
     }
 
     /// Returns a best-effort hint of the
-    /// cost to drive the docset.
-    fn cost(&self) -> u64 {
-        // While determing a potential hit is cheap for phrases, evaluating an actual hit is
-        // expensive since it requires to load positions for a doc and check if they are next to
+    /// cost to drive and probe the docset.
+    fn cost(&self) -> crate::DocSetCost {
+        // While determining a potential hit is cheap for phrases, evaluating an actual hit is
+        // expensive since it requires loading positions for a doc and checking if they are next to
         // each other.
-        // So the cost estimation would be the number of times we need to check if a doc is a hit *
+        // So the cost estimation is the number of times we need to check if a doc is a hit *
         // 10 * self.num_terms.
-        self.intersection_docset.size_hint() as u64 * 10 * self.num_terms as u64
+        let per_doc_probe = 10u64.saturating_mul(self.num_terms as u64);
+        crate::DocSetCost::new(
+            crate::DriveCost(
+                u64::from(self.intersection_docset.size_hint()).saturating_mul(per_doc_probe),
+            ),
+            crate::ProbeCost::per_doc(per_doc_probe),
+        )
     }
 }
 
