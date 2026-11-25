@@ -16,10 +16,11 @@ use super::fast_field_range_doc_set::RangeDocSet;
 use super::sorted_internals::sorted_doc_range_for_bounds;
 use crate::index::SegmentReader;
 use crate::query::{
-    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
+    AllScorer, CandidateHint, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer,
+    UnpositionedScorer, Weight,
 };
 use crate::schema::{Type, ValueBytes};
-use crate::{DocId, DocSet, Order, Score, TantivyError, Term};
+use crate::{DocId, DocSet, Order, Result, Score, TantivyError, Term};
 
 #[derive(Clone, Debug)]
 /// `FastFieldRangeQuery` is the same as [RangeQuery] but only uses the fast field
@@ -52,13 +53,18 @@ impl FastFieldRangeWeight {
     pub fn new(bounds: BoundsRange<Term>) -> Self {
         Self { bounds }
     }
-}
 
-impl Weight for FastFieldRangeWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+    fn scorer_impl(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_mode: bool,
+    ) -> crate::Result<UnpositionedScorer> {
         // Check if both bounds are Bound::Unbounded
         if self.bounds.is_unbounded() {
-            return Ok(Box::new(AllScorer::new(reader.max_doc())));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(
+                AllScorer::new(reader.max_doc()),
+            )));
         }
 
         let term = self
@@ -105,7 +111,7 @@ impl Weight for FastFieldRangeWeight {
                     let Some(str_dict_column): Option<StrColumn> =
                         reader.fast_fields().str(&field_name)?
                     else {
-                        return Ok(Box::new(EmptyScorer));
+                        return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                     };
                     let dict = str_dict_column.dictionary();
 
@@ -116,7 +122,7 @@ impl Weight for FastFieldRangeWeight {
                     let Some((column, _col_type)) = fast_field_reader
                         .u64_lenient_for_type(Some(&[ColumnType::Str]), &field_name)?
                     else {
-                        return Ok(Box::new(EmptyScorer));
+                        return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                     };
                     // JSON subfields can't be sort_by_field targets, so no sorted optimization.
                     search_on_u64_ff(
@@ -124,17 +130,23 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(lower_bound, upper_bound),
                         None,
+                        candidate_mode,
                     )
                 }
-                Type::U64 | Type::I64 | Type::F64 => {
-                    search_on_json_numerical_field(reader, &field_name, typ, bounds, boost)
-                }
+                Type::U64 | Type::I64 | Type::F64 => search_on_json_numerical_field(
+                    reader,
+                    &field_name,
+                    typ,
+                    bounds,
+                    boost,
+                    candidate_mode,
+                ),
                 Type::Date => {
                     let fast_field_reader = reader.fast_fields();
                     let Some((column, _col_type)) = fast_field_reader
                         .u64_lenient_for_type(Some(&[ColumnType::DateTime]), &field_name)?
                     else {
-                        return Ok(Box::new(EmptyScorer));
+                        return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
                     };
                     let bounds = bounds.map_bound(|term| term.as_date().unwrap().to_u64());
                     // JSON subfields can't be sort_by_field targets, so no sorted optimization.
@@ -143,6 +155,7 @@ impl Weight for FastFieldRangeWeight {
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                         None,
+                        candidate_mode,
                     )
                 }
                 Type::Bool
@@ -166,7 +179,7 @@ impl Weight for FastFieldRangeWeight {
             let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
                 reader.fast_fields().column_opt(&field_name)?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             let value_range = bound_range_inclusive_ip(
                 &bounds.lower_bound,
@@ -174,12 +187,21 @@ impl Weight for FastFieldRangeWeight {
                 ip_addr_column.min_value(),
                 ip_addr_column.max_value(),
             );
-            let docset = RangeDocSet::new(value_range, ip_addr_column);
-            Ok(Box::new(ConstScorer::new(docset, boost)))
+            if candidate_mode {
+                let docset = RangeDocSet::new_unpositioned(value_range, ip_addr_column);
+                Ok(UnpositionedScorer::from_unpositioned(Box::new(
+                    ConstScorer::new(docset, boost),
+                )))
+            } else {
+                let docset = RangeDocSet::new(value_range, ip_addr_column);
+                Ok(UnpositionedScorer::from_positioned(Box::new(
+                    ConstScorer::new(docset, boost),
+                )))
+            }
         } else if field_type.is_str() {
             let Some(str_dict_column): Option<StrColumn> = reader.fast_fields().str(&field_name)?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             let dict = str_dict_column.dictionary();
 
@@ -190,19 +212,20 @@ impl Weight for FastFieldRangeWeight {
             let Some((column, _col_type)) =
                 fast_field_reader.u64_lenient_for_type(None, &field_name)?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             search_on_u64_ff(
                 column,
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                candidate_mode,
             )
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
                 reader.fast_fields().bytes(&field_name)?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             let dict = bytes_column.dictionary();
 
@@ -213,13 +236,14 @@ impl Weight for FastFieldRangeWeight {
             let Some((column, _col_type)) =
                 fast_field_reader.u64_lenient_for_type(None, &field_name)?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             search_on_u64_ff(
                 column,
                 boost,
                 BoundsRange::new(lower_bound, upper_bound),
                 sort_order,
+                candidate_mode,
             )
         } else {
             assert!(
@@ -256,15 +280,36 @@ impl Weight for FastFieldRangeWeight {
                 &field_name,
             )?
             else {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             };
             search_on_u64_ff(
                 column,
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                 sort_order,
+                candidate_mode,
             )
         }
+    }
+}
+
+impl Weight for FastFieldRangeWeight {
+    fn uses_fast_fields(&self) -> bool {
+        true
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        _candidate_hint: CandidateHint,
+    ) -> Result<UnpositionedScorer> {
+        self.scorer_impl(reader, boost, true)
+    }
+
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        self.scorer_impl(reader, boost, false)
+            .map(UnpositionedScorer::into_positioned)
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -289,7 +334,8 @@ fn search_on_json_numerical_field(
     typ: Type,
     bounds: BoundsRange<ValueBytes<Vec<u8>>>,
     boost: Score,
-) -> crate::Result<Box<dyn Scorer>> {
+    candidate_mode: bool,
+) -> crate::Result<UnpositionedScorer> {
     // Since we don't know which type was interpolated for the internal column we
     // have to check for all numeric types (only one exists)
     let allowed_column_types: Option<&[ColumnType]> =
@@ -298,7 +344,7 @@ fn search_on_json_numerical_field(
     let Some((column, col_type)) =
         fast_field_reader.u64_lenient_for_type(allowed_column_types, field_name)?
     else {
-        return Ok(Box::new(EmptyScorer));
+        return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
     };
     let actual_column_type: NumericalType = col_type
         .numerical_type()
@@ -368,6 +414,7 @@ fn search_on_json_numerical_field(
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
         None,
+        candidate_mode,
     )
 }
 
@@ -447,7 +494,8 @@ fn search_on_u64_ff(
     boost: Score,
     bounds: BoundsRange<u64>,
     sort_order: Option<Order>,
-) -> crate::Result<Box<dyn Scorer>> {
+    candidate_mode: bool,
+) -> crate::Result<UnpositionedScorer> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
     #[expect(clippy::reversed_empty_ranges)]
@@ -459,19 +507,17 @@ fn search_on_u64_ff(
     )
     .unwrap_or(1..=0); // empty range
     if value_range.is_empty() {
-        return Ok(Box::new(EmptyScorer));
+        return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
     }
     if col_min_value >= *value_range.start() && col_max_value <= *value_range.end() {
         // all values in the column are within the range.
         if column.index.get_cardinality() == Cardinality::Full {
-            if boost != 1.0f32 {
-                return Ok(Box::new(ConstScorer::new(
-                    AllScorer::new(column.num_docs()),
-                    boost,
-                )));
+            let scorer: Box<dyn Scorer> = if boost != 1.0f32 {
+                Box::new(ConstScorer::new(AllScorer::new(column.num_docs()), boost))
             } else {
-                return Ok(Box::new(AllScorer::new(column.num_docs())));
-            }
+                Box::new(AllScorer::new(column.num_docs()))
+            };
+            return Ok(UnpositionedScorer::from_positioned(scorer));
         } else {
             // TODO Make it a field presence request for that specific column
         }
@@ -482,15 +528,26 @@ fn search_on_u64_ff(
     if let Some(order) = sort_order {
         if let Some(doc_range) = sorted_doc_range_for_bounds(&column, &value_range, order) {
             if doc_range.is_empty() {
-                return Ok(Box::new(EmptyScorer));
+                return Ok(UnpositionedScorer::from_positioned(Box::new(EmptyScorer)));
             }
             let docset = ContiguousDocSet::new(doc_range.start, doc_range.end);
-            return Ok(Box::new(ConstScorer::new(docset, boost)));
+            return Ok(UnpositionedScorer::from_positioned(Box::new(
+                ConstScorer::new(docset, boost),
+            )));
         }
     }
 
-    let docset = RangeDocSet::new(value_range, column);
-    Ok(Box::new(ConstScorer::new(docset, boost)))
+    if candidate_mode {
+        let docset = RangeDocSet::new_unpositioned(value_range, column);
+        Ok(UnpositionedScorer::from_unpositioned(Box::new(
+            ConstScorer::new(docset, boost),
+        )))
+    } else {
+        let docset = RangeDocSet::new(value_range, column);
+        Ok(UnpositionedScorer::from_positioned(Box::new(
+            ConstScorer::new(docset, boost),
+        )))
+    }
 }
 
 /// Returns true if the type maps to a u64 fast field
@@ -1731,9 +1788,9 @@ mod sorted_range_tests {
     use crate::collector::Count;
     use crate::index::{Index, IndexSettings, IndexSortByField};
     use crate::query::range_query::range_query_fastfield::FastFieldRangeWeight;
-    use crate::query::{RangeQuery, Scorer, Weight};
+    use crate::query::{CandidateHint, ExcludedDocSet, ExclusionSet, RangeQuery, Scorer, Weight};
     use crate::schema::{BytesOptions, NumericOptions, SchemaBuilder, FAST};
-    use crate::{IndexWriter, Order, TantivyDocument, Term};
+    use crate::{IndexWriter, Order, TantivyDocument, Term, TERMINATED};
 
     fn create_sorted_index_u64(order: Order, values: &[u64]) -> (Index, crate::schema::Field) {
         let mut schema_builder = SchemaBuilder::new();
@@ -1887,9 +1944,41 @@ mod sorted_range_tests {
     fn assert_sorted_range_cases(order: Order, cases: &[(&str, Bound<u64>, Bound<u64>, usize)]) {
         let (index, field) =
             create_sorted_index_u64(order, &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        let searcher = index.reader().unwrap().searcher();
+        let reader = searcher.segment_reader(0);
         for (name, lower, upper, expected) in cases {
             let actual = count_range(&index, field, lower.clone(), upper.clone());
             assert_eq!(actual, *expected, "order={order:?}, case={name}");
+            let weight = FastFieldRangeWeight::new(BoundsRange::new(
+                lower.clone().map(|v| Term::from_field_u64(field, v)),
+                upper.clone().map(|v| Term::from_field_u64(field, v)),
+            ));
+            let mut scorer = weight.scorer(reader, 1.0).unwrap();
+            let mut matches = vec![false; reader.max_doc() as usize];
+            while scorer.doc() != TERMINATED {
+                matches[scorer.doc() as usize] = true;
+                scorer.advance();
+            }
+            for docs in [&[8, 9][..], &[0, 1, 4, 5][..], &[0, 1, 8, 9][..]] {
+                let mut scorer = ExcludedDocSet::from_unpositioned(
+                    weight
+                        .scorer_for_candidates_unpositioned(
+                            reader,
+                            1.0,
+                            CandidateHint::Estimated(docs.len() as u32),
+                        )
+                        .unwrap(),
+                );
+                assert_eq!(
+                    docs.iter()
+                        .map(|&doc| scorer.contains(doc))
+                        .collect::<Vec<_>>(),
+                    docs.iter()
+                        .map(|&doc| matches[doc as usize])
+                        .collect::<Vec<_>>(),
+                    "order={order:?}, case={name}"
+                );
+            }
         }
     }
 

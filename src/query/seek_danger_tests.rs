@@ -339,8 +339,9 @@ fn seek_danger_implementation_inventory() {
     for &(path, count) in EXTRA_INVENTORY {
         covered.insert(path.to_string(), count);
     }
-    // Trait default (used by TermScorer) and the Box / &mut forwarding impls.
+    // Trait default (used by TermScorer) and the Box / &mut / UnpositionedScorer forwarding impls.
     covered.insert("docset.rs".to_string(), 3);
+    covered.insert("query/scorer.rs".to_string(), 1);
     // Test-only spy for probe-cost unit tests in intersection.rs.
     *covered
         .entry("query/intersection.rs".to_string())

@@ -1,7 +1,9 @@
 use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
@@ -63,9 +65,25 @@ impl ConstWeight {
 }
 
 impl Weight for ConstWeight {
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer = self.weight.scorer(reader, boost)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_hint: CandidateHint,
+    ) -> crate::Result<UnpositionedScorer> {
+        Ok(self
+            .weight
+            .scorer_for_candidates_unpositioned(reader, boost, candidate_hint)?
+            .map_scorer(|inner| Box::new(ConstScorer::new(inner, boost * self.score))))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {

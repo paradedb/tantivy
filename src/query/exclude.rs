@@ -1,5 +1,5 @@
 use crate::docset::{DocSet, DocSetCost, DriveCost, ProbeCost, SeekDangerResult, TERMINATED};
-use crate::query::Scorer;
+use crate::query::{Scorer, UnpositionedScorer};
 use crate::{DocId, Score};
 
 /// An exclusion set is a set of documents
@@ -57,7 +57,38 @@ impl<TDocSet: DocSet> ExclusionSet for ExcludedDocSet<TDocSet> {
     }
 }
 
-impl<TDocSet: DocSet> ExclusionSet for Vec<ExcludedDocSet<TDocSet>> {
+impl ExcludedDocSet<UnpositionedScorer> {
+    /// Wraps an [`UnpositionedScorer`] as an exclusion set without positioning it.
+    pub fn from_unpositioned(scorer: UnpositionedScorer) -> Self {
+        let lower_bound = scorer.lower_bound();
+        ExcludedDocSet {
+            docset: scorer,
+            lower_bound,
+        }
+    }
+}
+
+impl ExclusionSet for ExcludedDocSet<UnpositionedScorer> {
+    #[inline]
+    fn contains(&mut self, doc: DocId) -> bool {
+        if doc < self.lower_bound {
+            return false;
+        }
+        match self.docset.seek_danger(doc) {
+            SeekDangerResult::Found => true,
+            SeekDangerResult::SeekLowerBound(lower_bound) => {
+                self.lower_bound = lower_bound;
+                false
+            }
+        }
+    }
+
+    fn probe_cost(&self) -> ProbeCost {
+        self.docset.cost().probe
+    }
+}
+
+impl<TExclusionSet: ExclusionSet> ExclusionSet for Vec<TExclusionSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
         self.iter_mut().any(|docset| docset.contains(doc))

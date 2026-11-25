@@ -2,7 +2,9 @@ use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
@@ -67,8 +69,22 @@ impl BoostWeight {
 }
 
 impl Weight for BoostWeight {
+    fn uses_fast_fields(&self) -> bool {
+        self.weight.uses_fast_fields()
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.weight.scorer(reader, boost * self.boost)
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_hint: CandidateHint,
+    ) -> crate::Result<UnpositionedScorer> {
+        self.weight
+            .scorer_for_candidates_unpositioned(reader, boost * self.boost, candidate_hint)
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {

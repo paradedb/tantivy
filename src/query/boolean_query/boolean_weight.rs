@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+use crate::docset::{DriveCost, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
+use crate::query::intersection::intersect_candidate_scorers;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, ExcludedDocSet,
-    Explanation, Occur, RequiredOptionalScorer, Scorer, Weight,
+    intersect_scorers, AllScorer, BufferedUnionScorer, CandidateHint, EmptyScorer, Exclude,
+    ExcludedDocSet, Explanation, Occur, RequiredOptionalScorer, Scorer, UnpositionedScorer, Weight,
 };
 use crate::{DocId, Score};
 
@@ -116,7 +115,7 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
 /// When AllScorer instances are removed from must_scorers as an optimization,
 /// we must restore the "match all" semantics if the list becomes empty.
 fn effective_must_scorer(
-    must_scorers: Vec<Box<dyn Scorer>>,
+    must_scorers: Vec<UnpositionedScorer>,
     removed_all_scorer_count: usize,
     max_doc: DocId,
     num_docs: u32,
@@ -130,7 +129,7 @@ fn effective_must_scorer(
             None
         }
     } else {
-        Some(intersect_scorers(must_scorers, num_docs))
+        Some(intersect_candidate_scorers(must_scorers, num_docs))
     }
 }
 
@@ -179,6 +178,13 @@ enum ShouldScorersCombinationMethod {
     Required(SpecializedScorer),
 }
 
+#[derive(Default)]
+struct PerOccurScorers {
+    must: Vec<UnpositionedScorer>,
+    should: Vec<Box<dyn Scorer>>,
+    must_not: Vec<UnpositionedScorer>,
+}
+
 /// Weight associated to the `BoolQuery`.
 pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
@@ -221,15 +227,120 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         &self,
         reader: &SegmentReader,
         boost: Score,
-    ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
-        let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
+    ) -> crate::Result<PerOccurScorers> {
+        let mut per_occur_scorers = PerOccurScorers::default();
+        let mut deferred_fast_clauses: Vec<(Occur, &dyn Weight)> = Vec::new();
+
         for (occur, subweight) in &self.weights {
+            if matches!(*occur, Occur::Must | Occur::MustNot) && subweight.uses_fast_fields() {
+                deferred_fast_clauses.push((*occur, subweight.as_ref()));
+                continue;
+            }
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
-            per_occur_scorers
-                .entry(*occur)
-                .or_default()
-                .push(sub_scorer);
+            match *occur {
+                Occur::Must => {
+                    let is_empty = sub_scorer.is::<EmptyScorer>();
+                    per_occur_scorers
+                        .must
+                        .push(UnpositionedScorer::from_positioned(sub_scorer));
+                    if is_empty {
+                        return Ok(per_occur_scorers);
+                    }
+                }
+                Occur::Should => per_occur_scorers.should.push(sub_scorer),
+                Occur::MustNot => per_occur_scorers
+                    .must_not
+                    .push(UnpositionedScorer::from_positioned(sub_scorer)),
+            }
         }
+
+        if !deferred_fast_clauses.is_empty() {
+            let num_docs = reader.num_docs();
+            let max_doc = reader.max_doc();
+            let max_driver_cost = DriveCost((f64::from(max_doc) * 0.8) as u64);
+
+            let mut candidate_bound: Option<u32> = None;
+            let mut min_driver_cost: Option<DriveCost> = None;
+
+            if !per_occur_scorers.must.is_empty() {
+                let mut hints = Vec::with_capacity(per_occur_scorers.must.len());
+                for s in &per_occur_scorers.must {
+                    if !self.scoring_enabled && s.is::<AllScorer>() {
+                        continue;
+                    }
+                    hints.push(s.size_hint());
+                    let c = s.cost().drive;
+                    min_driver_cost = Some(min_driver_cost.map_or(c, |prev| prev.min(c)));
+                }
+                if !hints.is_empty() {
+                    candidate_bound = Some(crate::query::size_hint::estimate_intersection(
+                        hints.into_iter(),
+                        num_docs,
+                    ));
+                }
+            }
+
+            if self.minimum_number_should_match >= 1 {
+                if !per_occur_scorers.should.is_empty() {
+                    let shoulds = &per_occur_scorers.should;
+                    let has_removed_all =
+                        !self.scoring_enabled && shoulds.iter().any(|s| s.is::<AllScorer>());
+                    if !has_removed_all {
+                        let non_empty: Vec<&Box<dyn Scorer>> =
+                            shoulds.iter().filter(|s| !s.is::<EmptyScorer>()).collect();
+                        if non_empty.len() < self.minimum_number_should_match {
+                            return Ok(per_occur_scorers);
+                        }
+                        let union_hint = non_empty
+                            .iter()
+                            .map(|s| u64::from(s.size_hint()))
+                            .sum::<u64>()
+                            .min(u64::from(max_doc))
+                            as u32;
+                        let union_cost = non_empty
+                            .iter()
+                            .map(|s| s.cost().drive)
+                            .fold(DriveCost::ZERO, DriveCost::saturating_add);
+                        candidate_bound =
+                            Some(candidate_bound.map_or(union_hint, |prev| prev.min(union_hint)));
+                        min_driver_cost =
+                            Some(min_driver_cost.map_or(union_cost, |prev| prev.min(union_cost)));
+                    }
+                } else {
+                    return Ok(per_occur_scorers);
+                }
+            }
+
+            let candidate_hint = match (candidate_bound, min_driver_cost) {
+                (Some(c), Some(cost))
+                    if c.saturating_mul(32) < num_docs && cost < max_driver_cost =>
+                {
+                    Some(CandidateHint::Estimated(c.max(1)))
+                }
+                _ => None,
+            };
+
+            for (occur, subweight) in deferred_fast_clauses {
+                let sub_scorer = match candidate_hint {
+                    Some(hint) => {
+                        subweight.scorer_for_candidates_unpositioned(reader, boost, hint)?
+                    }
+                    None => UnpositionedScorer::from_positioned(subweight.scorer(reader, boost)?),
+                };
+                let is_empty = sub_scorer.is::<EmptyScorer>();
+                match occur {
+                    Occur::Must => {
+                        per_occur_scorers.must.push(sub_scorer);
+                        if is_empty {
+                            return Ok(per_occur_scorers);
+                        }
+                    }
+                    Occur::MustNot => per_occur_scorers.must_not.push(sub_scorer),
+                    Occur::Should => unreachable!("SHOULD clauses are never deferred"),
+                }
+            }
+        }
+
         Ok(per_occur_scorers)
     }
 
@@ -240,26 +351,33 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
         let num_docs = reader.num_docs();
-        let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
+        let per_occur_scorers = self.per_occur_scorers(reader, boost)?;
 
         // Indicate how should clauses are combined with must clauses.
-        let mut must_scorers: Vec<Box<dyn Scorer>> =
-            per_occur_scorers.remove(&Occur::Must).unwrap_or_default();
-        let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(&mut must_scorers);
+        let mut must_scorers = per_occur_scorers.must;
+        let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(
+            &mut must_scorers,
+            |s| s.is::<AllScorer>(),
+            |s| s.is::<EmptyScorer>(),
+        );
 
         if must_special_scorer_counts.num_empty_scorers > 0 {
             return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
         }
 
-        let mut should_scorers = per_occur_scorers.remove(&Occur::Should).unwrap_or_default();
-        let should_special_scorer_counts =
-            remove_and_count_all_and_empty_scorers(&mut should_scorers);
+        let mut should_scorers = per_occur_scorers.should;
+        let should_special_scorer_counts = remove_and_count_all_and_empty_scorers(
+            &mut should_scorers,
+            |s| s.is::<AllScorer>(),
+            |s| s.is::<EmptyScorer>(),
+        );
 
-        let mut exclude_scorers: Vec<Box<dyn Scorer>> = per_occur_scorers
-            .remove(&Occur::MustNot)
-            .unwrap_or_default();
-        let exclude_special_scorer_counts =
-            remove_and_count_all_and_empty_scorers(&mut exclude_scorers);
+        let mut exclude_scorers = per_occur_scorers.must_not;
+        let exclude_special_scorer_counts = remove_and_count_all_and_empty_scorers(
+            &mut exclude_scorers,
+            |s| s.is::<AllScorer>(),
+            |s| s.is::<EmptyScorer>(),
+        );
 
         if exclude_special_scorer_counts.num_all_scorers > 0 {
             // We exclude all documents at one point.
@@ -292,7 +410,11 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
                     // they are no different from must clauses.
-                    must_scorers.append(&mut should_scorers);
+                    must_scorers.extend(
+                        should_scorers
+                            .into_iter()
+                            .map(UnpositionedScorer::from_positioned),
+                    );
                     ShouldScorersCombinationMethod::Ignored
                 }
                 _ => ShouldScorersCombinationMethod::Required(SpecializedScorer::Other(
@@ -321,7 +443,12 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 {
                     let term_scorers: Vec<TermScorer> = must_scorers
                         .into_iter()
-                        .map(|s| *(s.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
+                        .map(|s| {
+                            *(s.into_positioned()
+                                .downcast::<TermScorer>()
+                                .map_err(|_| ())
+                                .unwrap())
+                        })
                         .collect();
                     if term_scorers
                         .iter()
@@ -329,9 +456,9 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     {
                         SpecializedScorer::TermIntersection(term_scorers)
                     } else {
-                        let must_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                        let must_scorers: Vec<UnpositionedScorer> = term_scorers
                             .into_iter()
-                            .map(|s| Box::new(s) as Box<dyn Scorer>)
+                            .map(|s| UnpositionedScorer::from_positioned(Box::new(s)))
                             .collect();
                         let boxed_scorer: Box<dyn Scorer> =
                             effective_must_scorer(must_scorers, 0, reader.max_doc(), num_docs)
@@ -418,22 +545,26 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         let include_scorer_boxed = into_box_scorer(include_scorer, &score_combiner_fn, num_docs);
         let scorer: Box<dyn Scorer> = if exclude_scorers.len() == 1 {
             let exclude_scorer = exclude_scorers.pop().unwrap();
-            match exclude_scorer.downcast::<TermScorer>() {
-                // Cast to TermScorer succeeded
-                Ok(exclude_scorer) => Box::new(Exclude::new(
+            if exclude_scorer.is::<TermScorer>() {
+                let term_scorer = *(exclude_scorer
+                    .into_positioned()
+                    .downcast::<TermScorer>()
+                    .map_err(|_| ())
+                    .unwrap());
+                Box::new(Exclude::new(
                     include_scorer_boxed,
-                    ExcludedDocSet::new(*exclude_scorer),
-                )),
-                // We get back the original Box<dyn Scorer>
-                Err(exclude_scorer) => Box::new(Exclude::new(
+                    ExcludedDocSet::new(term_scorer),
+                ))
+            } else {
+                Box::new(Exclude::new(
                     include_scorer_boxed,
-                    ExcludedDocSet::new(exclude_scorer),
-                )),
+                    ExcludedDocSet::from_unpositioned(exclude_scorer),
+                ))
             }
         } else {
             let exclude_scorers: Vec<_> = exclude_scorers
                 .into_iter()
-                .map(ExcludedDocSet::new)
+                .map(ExcludedDocSet::from_unpositioned)
                 .collect();
             Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
         };
@@ -447,15 +578,17 @@ struct AllAndEmptyScorerCounts {
     num_empty_scorers: usize,
 }
 
-fn remove_and_count_all_and_empty_scorers(
-    scorers: &mut Vec<Box<dyn Scorer>>,
+fn remove_and_count_all_and_empty_scorers<T>(
+    scorers: &mut Vec<T>,
+    is_all: impl Fn(&T) -> bool,
+    is_empty: impl Fn(&T) -> bool,
 ) -> AllAndEmptyScorerCounts {
     let mut counts = AllAndEmptyScorerCounts::default();
     scorers.retain(|scorer| {
-        if scorer.is::<AllScorer>() {
+        if is_all(scorer) {
             counts.num_all_scorers += 1;
             false
-        } else if scorer.is::<EmptyScorer>() {
+        } else if is_empty(scorer) {
             counts.num_empty_scorers += 1;
             false
         } else {
@@ -466,6 +599,12 @@ fn remove_and_count_all_and_empty_scorers(
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+    fn uses_fast_fields(&self) -> bool {
+        self.weights
+            .iter()
+            .any(|(_, weight)| weight.uses_fast_fields())
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let num_docs = reader.num_docs();
         if self.weights.is_empty() {
@@ -488,6 +627,47 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     into_box_scorer(specialized_scorer, DoNothingCombiner::default, num_docs)
                 })
         }
+    }
+
+    fn scorer_for_candidates_unpositioned(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        candidate_hint: CandidateHint,
+    ) -> crate::Result<UnpositionedScorer> {
+        if self.weights.len() == 1 {
+            let &(occur, ref weight) = &self.weights[0];
+            if occur != Occur::MustNot {
+                return weight.scorer_for_candidates_unpositioned(reader, boost, candidate_hint);
+            }
+        }
+        if !self.scoring_enabled
+            && self.minimum_number_should_match == 0
+            && self.weights.iter().all(|(occur, _)| *occur == Occur::Must)
+        {
+            let mut fast_fields = self
+                .weights
+                .iter()
+                .filter(|(_, weight)| weight.uses_fast_fields());
+            if let (Some((_, candidate_weight)), None) = (fast_fields.next(), fast_fields.next()) {
+                for (_, weight) in &self.weights {
+                    if !weight.uses_fast_fields()
+                        && !weight.scorer(reader, boost)?.is::<AllScorer>()
+                    {
+                        return self
+                            .scorer(reader, boost)
+                            .map(UnpositionedScorer::from_positioned);
+                    }
+                }
+                return candidate_weight.scorer_for_candidates_unpositioned(
+                    reader,
+                    boost,
+                    candidate_hint,
+                );
+            }
+        }
+        self.scorer(reader, boost)
+            .map(UnpositionedScorer::from_positioned)
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

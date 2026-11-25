@@ -62,13 +62,13 @@ pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
-pub use self::scorer::Scorer;
+pub use self::scorer::{Scorer, UnpositionedScorer};
 pub use self::set_query::TermSetQuery;
 pub use self::term_query::TermQuery;
 pub use self::union::BufferedUnionScorer;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
-pub use self::weight::Weight;
+pub use self::weight::{CandidateHint, Weight};
 
 #[cfg(test)]
 mod tests {

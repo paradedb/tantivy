@@ -74,17 +74,30 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             };
         }
 
-        let mut range_docset = Self {
+        let mut range_docset = Self::new_unpositioned(value_range, column);
+        range_docset.fetch_block();
+        range_docset
+    }
+
+    /// Creates an iterator without finding its first matching document.
+    /// The caller must seek to a match before using its current position.
+    pub(crate) fn new_unpositioned(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+        let next_fetch_start = if column.num_docs() == 0
+            || *value_range.start() > column.max_value()
+            || *value_range.end() < column.min_value()
+        {
+            TERMINATED
+        } else {
+            0
+        };
+        Self {
             value_range,
             column,
             loaded_docs: VecCursor::new(),
-            next_fetch_start: 0,
+            next_fetch_start,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
-        };
-        range_docset.reset_fetch_range();
-        range_docset.fetch_block();
-        range_docset
+        }
     }
 
     fn reset_fetch_range(&mut self) {
@@ -157,7 +170,13 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
 
     #[inline]
     fn doc(&self) -> DocId {
-        self.loaded_docs.current().unwrap_or(TERMINATED)
+        self.loaded_docs.current().unwrap_or_else(|| {
+            if self.next_fetch_start == 0 && self.column.num_docs() > 0 {
+                0
+            } else {
+                TERMINATED
+            }
+        })
     }
 
     /// Advances the `DocSet` forward until reaching the target, or going to the
@@ -172,6 +191,12 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     fn seek(&mut self, target: DocId) -> DocId {
         if self.is_last_seek_distance_large(target) {
             self.reset_fetch_range();
+        }
+        if self.next_fetch_start == 0 && self.loaded_docs.is_empty() {
+            self.next_fetch_start = target;
+            self.fetch_block();
+            self.last_seek_pos_opt = Some(target);
+            return self.doc();
         }
         if target > self.next_fetch_start {
             self.next_fetch_start = target;

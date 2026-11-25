@@ -5,28 +5,35 @@ use crate::docset::{
     DocSet, DocSetCost, DriveCost, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED,
 };
 use crate::query::term_query::TermScorer;
-use crate::query::{EmptyScorer, Scorer};
+use crate::query::{EmptyScorer, Scorer, UnpositionedScorer};
 use crate::{DocId, Score};
 
 /// Orders intersection participants so index `0` is the cheapest driver (`cost().drive`,
 /// tie-breaking by `size_hint()`), and followers `[1..]` are ordered by expected probe cost per
 /// eliminated candidate (`probe.scalar() / (1 - selectivity)`), tie-breaking by `drive`.
-fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_num_docs: u32) {
-    if docsets.len() <= 1 {
+fn order_by_drive_and_probe<T>(
+    items: &mut [T],
+    segment_num_docs: u32,
+    cost_and_hint: impl Fn(&T) -> (DocSetCost, u32),
+) {
+    if items.len() <= 1 {
         return;
     }
-    let driver_idx = docsets
+    let driver_idx = items
         .iter()
         .enumerate()
-        .min_by_key(|(_, d)| (d.cost().drive, d.size_hint()))
+        .min_by_key(|(_, item)| {
+            let (cost, hint) = cost_and_hint(item);
+            (cost.drive, hint)
+        })
         .map(|(i, _)| i)
         .unwrap();
-    docsets.swap(0, driver_idx);
+    items.swap(0, driver_idx);
     let num_docs = f64::from(segment_num_docs.max(1));
-    docsets[1..].sort_by(|a, b| {
-        let rank = |d: &TDocSet| -> (f64, DriveCost) {
-            let cost = d.cost();
-            let selectivity = (f64::from(d.size_hint()) / num_docs).clamp(0.0, 1.0);
+    items[1..].sort_by(|a, b| {
+        let rank = |item: &T| -> (f64, DriveCost) {
+            let (cost, hint) = cost_and_hint(item);
+            let selectivity = (f64::from(hint) / num_docs).clamp(0.0, 1.0);
             let elim = (1.0 - selectivity).max(1e-6);
             (cost.probe.scalar() as f64 / elim, cost.drive)
         };
@@ -36,33 +43,51 @@ fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_
     });
 }
 
-/// Returns the intersection scorer.
-///
-/// The score associated with the documents is the sum of the
-/// score of the `Scorer`s given in argument.
-///
-/// For better performance, the function uses a
-/// specialized implementation if the two
-/// shortest scorers are `TermScorer`s.
-///
-/// num_docs_segment is the number of documents in the segment. It is used for estimating the
-/// `size_hint` of the intersection.
-pub fn intersect_scorers(
+fn order_intersection_docsets<TDocSet: DocSet>(docsets: &mut [TDocSet], segment_num_docs: u32) {
+    order_by_drive_and_probe(docsets, segment_num_docs, |d| (d.cost(), d.size_hint()));
+}
+
+fn order_unpositioned_scorers(scorers: &mut [UnpositionedScorer], segment_num_docs: u32) {
+    order_by_drive_and_probe(scorers, segment_num_docs, |s| (s.cost(), s.size_hint()));
+}
+
+fn go_to_first_unpositioned(scorers: &mut [UnpositionedScorer]) -> DocId {
+    let mut candidate = scorers
+        .iter()
+        .map(UnpositionedScorer::lower_bound)
+        .max()
+        .expect("go_to_first_unpositioned requires at least one scorer");
+    let (first, rest) = scorers.split_first_mut().unwrap();
+    'outer: while candidate < TERMINATED {
+        candidate = first.position_at(candidate);
+        if candidate == TERMINATED {
+            break;
+        }
+        for scorer in rest.iter_mut() {
+            if let SeekDangerResult::SeekLowerBound(seek_lower_bound) =
+                scorer.seek_danger(candidate)
+            {
+                debug_assert!(
+                    seek_lower_bound == TERMINATED || seek_lower_bound > candidate,
+                    "seek_lower_bound {seek_lower_bound} must be greater than candidate \
+                     {candidate}"
+                );
+                candidate = seek_lower_bound;
+                continue 'outer;
+            }
+        }
+        return candidate;
+    }
+    for scorer in rest.iter_mut() {
+        scorer.position_at(TERMINATED);
+    }
+    first.position_at(TERMINATED)
+}
+
+fn box_intersection_pair(
     mut scorers: Vec<Box<dyn Scorer>>,
     segment_num_docs: u32,
 ) -> Box<dyn Scorer> {
-    if scorers.is_empty() {
-        return Box::new(EmptyScorer);
-    }
-    if scorers.len() == 1 {
-        return scorers.pop().unwrap();
-    }
-    order_intersection_docsets(&mut scorers, segment_num_docs);
-    let doc = go_to_first_doc(&mut scorers[..]);
-    if doc == TERMINATED {
-        return Box::new(EmptyScorer);
-    }
-    // We know that we have at least 2 elements.
     let left = scorers.remove(0);
     let right = scorers.remove(0);
     let all_term_scorers = [&left, &right]
@@ -82,6 +107,61 @@ pub fn intersect_scorers(
         others: scorers,
         segment_num_docs,
     })
+}
+
+fn intersect_scalar_positioned(
+    mut scorers: Vec<UnpositionedScorer>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    if scorers.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if scorers.len() == 1 {
+        return scorers.pop().unwrap().into_positioned();
+    }
+    order_unpositioned_scorers(&mut scorers, segment_num_docs);
+    if scorers.iter().any(UnpositionedScorer::is_empty) {
+        return Box::new(EmptyScorer);
+    }
+    if go_to_first_unpositioned(&mut scorers[..]) == TERMINATED {
+        return Box::new(EmptyScorer);
+    }
+    let positioned = scorers
+        .into_iter()
+        .map(UnpositionedScorer::into_positioned)
+        .collect();
+    box_intersection_pair(positioned, segment_num_docs)
+}
+
+pub(crate) fn intersect_candidate_scorers(
+    scorers: Vec<UnpositionedScorer>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    intersect_scalar_positioned(scorers, segment_num_docs)
+}
+
+/// Returns the intersection scorer.
+///
+/// The score associated with the documents is the sum of the
+/// score of the `Scorer`s given in argument.
+///
+/// For better performance, the function uses a
+/// specialized implementation if the two
+/// shortest scorers are `TermScorer`s.
+///
+/// num_docs_segment is the number of documents in the segment. It is used for estimating the
+/// `size_hint` of the intersection.
+pub fn intersect_scorers(
+    scorers: Vec<Box<dyn Scorer>>,
+    segment_num_docs: u32,
+) -> Box<dyn Scorer> {
+    intersect_candidate_scorers(
+        scorers
+            .into_iter()
+            .map(UnpositionedScorer::from_positioned)
+            .collect(),
+        segment_num_docs,
+    )
 }
 
 /// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
