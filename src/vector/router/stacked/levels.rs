@@ -19,7 +19,9 @@ use std::ops::Deref;
 use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
-use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeansConfig};
+use superkmeans::{
+    HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, Matrix, SuperKMeansConfig,
+};
 
 use crate::directory::FileSlice;
 use crate::schema::Metric;
@@ -217,8 +219,11 @@ impl LevelClusterer for SuperKMeansLevelClusterer {
             ..Default::default()
         };
         let mut kmeans = HierarchicalSuperKMeans::with_config(dim, cfg);
-        let centroids = kmeans.train(data, n);
-        let assignments = kmeans.assign(data, &centroids, n);
+        let centroids = kmeans.train(&mut Matrix::new(data, n, dim));
+        let assignments = kmeans.assign(
+            Matrix::new(data, n, dim),
+            Matrix::new(&centroids, centroids.len() / dim, dim),
+        );
         (centroids, assignments)
     }
 }

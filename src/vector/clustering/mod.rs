@@ -41,6 +41,13 @@ pub struct AssignedBatch<'a> {
 /// Rows per batch the default [`IvfClusterer::assign_batches`] reads back.
 const ASSIGNED_BATCH_ROWS: usize = 4_096;
 
+/// How [`IvfClusterer::train_reporting`] held its sample.
+#[derive(Clone, Debug, Default)]
+pub struct IvfTrainReport {
+    /// Sample rows held decoded between passes over the source.
+    pub kept_rows: usize,
+}
+
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of `num_rows` vectors sampled for training, in `(0, 1]`.
     fn training_sample_ratio(&self, options: &VectorOptions, num_rows: usize) -> f32;
@@ -52,6 +59,18 @@ pub trait IvfClusterer: Send + Sync + 'static {
         source: &mut dyn VectorSource,
         training_sample_ratio: f32,
     ) -> crate::Result<IvfCentroids>;
+
+    /// [`Self::train`], filling `report`. The default holds no row between passes.
+    fn train_reporting(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
+        report: &mut IvfTrainReport,
+    ) -> crate::Result<IvfCentroids> {
+        let _ = report;
+        self.train(options, source, training_sample_ratio)
+    }
 
     /// Assigns vectors to centroids.
     fn assign(

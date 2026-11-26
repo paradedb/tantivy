@@ -4,7 +4,7 @@
 use super::source::MergeVectorSource;
 use super::{FieldMerge, IvfBuildTimings};
 use crate::schema::VectorOptions;
-use crate::vector::clustering::{IvfCentroids, IvfClusterer};
+use crate::vector::clustering::{IvfCentroids, IvfClusterer, IvfTrainReport};
 use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::write::RowAddress;
 use crate::{DocId, TantivyError};
@@ -67,8 +67,13 @@ pub(super) fn train(
 
     let mut training_source =
         MergeVectorSource::new(&merge.readers, &training_rows, opts.dim(), merge.ctx.cancel);
-    let centroids = clusterer.train(opts, &mut training_source, sample_ratio)?;
+    let mut report = IvfTrainReport::default();
+    let centroids =
+        clusterer.train_reporting(opts, &mut training_source, sample_ratio, &mut report)?;
     timings.train_reads += training_source.reads;
+    timings.train_read += training_source.read_time;
+    timings.train_sample += training_rows.len();
+    timings.train_kept += report.kept_rows;
 
     if merge.ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);

@@ -12,7 +12,7 @@ use crate::schema::VectorOptions;
 use crate::vector::clustering::soar::SOAR_CANDIDATES;
 use crate::vector::clustering::{
     for_each_batch, AssignedBatch, AssignmentShortlist, IvfAssignmentCandidate, IvfCentroids,
-    IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    IvfClusterer, IvfMatrix, IvfTrainReport, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::distance::dot;
 use crate::{Result, TantivyError};
@@ -27,6 +27,10 @@ pub const MINIMUM_TRAINING_VECTORS_PER_LIST: usize = 16;
 
 /// Rows held at once without a memory limit.
 const DEFAULT_BUDGET_ROWS: usize = 40_960;
+
+/// Policy constant, not derived: the fewest resident rows per meso centroid for which the meso
+/// step trains on resident rows alone. Below it, every meso pass streams the whole sample.
+const MESO_RESIDENT_ROWS_PER_CENTROID: usize = 256;
 
 /// Replays a [`VectorSource`] as a SuperKMeans [`Dataset`]. The first pass keeps rows
 /// `0..kept_rows` decoded so later passes skip reading them; the rest stream through batches of
@@ -58,6 +62,61 @@ impl Dataset for SourceDataset<'_> {
             let end = (start + self.batch_rows).min(num_rows);
             let IvfTrainingVectors::F32(batch) = self.source.read_range(start..end)?;
             let batch = checked_matrix(batch.matrix, end - start, self.dim)?;
+            f(Matrix::new(&batch.values, batch.rows, batch.dims));
+        }
+        Ok(())
+    }
+}
+
+/// `count` scan positions spread evenly over `0..num_rows`, ascending: position `i` is
+/// `floor(i * num_rows / count)`, so the set reaches every part of the scan order. Requires
+/// `count <= num_rows`.
+fn strided_positions(num_rows: usize, count: usize) -> Vec<u32> {
+    debug_assert!(count <= num_rows);
+    (0..count as u64)
+        .map(|i| (i * num_rows as u64 / count as u64) as u32)
+        .collect()
+}
+
+/// The sample rows outside an ascending set of resident positions, in scan order, read from the
+/// source `batch_rows` at a time.
+struct RestDataset<'a> {
+    source: &'a mut dyn VectorSource,
+    dim: usize,
+    rows: Vec<u32>,
+    batch_rows: usize,
+}
+
+impl<'a> RestDataset<'a> {
+    fn new(
+        source: &'a mut dyn VectorSource,
+        dim: usize,
+        resident: &[u32],
+        batch_rows: usize,
+    ) -> Self {
+        let mut resident = resident.iter().peekable();
+        let rows = (0..source.num_rows() as u32)
+            .filter(|&row| resident.next_if_eq(&&row).is_none())
+            .collect();
+        RestDataset {
+            source,
+            dim,
+            rows,
+            batch_rows,
+        }
+    }
+}
+
+impl Dataset for RestDataset<'_> {
+    type Error = TantivyError;
+
+    fn for_each_batch(&mut self, f: &mut dyn FnMut(Matrix<'_>)) -> crate::Result<()> {
+        for rows in self.rows.chunks(self.batch_rows.max(1)) {
+            if self.source.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            let IvfTrainingVectors::F32(batch) = self.source.read_rows(rows)?;
+            let batch = checked_matrix(batch.matrix, rows.len(), self.dim)?;
             f(Matrix::new(&batch.values, batch.rows, batch.dims));
         }
         Ok(())
@@ -301,6 +360,22 @@ impl IvfClusterer for SuperKMeansClusterer {
         source: &mut dyn VectorSource,
         training_sample_ratio: f32,
     ) -> crate::Result<IvfCentroids> {
+        self.train_reporting(
+            options,
+            source,
+            training_sample_ratio,
+            &mut IvfTrainReport::default(),
+        )
+    }
+
+    /// Reports the rows the meso step keeps decoded between its passes.
+    fn train_reporting(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
+        report: &mut IvfTrainReport,
+    ) -> crate::Result<IvfCentroids> {
         let dim = options.dim();
         let num_rows = source.num_rows();
         if num_rows == 0 {
@@ -322,15 +397,38 @@ impl IvfClusterer for SuperKMeansClusterer {
             let batch_rows = (budget_rows / 8).clamp(1, DEFAULT_BUDGET_ROWS);
             (budget_rows - batch_rows, batch_rows)
         };
-        let mut dataset = SourceDataset {
-            source: &mut *source,
-            dim,
-            kept_rows,
-            batch_rows,
-            kept: None,
+        report.kept_rows = kept_rows;
+        // A sample that streams trains the meso step on resident rows spread evenly over it, when
+        // they give every meso centroid enough rows: the Lloyd passes stay in memory and the rest
+        // of the sample is read once to place it. Otherwise every meso pass replays the kept prefix
+        // and streams the rest.
+        let k_meso = kmeans.meso_clusters(num_rows);
+        let meso_on_resident = kept_rows < num_rows
+            && k_meso >= 2
+            && kept_rows >= MESO_RESIDENT_ROWS_PER_CENTROID * k_meso;
+        let (meso, kept) = if meso_on_resident {
+            let positions = strided_positions(num_rows, kept_rows);
+            let IvfTrainingVectors::F32(resident) = source.read_rows(&positions)?;
+            let resident = checked_matrix(resident.matrix, kept_rows, dim)?;
+            let mut rest = RestDataset::new(&mut *source, dim, &positions, batch_rows);
+            let meso = kmeans.train_meso_resident(
+                Matrix::new(&resident.values, resident.rows, dim),
+                &positions,
+                &mut rest,
+                num_rows,
+            )?;
+            (meso, None)
+        } else {
+            let mut dataset = SourceDataset {
+                source: &mut *source,
+                dim,
+                kept_rows,
+                batch_rows,
+                kept: None,
+            };
+            let meso = kmeans.train_meso(&mut dataset, num_rows)?;
+            (meso, dataset.kept.take())
         };
-        let meso = kmeans.train_meso(&mut dataset, num_rows)?;
-        let kept = dataset.kept.take();
 
         let largest_meso = (0..meso.n_meso())
             .map(|m| meso.meso_rows(m).len())
@@ -346,10 +444,11 @@ impl IvfClusterer for SuperKMeansClusterer {
                         return Err(TantivyError::Cancelled);
                     }
                     let rows = meso.offsets[m]..meso.offsets[m + 1];
-                    let fine = kmeans.train_meso_cluster(
+                    let fine = kmeans.train_meso_cluster(&mut Matrix::new(
                         &kept.values[rows.start * dim..rows.end * dim],
                         rows.len(),
-                    );
+                        dim,
+                    ));
                     centroids.extend_from_slice(&fine.centroids);
                 }
             }
@@ -369,10 +468,11 @@ impl IvfClusterer for SuperKMeansClusterer {
                             return Err(TantivyError::Cancelled);
                         }
                         let rows = meso.offsets[m] - group_start..meso.offsets[m + 1] - group_start;
-                        let fine = kmeans.train_meso_cluster(
+                        let fine = kmeans.train_meso_cluster(&mut Matrix::new(
                             &group.values[rows.start * dim..rows.end * dim],
                             rows.len(),
-                        );
+                            dim,
+                        ));
                         centroids.extend_from_slice(&fine.centroids);
                     }
                     start = end;
@@ -407,9 +507,8 @@ impl IvfClusterer for SuperKMeansClusterer {
             self.budget_rows(options),
             |IvfTrainingVectors::F32(batch)| {
                 assignments.extend(kmeans.assign(
-                    &batch.matrix.values,
-                    centroids.values.as_slice(),
-                    batch.matrix.rows,
+                    Matrix::new(&batch.matrix.values, batch.matrix.rows, batch.matrix.dims),
+                    Matrix::new(&centroids.values, centroids.rows, centroids.dims),
                 ));
             },
         )?;
@@ -436,7 +535,11 @@ impl IvfClusterer for SuperKMeansClusterer {
         );
         let batch_rows = self.budget_rows(options);
         for_each_batch(source, batch_rows, |IvfTrainingVectors::F32(batch)| {
-            let (primary, secondary) = soar.assign(&batch.matrix.values, batch.matrix.rows);
+            let (primary, secondary) = soar.assign(Matrix::new(
+                &batch.matrix.values,
+                batch.matrix.rows,
+                batch.matrix.dims,
+            ));
             pairs.extend(
                 primary
                     .into_iter()
@@ -548,12 +651,16 @@ impl BatchAssigner<'_> {
     ) -> Result<Vec<(u32, Option<u32>)>> {
         match self {
             BatchAssigner::Nearest(kmeans) => Ok(kmeans
-                .assign(&batch.values, centroids.values.as_slice(), batch.rows)
+                .assign(
+                    Matrix::new(&batch.values, batch.rows, batch.dims),
+                    Matrix::new(&centroids.values, centroids.rows, centroids.dims),
+                )
                 .into_iter()
                 .map(|cluster| (cluster, None))
                 .collect()),
             BatchAssigner::Soar(soar) => {
-                let (primary, secondary) = soar.assign(&batch.values, batch.rows);
+                let (primary, secondary) =
+                    soar.assign(Matrix::new(&batch.values, batch.rows, batch.dims));
                 Ok(primary
                     .into_iter()
                     .zip(secondary)
@@ -656,21 +763,26 @@ mod tests {
     };
     use crate::vector::test_support::NearestClusterer;
 
-    /// In-memory [`VectorSource`] that records every range read and counts `read_rows` calls.
+    /// In-memory [`VectorSource`] that records every range read and every `read_rows` request,
+    /// counts `read_rows` calls, and counts the reads of each row.
     struct VecSource {
         values: Vec<f32>,
         dim: usize,
         ranges: Vec<Range<usize>>,
         row_reads: usize,
+        row_requests: Vec<Vec<u32>>,
+        reads_per_row: Vec<usize>,
     }
 
     impl VecSource {
         fn new(values: Vec<f32>, dim: usize) -> Self {
             VecSource {
+                reads_per_row: vec![0; values.len() / dim],
                 values,
                 dim,
                 ranges: Vec::new(),
                 row_reads: 0,
+                row_requests: Vec::new(),
             }
         }
 
@@ -698,11 +810,18 @@ mod tests {
 
         fn read_range(&mut self, range: Range<usize>) -> crate::Result<IvfTrainingVectors> {
             self.ranges.push(range.clone());
+            for row in range.clone() {
+                self.reads_per_row[row] += 1;
+            }
             Ok(self.batch(range))
         }
 
         fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors> {
             self.row_reads += 1;
+            self.row_requests.push(rows.to_vec());
+            for &row in rows {
+                self.reads_per_row[row as usize] += 1;
+            }
             Ok(self.batch(rows.iter().map(|&row| row as usize)))
         }
     }
@@ -1353,6 +1472,93 @@ mod tests {
             .count();
         assert!(passes > 1, "meso step should replay the streamed rows");
         assert!(source.row_reads > 1, "{} row reads", source.row_reads);
+    }
+
+    /// A sample larger than the budget whose kept rows give every meso centroid at least
+    /// [`MESO_RESIDENT_ROWS_PER_CENTROID`] trains the meso step on resident rows spread over the
+    /// sample, and reads every sample row at most twice: the resident rows once to hold them and
+    /// once for the fine step, the rest once to place them and once for the fine step. With fewer
+    /// kept rows each meso pass streams the sample again.
+    #[test]
+    fn meso_on_resident_rows_reads_each_sample_row_at_most_twice() {
+        let (n, dim) = (20_000, 16);
+        let options = VectorOptions::new(dim, Metric::L2);
+        let clusterer = SuperKMeansClusterer::new()
+            .with_target_leaf_size(100)
+            .with_training_sample_ratio(Some(1.0));
+        let k_meso =
+            HierarchicalSuperKMeans::with_config(dim, clusterer.training_config(false, 1.0))
+                .meso_clusters(n);
+        assert_eq!(k_meso, 15);
+
+        // 8,000 budget rows: 7,000 resident, at least 256 per meso centroid.
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let mut report = IvfTrainReport::default();
+        let limited = clusterer
+            .clone()
+            .with_memory_limit(8_000 * options.bytes_per_vector());
+        let IvfCentroids::F32(centroids) = limited
+            .train_reporting(&options, &mut source, 1.0, &mut report)
+            .unwrap();
+        assert!(centroids.rows >= n / 200, "{} centroids", centroids.rows);
+        assert_eq!(report.kept_rows, 7_000);
+        assert!(report.kept_rows >= MESO_RESIDENT_ROWS_PER_CENTROID * k_meso);
+        assert_eq!(source.row_requests[0], strided_positions(n, 7_000));
+        assert!(
+            source.reads_per_row.iter().all(|&reads| reads == 2),
+            "{:?}",
+            source.reads_per_row.iter().max()
+        );
+
+        // 2,000 budget rows: 1,750 kept, fewer than 256 per meso centroid.
+        let mut source = VecSource::new(blobs(n, dim), dim);
+        let mut report = IvfTrainReport::default();
+        let limited = clusterer.with_memory_limit(2_000 * options.bytes_per_vector());
+        limited
+            .train_reporting(&options, &mut source, 1.0, &mut report)
+            .unwrap();
+        assert!(report.kept_rows < MESO_RESIDENT_ROWS_PER_CENTROID * k_meso);
+        let streamed = &source.reads_per_row[report.kept_rows..];
+        assert!(
+            streamed.iter().all(|&reads| reads > 2),
+            "{:?}",
+            streamed.iter().min()
+        );
+    }
+
+    /// On a sample stored group by group, the meso step's resident rows come from every group, not
+    /// only the first groups in storage order.
+    #[test]
+    fn the_resident_meso_rows_reach_every_group_of_a_sorted_sample() {
+        let (groups, per_group, dim) = (20, 1_000, 16);
+        let n = groups * per_group;
+        let values: Vec<f32> = (0..n)
+            .flat_map(|row| {
+                let group = row / per_group;
+                (0..dim).map(move |k| {
+                    let center = if k == group % dim { 100.0 } else { 0.0 };
+                    center + (group / dim) as f32 * 50.0 + ((row * 31 + k * 7) % 17) as f32 * 0.1
+                })
+            })
+            .collect();
+        let options = VectorOptions::new(dim, Metric::L2);
+        let clusterer = SuperKMeansClusterer::new()
+            .with_target_leaf_size(100)
+            .with_training_sample_ratio(Some(1.0))
+            .with_memory_limit(8_000 * options.bytes_per_vector());
+        let mut source = VecSource::new(values, dim);
+        let mut report = IvfTrainReport::default();
+        clusterer
+            .train_reporting(&options, &mut source, 1.0, &mut report)
+            .unwrap();
+        assert_eq!(report.kept_rows, 7_000);
+        let resident = &source.row_requests[0];
+        assert_eq!(resident.len(), report.kept_rows);
+        let mut seen = vec![0_usize; groups];
+        for &row in resident {
+            seen[row as usize / per_group] += 1;
+        }
+        assert!(seen.iter().all(|&rows| rows > 0), "{seen:?}");
     }
 
     /// The memory limit changes how the sample is read, never the centroids: keeping every row

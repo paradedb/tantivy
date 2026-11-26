@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::vector::clustering::{
@@ -20,6 +21,8 @@ pub(super) struct MergeVectorSource<'a> {
     rows: &'a [(RowAddress, DocId)],
     reader: RowReader<'a>,
     pub(super) reads: usize,
+    /// Calling-thread time inside `read_range` and `read_rows`, timed per call.
+    pub(super) read_time: Duration,
 }
 
 impl<'a> MergeVectorSource<'a> {
@@ -39,6 +42,7 @@ impl<'a> MergeVectorSource<'a> {
                 order: Vec::new(),
             },
             reads: 0,
+            read_time: Duration::ZERO,
         }
     }
 }
@@ -140,12 +144,16 @@ impl VectorSource for MergeVectorSource<'_> {
                 self.rows.len()
             )));
         };
-        let batch = self.reader.load(requested)?;
+        let start = Instant::now();
+        let batch = self.reader.load(requested);
+        self.read_time += start.elapsed();
+        let batch = batch?;
         self.reads += requested.len();
         Ok(batch)
     }
 
     fn read_rows(&mut self, rows: &[u32]) -> crate::Result<IvfTrainingVectors> {
+        let start = Instant::now();
         if let Some(&row) = rows.iter().find(|&&row| row as usize >= self.rows.len()) {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector source row {row} is out of bounds for {} rows",
@@ -154,7 +162,9 @@ impl VectorSource for MergeVectorSource<'_> {
         }
         let requested: Vec<(RowAddress, DocId)> =
             rows.iter().map(|&row| self.rows[row as usize]).collect();
-        let batch = self.reader.load(&requested)?;
+        let batch = self.reader.load(&requested);
+        self.read_time += start.elapsed();
+        let batch = batch?;
         self.reads += rows.len();
         Ok(batch)
     }
