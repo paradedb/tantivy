@@ -12,7 +12,7 @@ use crate::schema::VectorOptions;
 use crate::vector::clustering::soar::SOAR_CANDIDATES;
 use crate::vector::clustering::{
     for_each_batch, AssignedBatch, AssignmentShortlist, IvfAssignmentCandidate, IvfCentroids,
-    IvfClusterer, IvfMatrix, IvfTrainingVectors, VectorSource,
+    IvfClusterer, IvfMatrix, IvfTrainReport, IvfTrainingVectors, VectorSource,
 };
 use crate::vector::distance::dot;
 use crate::{Result, TantivyError};
@@ -301,6 +301,22 @@ impl IvfClusterer for SuperKMeansClusterer {
         source: &mut dyn VectorSource,
         training_sample_ratio: f32,
     ) -> crate::Result<IvfCentroids> {
+        self.train_reporting(
+            options,
+            source,
+            training_sample_ratio,
+            &mut IvfTrainReport::default(),
+        )
+    }
+
+    /// Reports the rows the meso step keeps decoded between its passes.
+    fn train_reporting(
+        &self,
+        options: &VectorOptions,
+        source: &mut dyn VectorSource,
+        training_sample_ratio: f32,
+        report: &mut IvfTrainReport,
+    ) -> crate::Result<IvfCentroids> {
         let dim = options.dim();
         let num_rows = source.num_rows();
         if num_rows == 0 {
@@ -322,6 +338,7 @@ impl IvfClusterer for SuperKMeansClusterer {
             let batch_rows = (budget_rows / 8).clamp(1, DEFAULT_BUDGET_ROWS);
             (budget_rows - batch_rows, batch_rows)
         };
+        report.kept_rows = kept_rows;
         let mut dataset = SourceDataset {
             source: &mut *source,
             dim,

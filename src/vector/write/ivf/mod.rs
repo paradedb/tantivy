@@ -107,6 +107,12 @@ struct IvfBuildTimings {
     data_write: Duration,
     /// The ExactRows entry, its reads and its writes.
     exact: Duration,
+    /// Calling-thread time inside the training source's reads, a part of `train`.
+    train_read: Duration,
+    /// Rows in the training sample.
+    train_sample: usize,
+    /// Sample rows the clusterer held decoded between its passes.
+    train_kept: usize,
 }
 
 impl IvfBuildTimings {
@@ -405,7 +411,8 @@ pub(crate) fn merge_ivf(
         "ivf_build timings_ms train={} router={} assign={} other={} total={} \
          fields={} centroids={} vectors={} train_reads={} assign_reads={} \
          encode_reads={} exact_reads={} replica_bytes={} vec_bytes={} pad_bytes={} \
-         encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={}",
+         encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={} train_read_ms={} \
+         train_sample={} train_kept={}",
         timings.train.as_millis(),
         timings.router.as_millis(),
         timings.assign.as_millis(),
@@ -425,6 +432,9 @@ pub(crate) fn merge_ivf(
         timings.encode.as_millis(),
         timings.data_write.as_millis(),
         timings.exact.as_millis(),
+        timings.train_read.as_millis(),
+        timings.train_sample,
+        timings.train_kept,
     );
     Ok(())
 }

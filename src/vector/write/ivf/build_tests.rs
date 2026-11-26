@@ -351,15 +351,25 @@ fn ivf_build_emits_timings_log() -> crate::Result<()> {
     let parts = ["encode_read_ms", "encode_ms", "data_write_ms", "exact_ms"];
     let within_other: usize = parts.iter().map(|part| field(part)).sum();
     assert!(within_other <= field("other"), "parts exceed other: {line}");
+    // The training counters follow the stage parts. The fixture's clusterer trains on every
+    // vector without reading the source and holds no row between passes.
+    assert_eq!(field("train_sample"), vectors);
+    assert_eq!(field("train_reads"), 0);
+    assert_eq!(field("train_read_ms"), 0);
+    assert_eq!(field("train_kept"), 0);
     assert!(
         line.ends_with(&format!(
-            "encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={}",
+            "encode_read_ms={} encode_ms={} data_write_ms={} exact_ms={} train_read_ms={} \
+             train_sample={} train_kept={}",
             field("encode_read_ms"),
             field("encode_ms"),
             field("data_write_ms"),
-            field("exact_ms")
+            field("exact_ms"),
+            field("train_read_ms"),
+            field("train_sample"),
+            field("train_kept")
         )),
-        "the stage parts close the line: {line}"
+        "the stage parts, then the training counters, close the line: {line}"
     );
     eprintln!("IVF_BUILD_SAMPLE {line}");
     Ok(())
